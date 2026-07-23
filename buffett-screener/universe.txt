@@ -1,0 +1,93 @@
+# Screening universe — one ticker per line. '#' starts a comment.
+# Starter set: large-cap US names commonly associated with wide-moat / quality
+# characteristics. This is a CONVENIENCE list, not a recommendation, and is
+# intentionally survivorship-biased toward known survivors — DO NOT use this
+# same list for a backtest (see backtest notes in README.md).
+#
+# Free-tier note: FMP free tier is ~250 calls/day; the screener uses 2 calls per
+# ticker (4 with DEEP=1). MAX_TICKERS defaults to 100. Keep the active list
+# within your daily budget, or upgrade the FMP tier and raise MAX_TICKERS.
+
+# Consumer / brands
+KO
+PEP
+PG
+CL
+KMB
+MDLZ
+HSY
+MCD
+SBUX
+NKE
+EL
+MO
+PM
+KHC
+
+# Payments / financial franchises
+V
+MA
+AXP
+SPGI
+MCO
+MSCI
+ICE
+FICO
+
+# Technology franchises
+AAPL
+MSFT
+GOOGL
+META
+ADBE
+ORCL
+CRM
+INTU
+TXN
+AVGO
+QCOM
+ACN
+CSCO
+
+# Healthcare
+JNJ
+UNH
+LLY
+ABBV
+MRK
+PFE
+TMO
+ABT
+DHR
+ISRG
+MDT
+
+# Industrials / materials
+HON
+CAT
+DE
+LMT
+RTX
+UNP
+GD
+ITW
+EMR
+ROP
+PH
+
+# Consumer discretionary / retail
+HD
+LOW
+COST
+TJX
+ROST
+ORLY
+AZO
+YUM
+
+# Media / comms / other moats
+DIS
+CMCSA
+TMUS
+WM
+RSG
