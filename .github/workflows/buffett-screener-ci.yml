@@ -1,0 +1,41 @@
+name: Buffett screener CI
+
+# Offline validation of the screener: compiles the code and runs the pure-logic
+# + config test suite. No network, no secrets — safe and fast. Runs on any push
+# or PR that touches the screener or its workflows.
+
+on:
+  push:
+    paths:
+      - "buffett-screener/**"
+      - ".github/workflows/buffett-screener-ci.yml"
+  pull_request:
+    paths:
+      - "buffett-screener/**"
+      - ".github/workflows/buffett-screener-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        working-directory: buffett-screener
+        run: pip install -r requirements.txt
+
+      - name: Compile
+        working-directory: buffett-screener
+        run: python -m py_compile screener.py test_screener.py
+
+      - name: Run tests
+        working-directory: buffett-screener
+        run: python test_screener.py

@@ -131,72 +131,33 @@ def ten_year_yield(api: Budget) -> tuple[float, bool]:
     return TREASURY_FALLBACK_10Y, False
 
 
-def evaluate(ticker: str, api: Budget, sig: dict, deep: bool) -> dict | None:
-    ratios = first(api.get(f"v3/ratios-ttm/{ticker}"))
-    metrics = first(api.get(f"v3/key-metrics-ttm/{ticker}"))
-    if not ratios and not metrics:
-        return None
+def score(ticker: str, values: dict, sig: dict) -> dict:
+    """Pure signal-scoring logic — no network, no I/O.
 
-    def num(d: dict, k: str):
-        v = d.get(k)
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    net_margin = num(ratios, "netProfitMarginTTM")
-    roe = num(ratios, "returnOnEquityTTM")
-    roic = num(metrics, "roicTTM")
-    if roic is None:
-        roic = num(ratios, "returnOnCapitalEmployedTTM")
-    eps = num(metrics, "netIncomePerShareTTM")
-    earnings_yield = num(metrics, "earningsYieldTTM")
-    pe = num(ratios, "priceEarningsRatioTTM")
-    d_to_e = num(metrics, "debtToEquityTTM")
-    if d_to_e is None:
-        d_to_e = num(ratios, "debtEquityRatioTTM")
-
-    # Conservative-leverage test.
-    lev = sig["signals"]["conservative_leverage"]
-    if deep:
-        inc = first(api.get(f"v3/income-statement/{ticker}", {"period": "annual", "limit": 1}))
-        bal = first(api.get(f"v3/balance-sheet-statement/{ticker}", {"period": "annual", "limit": 1}))
-        ltd = None
-        ni = None
-        try:
-            ltd = float(bal.get("longTermDebt"))
-            ni = float(inc.get("netIncome"))
-        except (TypeError, ValueError, AttributeError):
-            pass
-        if ltd is not None and ni and ni > 0:
-            lev_value = ltd / ni
-            lev_pass = lev_value < float(lev["exact_value"])
-            lev_desc = f"LTD/NI={lev_value:.1f} (<5 exact)"
-        else:
-            lev_pass = None
-            lev_desc = "LTD/NI=n/a"
-    else:
-        if d_to_e is not None:
-            lev_pass = d_to_e < float(lev["approx_value"])
-            lev_desc = f"D/E={d_to_e:.2f} (<{lev['approx_value']} proxy)"
-        else:
-            lev_pass = None
-            lev_desc = "D/E=n/a"
-
+    `values` holds already-fetched metric values plus the resolved leverage
+    test (`lev_pass`/`lev_desc`). Kept pure so it can be unit-tested offline
+    (see test_screener.py). A missing (None) core input is treated
+    conservatively as a FAIL, never a pass.
+    """
     s = sig["signals"]
+    net_margin = values.get("net_margin")
+    roe = values.get("roe")
+    roic = values.get("roic")
+    eps = values.get("eps")
+    lev_pass = values.get("lev_pass")
+
     checks = {
         "net_margin>15%": (net_margin is not None and net_margin > s["net_margin"]["value"]),
         "roic>=12%": (roic is not None and roic >= s["return_on_capital"]["value"]),
         "leverage_ok": lev_pass,
         "eps>0": (eps is not None and eps > 0),
     }
-    roe12 = roe is not None and roe >= 0.12
-    roe20 = roe is not None and roe >= 0.20
+    tiers = s["roe_gate"]["tiers"]  # [0.12, 0.20]
+    roe12 = roe is not None and roe >= tiers[0]
+    roe20 = roe is not None and roe >= tiers[1]
 
-    core_no_roe = [v for v in checks.values() if v is not None]
-    passes_core_no_roe = all(checks[k] for k in checks if checks[k] is not None) and all(
-        checks[k] is not None for k in checks
-    )
+    # Pass every core check; None (unknown) is not True, so missing data fails.
+    passes_core_ex_roe = all(v is True for v in checks.values())
 
     return {
         "ticker": ticker,
@@ -204,14 +165,75 @@ def evaluate(ticker: str, api: Budget, sig: dict, deep: bool) -> dict | None:
         "roe": roe,
         "roic": roic,
         "eps": eps,
-        "earnings_yield": earnings_yield,
-        "pe": pe,
-        "leverage_desc": lev_desc,
+        "earnings_yield": values.get("earnings_yield"),
+        "pe": values.get("pe"),
+        "leverage_desc": values.get("lev_desc", ""),
         "checks": checks,
-        "passes_core_ex_roe": passes_core_no_roe,
-        "pass_at_roe12": passes_core_no_roe and roe12,
-        "pass_at_roe20": passes_core_no_roe and roe20,
+        "passes_core_ex_roe": passes_core_ex_roe,
+        "pass_at_roe12": passes_core_ex_roe and roe12,
+        "pass_at_roe20": passes_core_ex_roe and roe20,
     }
+
+
+def _num(d: dict, k: str):
+    v = (d or {}).get(k)
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def leverage_test(ratios: dict, metrics: dict, api: "Budget | None", ticker: str,
+                  sig: dict, deep: bool) -> tuple:
+    """Resolve the conservative-leverage signal. Returns (lev_pass, lev_desc).
+
+    deep=True computes the exact long-term-debt / net-earnings ratio (needs two
+    extra API calls); otherwise a labelled debt/equity proxy is used.
+    """
+    lev = sig["signals"]["conservative_leverage"]
+    if deep and api is not None:
+        inc = first(api.get(f"v3/income-statement/{ticker}", {"period": "annual", "limit": 1}))
+        bal = first(api.get(f"v3/balance-sheet-statement/{ticker}", {"period": "annual", "limit": 1}))
+        try:
+            ltd = float(bal.get("longTermDebt"))
+            ni = float(inc.get("netIncome"))
+        except (TypeError, ValueError, AttributeError):
+            return None, "LTD/NI=n/a"
+        if ni and ni > 0:
+            ratio = ltd / ni
+            return ratio < float(lev["exact_value"]), f"LTD/NI={ratio:.1f} (<5 exact)"
+        return None, "LTD/NI=n/a"
+
+    d_to_e = _num(metrics, "debtToEquityTTM")
+    if d_to_e is None:
+        d_to_e = _num(ratios, "debtEquityRatioTTM")
+    if d_to_e is not None:
+        return d_to_e < float(lev["approx_value"]), f"D/E={d_to_e:.2f} (<{lev['approx_value']} proxy)"
+    return None, "D/E=n/a"
+
+
+def evaluate(ticker: str, api: Budget, sig: dict, deep: bool) -> dict | None:
+    ratios = first(api.get(f"v3/ratios-ttm/{ticker}"))
+    metrics = first(api.get(f"v3/key-metrics-ttm/{ticker}"))
+    if not ratios and not metrics:
+        return None
+
+    roic = _num(metrics, "roicTTM")
+    if roic is None:
+        roic = _num(ratios, "returnOnCapitalEmployedTTM")
+    lev_pass, lev_desc = leverage_test(ratios, metrics, api, ticker, sig, deep)
+
+    values = {
+        "net_margin": _num(ratios, "netProfitMarginTTM"),
+        "roe": _num(ratios, "returnOnEquityTTM"),
+        "roic": roic,
+        "eps": _num(metrics, "netIncomePerShareTTM"),
+        "earnings_yield": _num(metrics, "earningsYieldTTM"),
+        "pe": _num(ratios, "priceEarningsRatioTTM"),
+        "lev_pass": lev_pass,
+        "lev_desc": lev_desc,
+    }
+    return score(ticker, values, sig)
 
 
 def pct(x) -> str:

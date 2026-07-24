@@ -94,3 +94,17 @@ pip install -r requirements.txt
 export FMP_API_KEY=...        # requires a network path to FMP (not the sandbox)
 python screener.py            # writes reports/buffett_scan_<date>.md
 ```
+
+## Tests
+
+The decision logic is factored into a pure `score()` function (plus
+`leverage_test()`), so it can be validated with no network or key:
+
+```bash
+cd buffett-screener
+python test_screener.py       # 28 offline checks: scoring, boundaries, config, universe
+```
+
+`.github/workflows/buffett-screener-ci.yml` runs this on every push/PR that
+touches the screener — a green check means the signal logic, thresholds, and
+universe file are all consistent.
