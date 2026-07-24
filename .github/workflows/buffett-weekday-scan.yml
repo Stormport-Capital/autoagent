@@ -37,6 +37,12 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Mail secrets are surfaced as job env so the email step can self-skip when
+    # they are not configured (the job still succeeds without email set up).
+    env:
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+      MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+      MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -75,15 +81,27 @@ jobs:
           path: buffett-screener/reports/latest.md
           if-no-files-found: warn
 
-      # ---- OPTIONAL EMAIL DELIVERY (uncomment + add SMTP secrets to enable) ----
-      # - name: Email the report
-      #   uses: dawidd6/action-send-mail@v3
-      #   with:
-      #     server_address: smtp.gmail.com
-      #     server_port: 465
-      #     username: ${{ secrets.MAIL_USERNAME }}
-      #     password: ${{ secrets.MAIL_PASSWORD }}   # Gmail app password
-      #     subject: "Buffett weekday scan"
-      #     to: ${{ secrets.MAIL_TO }}
-      #     from: Buffett Screener
-      #     body: file://buffett-screener/reports/latest.md
+      # ---- EMAIL DELIVERY ----
+      # Self-skips unless MAIL_* secrets are set. To enable, add three repo
+      # secrets: MAIL_TO (recipient), MAIL_USERNAME (Gmail address), and
+      # MAIL_PASSWORD (a Gmail *app password*, not your login password —
+      # https://myaccount.google.com/apppasswords, requires 2FA on the account).
+      - name: Read report date
+        id: meta
+        if: ${{ env.MAIL_TO != '' }}
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Email the report
+        if: ${{ env.MAIL_TO != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Buffett weekday scan — ${{ steps.meta.outputs.date }}"
+          to: ${{ secrets.MAIL_TO }}
+          from: Buffett Screener <${{ secrets.MAIL_USERNAME }}>
+          body: file://buffett-screener/reports/latest.md
+          convert_markdown: true

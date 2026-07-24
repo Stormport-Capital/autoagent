@@ -46,8 +46,11 @@ DST, so from November (EST) it lands at 07:00 ET until you bump the hour.
 
 - A dated file `reports/buffett_scan_YYYY-MM-DD.md` plus `reports/latest.md`,
   committed to the repo each run, and uploaded as a downloadable **artifact**.
-- **Email** is available but off by default — uncomment the mail step in the
-  workflow and add `MAIL_*` secrets (e.g. a Gmail app password).
+- **Email** is built in and **self-skips** until configured. To turn it on, add
+  three repo secrets: `MAIL_TO` (recipient), `MAIL_USERNAME` (Gmail address),
+  `MAIL_PASSWORD` (a Gmail **app password** — https://myaccount.google.com/apppasswords,
+  needs 2FA). With them set, the report is emailed every weekday run; without
+  them the step is skipped and the job still succeeds.
 - **Drive doc / Gmail draft** (your original ask) aren't native to Actions —
   they need Google credentials Actions doesn't have. The clean way to get them
   is a small **Claude Routine** that reads `reports/latest.md` from the repo
