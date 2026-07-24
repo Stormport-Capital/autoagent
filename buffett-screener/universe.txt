@@ -1,14 +1,19 @@
 # Screening universe — one ticker per line. '#' starts a comment.
-# Starter set: large-cap US names commonly associated with wide-moat / quality
-# characteristics. This is a CONVENIENCE list, not a recommendation, and is
-# intentionally survivorship-biased toward known survivors — DO NOT use this
-# same list for a backtest (see backtest notes in README.md).
 #
-# Free-tier note: FMP free tier is ~250 calls/day; the screener uses 2 calls per
-# ticker (4 with DEEP=1). MAX_TICKERS defaults to 100. Keep the active list
-# within your daily budget, or upgrade the FMP tier and raise MAX_TICKERS.
+# ORDERING MATTERS: the screener screens the FIRST `MAX_TICKERS` names (default
+# 100). Names are ordered core-wide-moat first so a capped free-tier run still
+# covers the highest-conviction candidates. To screen the whole list, raise
+# MAX_TICKERS and use a paid FMP tier.
+#
+# Free-tier budget: FMP free tier is ~250 calls/day; the screener uses 2 calls
+# per ticker (4 with DEEP=1). So ~125 tickers/day at 2 calls, ~60 with DEEP.
+#
+# This is a CONVENIENCE universe of large/mid-cap US names commonly discussed
+# as wide-moat/quality — NOT a recommendation, and survivorship-biased toward
+# known survivors. DO NOT backtest on this list (see README.md).
 
-# Consumer / brands
+# ===== TIER 1: core wide-moat compounders (screened first) =====
+# Consumer staples / brands
 KO
 PEP
 PG
@@ -16,15 +21,18 @@ CL
 KMB
 MDLZ
 HSY
-MCD
-SBUX
-NKE
-EL
+MKC
+GIS
+K
+CLX
+CHD
+MNST
+KDP
+STZ
 MO
 PM
-KHC
 
-# Payments / financial franchises
+# Payments / exchanges / data franchises
 V
 MA
 AXP
@@ -33,61 +41,147 @@ MCO
 MSCI
 ICE
 FICO
+NDAQ
+CME
+FDS
+VRSK
 
-# Technology franchises
-AAPL
+# Software / platform franchises
 MSFT
+AAPL
 GOOGL
 META
 ADBE
 ORCL
 CRM
 INTU
-TXN
-AVGO
-QCOM
-ACN
-CSCO
+NOW
+SNPS
+CDNS
+ADSK
+ANSS
+ROP
+TYL
 
-# Healthcare
+# Semiconductors
+AVGO
+TXN
+QCOM
+NVDA
+AMD
+ADI
+KLAC
+LRCX
+AMAT
+MCHP
+
+# Healthcare franchises
 JNJ
 UNH
 LLY
 ABBV
 MRK
-PFE
 TMO
 ABT
 DHR
 ISRG
 MDT
+SYK
+BDX
+ZTS
+IDXX
+RMD
+EW
+BSX
+ELV
+CI
 
-# Industrials / materials
+# ===== TIER 2: high-quality industrials, retail, discretionary =====
+# Industrials
 HON
 CAT
 DE
 LMT
 RTX
-UNP
 GD
+NOC
+UNP
+CSX
+NSC
 ITW
 EMR
-ROP
 PH
+ETN
+ROK
+DOV
+AME
+GWW
+FAST
+CTAS
+PAYX
+ADP
 
-# Consumer discretionary / retail
+# Retail / consumer discretionary
 HD
 LOW
 COST
+WMT
 TJX
 ROST
 ORLY
 AZO
+ULTA
+DPZ
 YUM
+MCD
+SBUX
+NKE
+LULU
+POOL
+TSCO
 
-# Media / comms / other moats
+# Media / comms / services
 DIS
 CMCSA
 TMUS
+VRSN
+EFX
 WM
 RSG
+EL
+CTVA
+
+# ===== TIER 3: financials, energy, materials (context-dependent moats) =====
+# Financials (note: ROE/leverage tests behave differently for banks/insurers;
+# treat flagged names with extra care in the checklist)
+BRK-B
+MMC
+AJG
+AON
+BLK
+TROW
+PGR
+CB
+TRV
+ALL
+BX
+KKR
+
+# Energy / materials with cost or scale advantages
+XOM
+CVX
+COP
+LIN
+SHW
+ECL
+APD
+NEM
+FCX
+
+# Other durable franchises
+UPS
+FDX
+BKNG
+MAR
+HLT
+CMG
