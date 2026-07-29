@@ -1,0 +1,107 @@
+name: Buffett weekday quality scan
+
+# Runs the Buffett quality-compounder screener on GitHub's runners (which have
+# outbound internet, unlike the Claude sandbox) every weekday pre-market, and
+# commits a dated candidate report into buffett-screener/reports/.
+#
+# ACTIVATION NOTES:
+#   * Scheduled workflows only run from the repository's DEFAULT branch. This
+#     file does nothing until it is merged to the default branch.
+#   * Add the FMP key as an encrypted secret named FMP_API_KEY:
+#       Settings -> Secrets and variables -> Actions -> New repository secret.
+#     It is never stored in the repo.
+#   * Cron is UTC and does NOT follow US daylight-saving. 12:00 UTC = 08:00 ET
+#     during EDT (Mar–Nov) and 07:00 ET during EST (Nov–Mar). Adjust the minute/
+#     hour in November if you want a fixed 8:00 AM local year-round.
+
+on:
+  schedule:
+    - cron: "0 12 * * 1-5"      # 08:00 America/New_York during EDT, weekdays
+  workflow_dispatch:            # allow manual runs from the Actions tab
+    inputs:
+      max_tickers:
+        description: "Max tickers to screen (free tier ~250 calls/day, 2 calls each)"
+        default: "100"
+      deep:
+        description: "Exact long-term-debt/net-earnings test (1=on, slower, 4 calls each)"
+        default: "0"
+
+permissions:
+  contents: write               # needed to commit the report back
+
+concurrency:
+  group: buffett-weekday-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Mail secrets are surfaced as job env so the email step can self-skip when
+    # they are not configured (the job still succeeds without email set up).
+    env:
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+      MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+      MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        working-directory: buffett-screener
+        run: pip install -r requirements.txt
+
+      - name: Run screener
+        working-directory: buffett-screener
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          MAX_TICKERS: ${{ github.event.inputs.max_tickers || '100' }}
+          DEEP: ${{ github.event.inputs.deep || '0' }}
+        run: python screener.py
+
+      - name: Commit report
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add buffett-screener/reports/
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+          else
+            git commit -m "Buffett weekday scan report ($(date -u +%Y-%m-%d))"
+            git push
+          fi
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: buffett-scan-report
+          path: buffett-screener/reports/latest.md
+          if-no-files-found: warn
+
+      # ---- EMAIL DELIVERY ----
+      # Self-skips unless MAIL_* secrets are set. To enable, add three repo
+      # secrets: MAIL_TO (recipient), MAIL_USERNAME (Gmail address), and
+      # MAIL_PASSWORD (a Gmail *app password*, not your login password —
+      # https://myaccount.google.com/apppasswords, requires 2FA on the account).
+      - name: Read report date
+        id: meta
+        if: ${{ env.MAIL_TO != '' }}
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Email the report
+        if: ${{ env.MAIL_TO != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Buffett weekday scan — ${{ steps.meta.outputs.date }}"
+          to: ${{ secrets.MAIL_TO }}
+          from: Buffett Screener <${{ secrets.MAIL_USERNAME }}>
+          body: file://buffett-screener/reports/latest.md
+          convert_markdown: true

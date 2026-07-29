@@ -1,0 +1,94 @@
+# Buffett quality-compounder screener — numeric signal definitions
+#
+# PROVENANCE BANNER (read this before trusting any number below):
+#   Every threshold here is a SECONDARY-CODIFIER PROXY (authority tier T3), not
+#   Buffett's own words. The numbers come from Mary Buffett & David Clark
+#   ("The New Buffettology", 2002) and from David Braverman's S&P screen as
+#   reported by Brendan Boyd (1996). Buffett's actual engine — durable
+#   competitive advantage ("moat") and intrinsic value — is a C4 judgment call
+#   he explicitly says he never reduces to a formula. Those are DELIBERATELY
+#   excluded from this screen and routed to research_checklist.md.
+#
+#   A name passing this screen is a CANDIDATE for human research, never a buy.
+#
+# The two codifiers disagree on the ROE gate (Mary Buffett >12% vs Braverman
+# >=20%). We do NOT pick for the operator: the screen evaluates BOTH tiers and
+# reports which names clear each. Set roe_gate.primary to choose the headline
+# tier; both are always shown.
+
+meta:
+  strategy: buffett-quality-compounder
+  layer: quantitative-proxy   # the ~62% automatable proxy layer only
+  cadence: native-annual; screen may refresh daily but turnover must not
+  authority_of_all_thresholds: T3-secondary-codifier-proxy
+
+# Core signals — a candidate must pass ALL "core: true" signals.
+signals:
+  net_margin:
+    core: true
+    field: netProfitMarginTTM
+    op: ">"
+    value: 0.15
+    source: "Braverman/Boyd 1996; Mary Buffett ch.4 — 'most important criterion'"
+    note: "High net margin as a proxy for pricing power / competitive advantage."
+
+  roe_gate:
+    core: true
+    field: returnOnEquityTTM
+    op: ">="
+    primary: 0.12            # headline tier (Mary Buffett). Both tiers reported.
+    tiers: [0.12, 0.20]      # 0.12 = Mary Buffett; 0.20 = Braverman
+    source: "Mary Buffett >12% consistent; Braverman >=20%"
+    note: "Return on equity. Operator has NOT resolved which tier is canonical."
+
+  return_on_capital:
+    core: true
+    field: roicTTM
+    op: ">="
+    value: 0.12
+    source: "Mary Buffett — return on total capital >=12%"
+    note: "ROIC as proxy for capital-efficiency of the business."
+
+  conservative_leverage:
+    core: true
+    # Exact Mary Buffett rule: long-term debt < 5x net earnings.
+    # DEEP=true computes LTD/netIncome exactly (balance sheet + income).
+    # DEEP=false uses debtToEquityTTM as a labelled approximation.
+    exact_field_ratio: ltd_over_net_income
+    exact_op: "<"
+    exact_value: 5.0
+    approx_field: debtToEquityTTM
+    approx_op: "<"
+    approx_value: 0.80
+    source: "Mary Buffett — long-term debt payable in < ~5 years of earnings"
+
+  positive_earnings:
+    core: true
+    field: netIncomePerShareTTM
+    op: ">"
+    value: 0.0
+    source: "sanity gate — screen is for profitable compounders only"
+
+# Contextual signals — reported but NOT used to reject (they inform valuation
+# and are price-sensitive, which is why a daily refresh is meaningful).
+context:
+  earnings_yield_vs_treasury:
+    field: earningsYieldTTM
+    compare_to: us_10y_treasury_yield   # fetched live; fallback in code
+    source: "Mary Buffett 'initial rate of return' = EPS/price vs bond yield"
+    note: "Earnings yield below the 10y Treasury = expensive vs the risk-free bond."
+
+  pe_ttm:
+    field: peRatioTTM
+    sell_flag_at: 40
+    source: "Mary Buffett ch.15 — consider exiting near P/E 40 vs own history"
+    note: "Contextual only; exit is a per-name, history-relative human call."
+
+# Rules explicitly EXCLUDED from automation (C3/C4) — see research_checklist.md
+excluded_from_screen:
+  - durable_competitive_advantage_moat   # C4 — the actual Buffett engine
+  - circle_of_competence                 # C4
+  - one_time_vs_terminal_problem         # C3/C4 — the value-trap killer
+  - management_quality_and_candor        # C4
+  - intrinsic_value_estimate             # C4 — Buffett: "we never give our estimate"
+  - reinvestment_runway_qualitative      # C3
