@@ -108,3 +108,14 @@ python test_screener.py       # 28 offline checks: scoring, boundaries, config, 
 `.github/workflows/buffett-screener-ci.yml` runs this on every push/PR that
 touches the screener — a green check means the signal logic, thresholds, and
 universe file are all consistent.
+
+## Diagnostics / endpoint resilience
+
+FMP has migrated from legacy `/api/v3/` endpoints to a newer `/stable/` API, and
+field names vary by plan. At startup the screener **auto-detects** which endpoint
+family returns data for your key (it probes v3 then stable on the first ticker)
+and logs the choice plus the sample field names as `[resolve] …` lines. Every
+report also carries a **data-coverage** figure (`coverage: N/100`): if it reads
+`0/N`, the run hit a data-access problem (wrong endpoint or plan), *not* a
+genuinely empty screen — check the `[resolve]` lines in the Actions log to see
+which endpoints failed.

@@ -93,6 +93,7 @@ jobs:
 
       - name: Email the report
         if: ${{ env.MAIL_TO != '' }}
+        continue-on-error: true   # a mail hiccup must not red an otherwise-good scan
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
