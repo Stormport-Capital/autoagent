@@ -256,8 +256,9 @@ def evaluate(ticker: str, api: Budget, sig: dict, deep: bool,
     lev_pass, lev_desc = leverage_test(d_to_e, ltd_ni, sig, deep)
 
     values = {
-        "net_margin": pick(ratios, "net_margin"),
-        "roe": pick(ratios, "roe"),
+        "net_margin": pick(ratios, "net_margin") if pick(ratios, "net_margin") is not None else pick(metrics, "net_margin"),
+        # ROE lives in key-metrics on the /stable API (not ratios); fall back either way.
+        "roe": pick(metrics, "roe") if pick(metrics, "roe") is not None else pick(ratios, "roe"),
         "roic": pick(metrics, "roic") if pick(metrics, "roic") is not None else pick(ratios, "roic"),
         "eps": pick(metrics, "eps") if pick(metrics, "eps") is not None else pick(ratios, "eps"),
         "earnings_yield": pick(metrics, "earnings_yield"),
