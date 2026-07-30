@@ -89,12 +89,28 @@ def test_scoring():
 def test_leverage_test():
     print("test_leverage_test")
     # Proxy path (deep=False): D/E below threshold passes, above fails.
-    p, _ = screener.leverage_test({}, {"debtToEquityTTM": 0.5}, None, "T", SIG, deep=False)
+    p, _ = screener.leverage_test(0.5, None, SIG, deep=False)
     check("D/E 0.5 passes proxy", p is True)
-    p, _ = screener.leverage_test({}, {"debtToEquityTTM": 1.5}, None, "T", SIG, deep=False)
+    p, _ = screener.leverage_test(1.5, None, SIG, deep=False)
     check("D/E 1.5 fails proxy", p is False)
-    p, d = screener.leverage_test({}, {}, None, "T", SIG, deep=False)
+    p, d = screener.leverage_test(None, None, SIG, deep=False)
     check("missing D/E -> None (unknown)", p is None and "n/a" in d)
+    # Exact path (deep=True): LTD/NI ratio.
+    p, _ = screener.leverage_test(None, (100.0, 40.0), SIG, deep=True)  # 2.5x
+    check("LTD/NI 2.5x passes exact", p is True)
+    p, _ = screener.leverage_test(None, (300.0, 40.0), SIG, deep=True)  # 7.5x
+    check("LTD/NI 7.5x fails exact", p is False)
+    p, d = screener.leverage_test(None, (100.0, 0.0), SIG, deep=True)   # NI=0
+    check("zero net income -> None (unknown)", p is None and "n/a" in d)
+
+
+def test_pick():
+    print("test_pick")
+    # pick() tries each candidate field name in order.
+    check("picks TTM field", screener.pick({"returnOnEquityTTM": 0.3}, "roe") == 0.3)
+    check("falls back to plain field", screener.pick({"returnOnEquity": 0.25}, "roe") == 0.25)
+    check("missing -> None", screener.pick({}, "roe") is None)
+    check("non-numeric -> None", screener.pick({"netProfitMarginTTM": "n/a"}, "net_margin") is None)
 
 
 def test_config():
@@ -124,7 +140,7 @@ def test_universe():
 
 
 def main() -> int:
-    for fn in (test_scoring, test_leverage_test, test_config, test_universe):
+    for fn in (test_scoring, test_leverage_test, test_pick, test_config, test_universe):
         fn()
     print()
     if _failures:
