@@ -60,16 +60,19 @@ TREASURY_FALLBACK_10Y = 0.043  # 4.3% — labelled in the report when triggered.
 # Candidate field names per metric (TTM first, then plain), tolerant to the
 # v3 vs stable naming differences.
 FIELDS = {
-    "net_margin": ["netProfitMarginTTM", "netProfitMargin", "netIncomeMargin"],
+    "net_margin": ["netProfitMarginTTM", "bottomLineProfitMarginTTM",
+                   "netIncomeMarginTTM", "netProfitMargin"],
     "roe": ["returnOnEquityTTM", "returnOnEquity"],
-    "roic": ["roicTTM", "returnOnInvestedCapitalTTM", "roic", "returnOnInvestedCapital",
-             "returnOnCapitalEmployedTTM", "returnOnCapitalEmployed"],
+    "roic": ["returnOnInvestedCapitalTTM", "roicTTM", "returnOnCapitalEmployedTTM",
+             "returnOnInvestedCapital", "roic", "returnOnCapitalEmployed"],
     "eps": ["netIncomePerShareTTM", "netIncomePerShare", "epsTTM", "eps"],
     "earnings_yield": ["earningsYieldTTM", "earningsYield"],
-    "pe": ["priceEarningsRatioTTM", "peRatioTTM", "priceToEarningsRatioTTM",
+    "pe": ["priceToEarningsRatioTTM", "priceEarningsRatioTTM", "peRatioTTM",
            "priceEarningsRatio", "peRatio"],
-    "d_to_e": ["debtToEquityTTM", "debtEquityRatioTTM", "debtToEquity",
-               "debtEquityRatio", "debtToEquityRatio"],
+    # NOTE: FMP /stable ratios use 'debtToEquityRatioTTM' (confirmed from logs);
+    # legacy v3 used 'debtToEquityTTM'. Keep both plus fallbacks.
+    "d_to_e": ["debtToEquityRatioTTM", "debtToEquityTTM", "debtEquityRatioTTM",
+               "debtToEquityRatio", "debtToEquity"],
 }
 
 
@@ -368,6 +371,9 @@ def main() -> int:
     for i, t in enumerate(universe, 1):
         r = evaluate(t, api, sig, deep, ratios_build, metrics_build)
         rows.append(r)
+        if i == 1:  # per-metric visibility on the first name to catch field gaps
+            print(f"[sample {t}] net_margin={r['net_margin']} roe={r['roe']} "
+                  f"roic={r['roic']} eps={r['eps']} pe={r['pe']} lev='{r['leverage_desc']}'")
         if r["has_data"]:
             coverage += 1
         if i % 20 == 0:
