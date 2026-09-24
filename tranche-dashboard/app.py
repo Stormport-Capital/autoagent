@@ -30,16 +30,37 @@ from store import Store
 HERE = Path(__file__).parent
 
 
-def load_dotenv(path: Path) -> None:
-    """KEY=VALUE lines from .env; real environment variables win."""
+KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
+
+
+def load_dotenv(path: Path) -> list[str]:
+    """Load KEY=VALUE lines from .env (a non-empty real environment variable
+    wins). Returns human-readable notes on what was found, never the values."""
+    notes = []
     if not path.exists():
-        return
-    for line in path.read_text().splitlines():
+        alt = path.with_name(path.name + ".txt")
+        notes.append(f"{path} not found" + (f" - but {alt.name} exists: rename it to .env"
+                                            if alt.exists() else ""))
+        return notes
+    empty = []
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if not v:
+            empty.append(k)
+        elif not os.environ.get(k):
+            os.environ[k] = v
+    for k in KEYS:
+        if os.environ.get(k):
+            notes.append(f"{k}: found ({len(os.environ[k])} chars)")
+        elif k in empty:
+            notes.append(f"{k}: EMPTY in .env - paste the key after the = and save")
+        else:
+            notes.append(f"{k}: missing from .env")
+    return notes
 
 
 class RealClock:
@@ -264,7 +285,8 @@ def main() -> None:
     ap.add_argument("--demo-days", type=int, default=15, help="weekdays of history to replay")
     ap.add_argument("--demo-speed", type=float, default=2.0, help="seconds per simulated hour")
     args = ap.parse_args()
-    load_dotenv(HERE / ".env")
+    for note in load_dotenv(HERE / ".env"):
+        print("  .env:", note)
     args.provider = args.provider or os.environ.get("TRANCHE_PROVIDER") or (
         "polygon" if os.environ.get("POLYGON_API_KEY") else "yahoo")
 
