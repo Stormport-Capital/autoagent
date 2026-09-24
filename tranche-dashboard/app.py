@@ -108,7 +108,29 @@ class SimClock:
 
 
 def boundaries(day: date, delay: timedelta) -> list[datetime]:
-    return [e + delay for e in session_hour_ends(day)] if day.weekday() < 5 else []
+    """Check times: the 9:30 open (acts on yesterday's 15:00-16:00 bar), then
+    10:00, 11:00, ..., 15:00 as each intraday bar closes. The 16:00 bar is not
+    checked at 16:00; its signals execute at the next open."""
+    if day.weekday() >= 5:
+        return []
+    ends = session_hour_ends(day)[:-1]
+    return [datetime.combine(day, RTH_OPEN, tzinfo=ET) + delay] + [e + delay for e in ends]
+
+
+def prev_weekday(day: date) -> date:
+    day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
+def bar_for_boundary(boundary: datetime, delay: timedelta) -> tuple[datetime, datetime]:
+    """(end of the bar a check handles, when that bar's signals execute)."""
+    t = boundary - delay
+    if t.time() == RTH_OPEN:
+        prev_close = datetime.combine(prev_weekday(t.date()), time(16, 0), tzinfo=ET)
+        return prev_close, t
+    return t, t
 
 
 def next_boundary(now: datetime, delay: timedelta) -> datetime:
@@ -121,7 +143,8 @@ def next_boundary(now: datetime, delay: timedelta) -> datetime:
 
 
 class Scheduler(threading.Thread):
-    """Runs a tick shortly after each RTH hourly bar closes (10:30 ... 16:00 ET)."""
+    """Runs a tick at the 9:30 open (for yesterday's 15:00-16:00 bar) and as
+    each intraday bar closes at 10:00, 11:00, ..., 15:00 ET."""
 
     def __init__(self, engine: Engine, clock, demo_speed: float, sync: BrokerSync | None = None):
         super().__init__(daemon=True)
@@ -153,7 +176,7 @@ class Scheduler(threading.Thread):
         symbol is still missing that hour (15-minute-delayed data plans)."""
         return (now - boundary <= RETRY_WINDOW
                 and self.last_tick is not None and now - self.last_tick >= RETRY_EVERY
-                and self.engine.behind(boundary - self.delay()))
+                and self.engine.behind(*bar_for_boundary(boundary, self.delay())))
 
     def next_tick(self) -> datetime:
         return next_boundary(self.clock.now(), self.delay())

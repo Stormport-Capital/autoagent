@@ -42,15 +42,19 @@ Each tranche gets one third of that budget.
 
 - **Setup choices, made per symbol:** *short only* or *long & short* for the two
   EMA tranches, plus the risk %. The VWAP tranche is short-only regardless.
-- **Bars:** RTH-anchored hourly bars (9:30–10:30 … 15:30–16:00 ET), built from
+- **Bars:** clock-aligned hourly bars, the same as standard hourly charts:
+  9:30–10:00 (a half hour), then 10–11 … 15–16 ET. Built from
   5-minute data. Session VWAP uses RTH typical price × volume. Pre- and post-market
   trading is ignored.
 - **Timing:** each hourly close is evaluated `Check delay` minutes (default 2)
   after the bar closes. An hour is only treated as complete once the feed has
   printed past its end, or 20 minutes have passed. So a 15-minute-delayed feed
-  just waits; it never trades on a partial hour. Entries and signal exits fill at that bar's close.
-  **Nothing from before you added the symbol is traded**, so adding a name
-  pre-market never back-fills old signals.
+  just waits; it never trades on a partial hour. Checks run at 10:00 … 15:00,
+  and entries and signal exits fill at that bar's close. The 15:00–16:00 bar is
+  acted on at the **next day's 9:30 open check**, filled at the opening price.
+  A signal only trades if it executes after you added the symbol. So a name
+  added pre-market can act on yesterday's last bar at the open, but never on
+  anything older.
 - **EMA stops:** the two EMA tranches have a hard stop at `EMA stop × hourly ATR(14)`
   from entry (default 1.5×). A stop is detected from each hourly bar's high or low
   and fills at the stop price, or at the bar's open if price gapped through it.

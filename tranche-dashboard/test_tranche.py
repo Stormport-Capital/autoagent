@@ -8,6 +8,7 @@ import unittest
 from datetime import date, datetime, time, timedelta
 
 from broker import AlpacaPaper, BrokerError, BrokerSync
+from app import bar_for_boundary, boundaries
 from engine import Engine, ValidationError, vwap_fail
 from indicators import (ET, Bar, atr, crossed_below, ema, resample_hourly,
                         session_hour_ends, session_vwap)
@@ -17,9 +18,12 @@ FIVE = timedelta(minutes=5)
 
 
 def hour_bars(day: date, hour_idx: int, o, h, l, c, vol=1000.0) -> list[Bar]:
-    """Twelve (or six for the last hour) 5-minute bars forming one hourly bar."""
-    start = datetime.combine(day, time(9, 30), tzinfo=ET) + timedelta(hours=hour_idx)
-    n = 6 if hour_idx == 6 else 12
+    """5-minute bars forming one clock-aligned hourly bar: index 0 is the
+    9:30-10:00 half hour (6 bars), index k>=1 is (9+k):00-(10+k):00 (12 bars)."""
+    if hour_idx == 0:
+        start, n = datetime.combine(day, time(9, 30), tzinfo=ET), 6
+    else:
+        start, n = datetime.combine(day, time(9 + hour_idx, 0), tzinfo=ET), 12
     out = []
     for k in range(n):
         t = start + k * FIVE
@@ -56,6 +60,12 @@ class ScriptedProvider:
     def five_min_bars(self, symbol, now):
         return [b for b in self.bars if b.end <= now]
 
+    def session_open(self, symbol, day, now):
+        for b in self.bars:  # the 9:30 print exists before its 5-minute bar closes
+            if b.session == day and b.start <= now:
+                return b.open
+        return None
+
 
 class IndicatorTests(unittest.TestCase):
     def test_ema_seed_and_recursion(self):
@@ -79,7 +89,8 @@ class IndicatorTests(unittest.TestCase):
         d = date(2026, 9, 21)
         bars = hour_bars(d, 0, 10, 10, 10, 10, vol=100) + hour_bars(d, 1, 20, 20, 20, 20, vol=300)
         end1 = session_hour_ends(d)[1]
-        self.assertAlmostEqual(session_vwap(bars, d, end1), (10 * 1200 + 20 * 3600) / 4800)
+        # hour 0 is the 9:30-10:00 half hour (6 bars), hour 1 is 10-11 (12 bars)
+        self.assertAlmostEqual(session_vwap(bars, d, end1), (10 * 600 + 20 * 3600) / 4200)
 
     def test_atr_and_cross(self):
         d = date(2026, 9, 21)
@@ -346,29 +357,79 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(v[0]["exit_reason"].startswith("target"))
         self.assertAlmostEqual(v[0]["exit_price"], 44.0)
 
+    def last_bar_cross(self):
+        """Uptrend, then the 15:00-16:00 bar drops hard enough to cross the
+        5 EMA below the 10 EMA. The next session opens at 47.0."""
+        ds = weekdays(date(2026, 8, 3), 10)
+        bars, p = [], 50.0
+        for d in ds[:-1]:
+            closes = [p + 0.1 * (k + 1) for k in range(7)]
+            if d == ds[-2]:
+                closes[-1] = closes[-2] - 3.0
+            bars += day_from_closes(d, closes)
+            p = closes[-1]
+        bars += day_from_closes(ds[-1], [47.0] * 7)
+        return bars, ds[-2], ds[-1]
+
+    def test_final_bar_signal_executes_at_next_open(self):
+        bars, d, nxt = self.last_bar_cross()
+        eng = self.engine(bars)
+        eng.add_symbols("OPN", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng.tick(datetime.combine(d, time(16, 5), tzinfo=ET))
+        q = "SELECT * FROM tranches WHERE sleeve='EMA5_10'"
+        self.assertFalse(self.store.q(q))                      # nothing at 16:00
+        eng.tick(datetime.combine(nxt, time(9, 32), tzinfo=ET))
+        t = self.store.q(q)[0]
+        self.assertEqual(t["side"], "short")
+        self.assertEqual(t["entry_time"], datetime.combine(nxt, time(9, 30), tzinfo=ET).isoformat())
+        self.assertAlmostEqual(t["entry_price"], 47.0)         # the opening print
+
+    def test_premarket_add_catches_yesterdays_last_bar(self):
+        bars, d, nxt = self.last_bar_cross()
+        eng = self.engine(bars)
+        eng.add_symbols("PRE", "short_only", 1.0, datetime.combine(nxt, time(8), tzinfo=ET))
+        eng.tick(datetime.combine(nxt, time(9, 32), tzinfo=ET))
+        self.assertTrue(self.store.q("SELECT 1 FROM tranches WHERE sleeve='EMA5_10'"))
+
+    def test_add_after_open_skips_yesterdays_last_bar(self):
+        bars, d, nxt = self.last_bar_cross()
+        eng = self.engine(bars)
+        eng.add_symbols("LTE", "short_only", 1.0, datetime.combine(nxt, time(9, 40), tzinfo=ET))
+        eng.tick(datetime.combine(nxt, time(10, 2), tzinfo=ET))
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE sleeve='EMA5_10'"))
+
+    def test_check_schedule(self):
+        d = date(2026, 9, 21)  # Monday
+        got = [b.strftime("%H:%M") for b in boundaries(d, timedelta(minutes=2))]
+        self.assertEqual(got, ["09:32", "10:02", "11:02", "12:02", "13:02", "14:02", "15:02"])
+        self.assertEqual(boundaries(date(2026, 9, 19), timedelta(0)), [])   # Saturday
+        end, acts = bar_for_boundary(datetime.combine(d, time(9, 32), tzinfo=ET), timedelta(minutes=2))
+        self.assertEqual(end, datetime.combine(date(2026, 9, 18), time(16), tzinfo=ET))  # Friday close
+        self.assertEqual(acts, datetime.combine(d, time(9, 30), tzinfo=ET))
+
     def test_behind_reports_unprocessed_hour(self):
         d = weekdays(date(2026, 8, 3), 1)[0]
         bars = day_from_closes(d, [50.0] * 7)
-        cut = datetime.combine(d, time(10, 15), tzinfo=ET)   # delayed feed
+        cut = datetime.combine(d, time(9, 45), tzinfo=ET)    # delayed feed
         feed = ScriptedProvider([b for b in bars if b.end <= cut])
         eng = Engine(self.store, feed)
         eng.add_symbols("DLY", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
         hour_end = session_hour_ends(d)[0]
-        eng.tick(datetime.combine(d, time(10, 32), tzinfo=ET))
+        eng.tick(datetime.combine(d, time(10, 2), tzinfo=ET))
         self.assertTrue(eng.behind(hour_end))                 # still waiting
         feed.bars = bars                                        # data arrives
-        eng.tick(datetime.combine(d, time(10, 47), tzinfo=ET))
+        eng.tick(datetime.combine(d, time(10, 17), tzinfo=ET))
         self.assertFalse(eng.behind(hour_end))
 
     def test_delayed_feed_does_not_close_partial_hour(self):
         d = weekdays(date(2026, 8, 3), 1)[0]
         bars = day_from_closes(d, [50.0] * 7)
-        cut = datetime.combine(d, time(10, 15), tzinfo=ET)   # feed lags: data to 10:15 only
+        cut = datetime.combine(d, time(9, 45), tzinfo=ET)    # feed lags: data to 9:45 only
         eng = self.engine([b for b in bars if b.end <= cut])
         eng.add_symbols("DLY", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
         with self.assertRaises(RuntimeError):
             eng._process_symbol(self.store.q("SELECT * FROM symbols")[0],
-                                datetime.combine(d, time(10, 32), tzinfo=ET), self.store.settings())
+                                datetime.combine(d, time(10, 2), tzinfo=ET), self.store.settings())
 
     def test_equity_accounting(self):
         bars, ds = self.uptrend_then_drop(8, lambda p: [p - 1.0, p - 2.5, p - 4, p - 3, p + 6, p + 7, p + 8])

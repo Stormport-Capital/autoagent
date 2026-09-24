@@ -36,19 +36,24 @@ def in_rth(ts: datetime) -> bool:
 
 
 def hourly_bucket(ts: datetime) -> tuple[datetime, datetime]:
-    """RTH-anchored hourly bucket: 9:30-10:30, ..., 14:30-15:30, 15:30-16:00."""
+    """Clock-aligned hourly bucket, as on standard hourly charts: the first
+    bar is the half hour 9:30-10:00, then 10-11, 11-12, ..., 15-16."""
     local = ts.astimezone(ET)
-    open_dt = datetime.combine(local.date(), RTH_OPEN, tzinfo=ET)
-    close_dt = datetime.combine(local.date(), RTH_CLOSE, tzinfo=ET)
-    idx = int((local - open_dt).total_seconds() // 3600)
-    start = open_dt + timedelta(hours=idx)
-    return start, min(start + timedelta(hours=1), close_dt)
+    day = local.date()
+    if local.time() < time(10, 0):
+        return (datetime.combine(day, RTH_OPEN, tzinfo=ET),
+                datetime.combine(day, time(10, 0), tzinfo=ET))
+    start = datetime.combine(day, time(local.hour, 0), tzinfo=ET)
+    return start, start + timedelta(hours=1)
 
 
 def session_hour_ends(day: date) -> list[datetime]:
-    """End times of the seven RTH hourly bars of a session."""
-    ends = [datetime.combine(day, time(h, 30), tzinfo=ET) for h in range(10, 16)]
-    return ends + [datetime.combine(day, RTH_CLOSE, tzinfo=ET)]
+    """End times of the seven RTH hourly bars: 10:00, 11:00, ..., 16:00."""
+    return [datetime.combine(day, time(h, 0), tzinfo=ET) for h in range(10, 17)]
+
+
+def is_final_bar(b: "Bar") -> bool:
+    return b.end.astimezone(ET).time() == RTH_CLOSE
 
 
 def resample_hourly(bars: list[Bar]) -> list[Bar]:

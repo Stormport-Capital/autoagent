@@ -139,9 +139,9 @@ orders are needed to match.
   portfolio, also closes that position at Alpaca.
 - **Stops are hourly, like the model.** There are no resting stop orders at
   Alpaca, so a stock can move past a stop inside the hour, just as in the model.
-- **After the close:** a signal on the 15:30–16:00 bar is checked at about
-  16:02. Its order queues and fills at the **next day's open**, while the model
-  books it at the 16:00 close.
+- **The last bar of the day (15:00–16:00)** is acted on at the **next day's
+  9:30 open check**. The model fills at the official opening price, and the
+  paper order goes out at about 9:32.
 - **Shorting:** the model assumes every stock can be borrowed. Alpaca may still
   **reject** shorts in hard-to-borrow names. A rejected order shows in the
   **Paper orders** tab, and the symbol shows as a mismatch on the Alpaca card.
@@ -153,31 +153,40 @@ orders are needed to match.
 
 ## Daily use: when to add symbols
 
-The app checks every watched symbol right after each hourly bar closes:
-**10:30, 11:30, 12:30, 13:30, 14:30, 15:30 and 16:00 ET**, plus a couple of
-minutes of delay. With a 15-minute-delayed data plan, it keeps re-checking every
-3 minutes until the full hour of data has arrived.
+Hourly bars are clock-aligned, like standard hourly charts: the first bar is the
+half hour **9:30–10:00**, then 10–11, 11–12, 12–1, 1–2, 2–3 and 3–4.
 
-- **Add symbols whenever you like.** Only hours that finish *after* you add a
-  symbol can trigger trades, so it never acts on old signals.
-- **Added before the open:** the first check is at about 10:32, on the
-  9:30–10:30 bar. The EMA lines already carry the previous days' history, so an
-  EMA cross can trigger at that first check. The VWAP tranche needs an earlier
-  hour of *today* that closed above VWAP, so its earliest possible entry is the
-  11:30 check.
-- **Added after the open** (say 11:05): the first check is at 11:32. The hours
-  already finished aren't traded, but they still count as today's history for
-  VWAP and the high of day. A cross that already happened before you added the
+**Checks run at 9:30, 10:00, 11:00, 12:00, 1:00, 2:00 and 3:00 ET**, plus a
+couple of minutes so the data can arrive:
+- **10:00 through 3:00:** each check acts on the bar that just closed, and
+  fills at that bar's close.
+- **9:30 open:** acts on **yesterday's 3:00–4:00 bar** (an EMA cross or VWAP
+  fail that printed at the end of the day) and fills at the opening price.
+  There is no separate 4:00 pm check.
+- **Delayed data:** with a 15-minute-delayed plan, each check keeps retrying
+  every 3 minutes until the data is complete.
+
+- **Add symbols whenever you like.** A signal only trades if it would execute
+  *after* you added the symbol, so it never acts on stale signals.
+- **Added before the open:** at the 9:30 check it acts on a signal from
+  yesterday's last bar, then checks every hour from 10:00. The EMA lines
+  already carry the previous days' history. The VWAP tranche needs an earlier
+  bar of *today* that closed above VWAP, so its earliest intraday entry is the
+  11:00 check (the 9:30–10:00 bar is the first "earlier" bar).
+- **Added after the open** (say 10:40): the first check is at 11:00. Earlier
+  bars today aren't traded, but they still count as today's history for VWAP
+  and the high of day. A cross that already happened before you added the
   symbol is not acted on; only the next new cross is.
-- **Added after 16:00:** nothing happens until about 10:32 the next trading day.
+- **Added after 3:00 pm:** the 3–4 bar is acted on at the next morning's 9:30
+  check.
 - **Symbols stay on the watchlist** until you click **Remove**. You don't
   re-enter them each day. **Pause** stops new entries but still manages open
   positions. **Flatten** closes that symbol's positions now.
 - **Positions carry overnight**:
   - EMA tranches: until the opposite cross or the stop.
   - VWAP tranche: until a new high of day above entry, or the 10-day average.
-- **Paper orders** go out right after each check. Orders from the 16:00 check
-  queue and fill at the next day's open.
+- **Paper orders** go out right after each check, including the 9:30 open
+  check.
 - **If the app was closed** during checks, it catches up when you start it. The
   model books those missed hours at their historical closes; the paper account
   can only trade at the current price. So the two can differ after downtime.

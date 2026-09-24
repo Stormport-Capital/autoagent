@@ -44,6 +44,15 @@ def redact(msg: str) -> str:
     return msg
 
 
+def _first_rth_open(rows, day: date) -> float | None:
+    """rows: (start datetime, open) in time order -> open of the 9:30 minute."""
+    for start, o in rows:
+        local = start.astimezone(ET)
+        if local.date() == day and local.time() >= RTH_OPEN and o is not None:
+            return float(o)
+    return None
+
+
 class YahooProvider:
     name = "yahoo"
     URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
@@ -72,6 +81,22 @@ class YahooProvider:
             if start + FIVE_MIN <= now:
                 bars.append(Bar(start, start + FIVE_MIN, o, h, l, c, float(v or 0)))
         return bars
+
+
+    def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
+        r = requests.get(self.URL.format(sym=symbol),
+                         params={"interval": "1m", "range": "1d", "includePrePost": "false"},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        if r.status_code != 200:
+            return None
+        try:
+            res = r.json()["chart"]["result"][0]
+            opens = res["indicators"]["quote"][0]["open"]
+            rows = [(datetime.fromtimestamp(t, tz=timezone.utc), opens[i])
+                    for i, t in enumerate(res["timestamp"])]
+        except (KeyError, IndexError, TypeError):
+            return None
+        return _first_rth_open(rows, day)
 
 
 class PolygonProvider:
@@ -106,6 +131,20 @@ class PolygonProvider:
             url = body.get("next_url")
             params = None  # next_url already carries the query and cursor
         return bars
+
+
+    def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
+        url = f"{self.base}/v2/aggs/ticker/{symbol}/range/1/minute/{day.isoformat()}/{day.isoformat()}"
+        try:
+            r = requests.get(url, params={"adjusted": "false", "sort": "asc", "limit": 50000},
+                             headers={"Authorization": f"Bearer {self.key}"}, timeout=20)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        rows = [(datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc), b["o"])
+                for b in r.json().get("results") or []]
+        return _first_rth_open(rows, day)
 
 
 class AlpacaProvider:
@@ -145,6 +184,22 @@ class AlpacaProvider:
             if not token:
                 return bars
             params["page_token"] = token
+
+
+    def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
+        start = datetime.combine(day, RTH_OPEN, tzinfo=ET)
+        try:
+            r = requests.get(self.URL.format(sym=symbol), timeout=20, params={
+                "timeframe": "1Min", "start": start.astimezone(timezone.utc).isoformat(),
+                "limit": 5, "adjustment": "raw", "feed": self.feed},
+                headers={"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret})
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        rows = [(datetime.fromisoformat(b["t"].replace("Z", "+00:00")), b["o"])
+                for b in r.json().get("bars") or []]
+        return _first_rth_open(rows, day)
 
 
 class DemoProvider:
@@ -193,6 +248,14 @@ class DemoProvider:
             self._cache[symbol] = cached = self._generate(symbol, through + timedelta(days=7))
         lo = now - timedelta(days=35)
         return [b for b in cached if lo <= b.start and b.end <= now]
+
+
+    def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
+        self.five_min_bars(symbol, now)  # make sure the day is generated
+        for b in self._cache.get(symbol, []):
+            if b.session == day:
+                return b.open  # the opening print exists from 9:30
+        return None
 
 
 def make_provider(name: str, demo_origin: date | None = None):
