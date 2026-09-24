@@ -71,7 +71,9 @@ Create `.env` from the template:
 - **Mac/Linux:** `cp .env.example .env`, then `open -e .env` (Mac) or `nano .env`
 - **Windows (PowerShell):** `copy .env.example .env`, then `notepad .env`
 
-Fill it in. No quotes and no spaces around `=`:
+Fill it in. No quotes and no spaces around `=`. Paste each key **inside the
+file**, after its `=`. Don't type anything into Notepad's "File name" box: the
+file name stays exactly `.env`.
 
 ```
 POLYGON_API_KEY=abc123...
@@ -81,14 +83,26 @@ APCA_API_SECRET_KEY=...
 
 (Alpaca paper key IDs usually start with `PK`.)
 
-## 4. Run it
+## 4. Run it: double-click
 
-```bash
-python app.py
-```
+In the `tranche-dashboard` folder, double-click **`Start Dashboard.bat`**
+(Windows) or **`Start Dashboard.command`** (Mac). It:
+1. gets the latest version and installs anything missing;
+2. on the very first run, creates `.env` and opens it in Notepad for your keys;
+3. starts the dashboard and opens it in your browser.
 
-The startup line should say `provider=polygon` and `alpaca paper=linked`. Then
-open <http://127.0.0.1:8050>.
+**Keep the black window open while it runs; close it to stop.** If you
+double-click again while it's already running, it just opens the browser. A
+second copy never starts.
+
+For a desktop icon on Windows, right-click `Start Dashboard.bat` → **Show more
+options** → **Send to** → **Desktop (create shortcut)**.
+
+The black window lists each key as `found`, `EMPTY` or `missing` (never the
+key itself), then shows `provider=polygon` and `alpaca paper=linked` once
+everything is in place.
+
+(From a terminal, `python app.py --open` does the same thing.)
 
 In the dashboard:
 1. **Portfolio settings**: set the portfolio size (match your paper balance)

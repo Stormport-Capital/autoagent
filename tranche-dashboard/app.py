@@ -17,6 +17,7 @@ import os
 import re
 import threading
 import time as _time
+import webbrowser
 from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,13 @@ from indicators import ET, RTH_OPEN, session_hour_ends
 from store import Store
 
 HERE = Path(__file__).parent
+
+
+class Server(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second process bind a port that is in use,
+    # which would let two copies trade at once. Only allow reuse elsewhere.
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
 
 
 KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
@@ -284,7 +292,18 @@ def main() -> None:
                     help="synthetic prices + simulated clock (fresh demo.db each run)")
     ap.add_argument("--demo-days", type=int, default=15, help="weekdays of history to replay")
     ap.add_argument("--demo-speed", type=float, default=2.0, help="seconds per simulated hour")
+    ap.add_argument("--open", action="store_true", help="open the dashboard in the browser")
     args = ap.parse_args()
+    url = f"http://{args.host}:{args.port}"
+
+    # Claim the port first: a second copy must never start trading alongside the first.
+    try:
+        server = Server((args.host, args.port), BaseHTTPRequestHandler)
+    except OSError:
+        print(f"The dashboard is already running at {url} - opening it.")
+        if args.open:
+            webbrowser.open(url)
+        return
     for note in load_dotenv(HERE / ".env"):
         print("  .env:", note)
     args.provider = args.provider or os.environ.get("TRANCHE_PROVIDER") or (
@@ -317,10 +336,12 @@ def main() -> None:
         store.save_settings({"broker_sync_enabled": False})
     sched = Scheduler(engine, clock, args.demo_speed, sync)
     sched.start()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(engine, sched, provider.name))
-    print(f"Tranche dashboard on http://{args.host}:{args.port}  "
+    server.RequestHandlerClass = make_handler(engine, sched, provider.name)
+    print(f"Tranche dashboard on {url}  "
           f"(provider={provider.name}, db={db}{', DEMO clock' if args.demo else ''}, "
           f"alpaca paper={'linked' if sync else 'not configured'})")
+    if args.open:
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

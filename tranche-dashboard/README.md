@@ -12,6 +12,10 @@ position with market orders. It is paper only: the paper endpoint is hard-coded,
 and there is no live-trading setting. **Step-by-step keys and setup:
 [SETUP.md](SETUP.md).**
 
+**Easiest:** double-click `Start Dashboard.bat` (Windows) or
+`Start Dashboard.command` (Mac). It installs what's needed, asks for your keys
+on the first run, and opens the dashboard in your browser.
+
 ```
 pip install -r requirements.txt
 cp .env.example .env            # then paste your keys (see SETUP.md)
