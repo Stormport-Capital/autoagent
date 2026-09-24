@@ -15,7 +15,6 @@ DEFAULT_SETTINGS = {
     "atr_period": 14,
     "max_leverage": 2.0,           # gross exposure cap as a multiple of equity
     "slippage_bps": 5.0,           # adverse fill vs bar close / stop, each side
-    "vwap_flatten_eod": True,      # VWAP tranche is intraday: cover at the close
     "bar_close_delay_min": 2,      # wait this long after an hourly bar closes
 }
 
@@ -43,6 +42,7 @@ CREATE TABLE IF NOT EXISTS tranches (
     entry_time TEXT NOT NULL,
     entry_price REAL NOT NULL,
     stop_price REAL NOT NULL,
+    target_price REAL,                      -- VWAP tranche: daily 10-MA
     risk_dollars REAL NOT NULL,
     fee_through TEXT NOT NULL,              -- last date borrow fee was charged
     borrow_fees REAL NOT NULL DEFAULT 0,
@@ -73,6 +73,9 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(tranches)")}
+        if "target_price" not in cols:  # databases created before the Russo exits
+            self.db.execute("ALTER TABLE tranches ADD COLUMN target_price REAL")
         self.db.commit()
 
     # -- generic helpers -------------------------------------------------

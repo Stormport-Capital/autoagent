@@ -119,6 +119,22 @@ def session_vwap(intraday: list[Bar], session: date, upto: datetime) -> float | 
     return pv / vol if vol > 0 else None
 
 
+def daily_closes(intraday: list[Bar]) -> dict[date, float]:
+    """Last RTH close of each session."""
+    out: dict[date, float] = {}
+    for b in sorted(intraday, key=lambda x: x.start):
+        if in_rth(b.start):
+            out[b.session] = b.close
+    return out
+
+
+def daily_sma(closes: dict[date, float], session: date, n: int) -> float | None:
+    """n-day simple average of the closes of the n sessions before `session`
+    (shifted one day, so it is constant through the session)."""
+    prior = [closes[d] for d in sorted(closes) if d < session][-n:]
+    return sum(prior) / n if len(prior) == n else None
+
+
 def crossed_below(a_prev, b_prev, a, b) -> bool:
     if None in (a_prev, b_prev, a, b):
         return False

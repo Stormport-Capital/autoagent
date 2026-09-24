@@ -126,7 +126,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
               <select id="borrow_day_count"><option value="360">360</option><option value="365">365</option></select></div>
           </div>
           <div class="row">
-            <div><label for="stop_atr_mult">Stop (× hourly ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
+            <div><label for="stop_atr_mult">EMA stop (× hourly ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
             <div><label for="atr_period">ATR period</label><input id="atr_period" type="number" step="1" min="2"></div>
           </div>
           <div class="row">
@@ -135,8 +135,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           </div>
           <div class="row">
             <div><label for="bar_close_delay_min">Check delay (min)</label><input id="bar_close_delay_min" type="number" step="1" min="0"></div>
-            <div><label for="vwap_flatten_eod">VWAP tranche at close</label>
-              <select id="vwap_flatten_eod"><option value="true">Flatten</option><option value="false">Hold</option></select></div>
+
           </div>
           <div style="margin-top:10px" class="row">
             <button class="primary" type="submit">Save settings</button>
@@ -243,7 +242,7 @@ function renderSettings(s) {
 
 function trancheCell(t, sleeve, mode) {
   if (!t) return `<span class="pill">flat</span>`;
-  return `<span class="pill ${t.side}" title="entry ${num(t.entry_price)} · stop ${num(t.stop_price)} · ${t.qty} sh">${t.side === "short" ? "S" : "L"} ${t.qty}</span>` +
+  return `<span class="pill ${t.side}" title="entry ${num(t.entry_price)} · stop ${num(t.stop_price)}${t.target_price == null ? "" : " · target " + num(t.target_price)} · ${t.qty} sh">${t.side === "short" ? "S" : "L"} ${t.qty}</span>` +
          `<span class="${cls(t.unrealized)}">${signed(t.unrealized)}</span>`;
 }
 
@@ -335,10 +334,10 @@ function renderTab() {
   let h = "";
   if (TAB === "open") {
     if (!m.open.length) return $("#tabBody").innerHTML = `<div class="empty">No open positions.</div>`;
-    h = `<table><thead><tr><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Side</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Mark</th>
+    h = `<table><thead><tr><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Side</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Target</th><th>Mark</th>
       <th>Notional</th><th>Risk</th><th>Borrow so far</th><th>Open P&amp;L (net)</th><th class="l">Opened</th></tr></thead><tbody>`;
     for (const t of m.open) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
-      <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${num(t.stop_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
+      <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${num(t.stop_price)}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
       <td>${usd(t.risk_dollars)}</td><td>${usd(t.borrow_fees, 2)}</td><td class="${cls(t.unrealized - t.borrow_fees)}">${signed(t.unrealized - t.borrow_fees)}</td><td class="l">${fmtT(t.entry_time)}</td></tr>`;
   } else if (TAB === "closed") {
     if (!m.closed.length) return $("#tabBody").innerHTML = `<div class="empty">No closed trades yet.</div>`;
@@ -378,7 +377,7 @@ document.querySelectorAll("#setForm input, #setForm select").forEach(el => el.on
 $("#setForm").onsubmit = async e => {
   e.preventDefault(); const msg = $("#setMsg"), body = {};
   for (const el of document.querySelectorAll("#setForm input, #setForm select"))
-    body[el.id] = el.id === "vwap_flatten_eod" ? el.value === "true" : Number(el.value);
+    body[el.id] = Number(el.value);
   try { await api("/api/settings", body); settingsDirty = false; msg.className = "msg ok"; msg.textContent = "Saved."; }
   catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
   refresh();

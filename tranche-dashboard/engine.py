@@ -9,10 +9,18 @@ third of the symbol's risk budget:
   VWAP      Russo "VWAP fail" (Trigger B), rising edge: an earlier hourly bar
             this session closed above VWAP, this bar closes below VWAP and
             prints a lower high than the session high so far -> short
-            (always short-only). Cover on an hourly close back above VWAP,
-            and at the close if vwap_flatten_eod.
+            (always short-only). Russo exits, stop checked before target:
+              stop   = max(session high of day incl. this bar, entry); fires on
+                       the first bar after entry that prints a new high of day
+                       (or trades back through entry on a later session), and
+                       fills at that level - the worst price in the bar
+              target = daily 10-day SMA of prior sessions' closes; covers when
+                       an hourly low touches it, filled at the target (or the
+                       open if the bar gaps below it). Entries already at or
+                       below the target are skipped.
+              held overnight; no end-of-session flatten.
 
-Every tranche also has a hard stop at stop_atr_mult x hourly ATR from entry.
+EMA tranches have a hard stop at stop_atr_mult x hourly ATR from entry.
 Sizing: qty = (equity x risk_pct / 3) / stop distance, capped so gross exposure
 stays <= equity x max_leverage. Fills are simulated at the hourly close (entries,
 signal exits) or at the stop / gapped open (stops), with slippage_bps adverse.
@@ -27,17 +35,18 @@ import math
 import re
 from datetime import date, datetime, time, timedelta
 
-from indicators import (ET, RTH_CLOSE, Bar, atr, crossed_above, crossed_below,
-                        ema, resample_hourly, session_vwap)
+from indicators import (ET, Bar, atr, crossed_above, crossed_below, daily_closes,
+                        daily_sma, ema, resample_hourly, session_vwap)
 from store import DEFAULT_SETTINGS, Store
 
 SLEEVES = ("EMA5_10", "EMA10_20", "VWAP")
 SLEEVE_LABELS = {
     "EMA5_10": "5/10 EMA cross",
     "EMA10_20": "10/20 EMA cross",
-    "VWAP": "VWAP loss",
+    "VWAP": "VWAP fail (Russo)",
 }
 RISK_MIN, RISK_MAX = 0.5, 3.0
+STALE_WAIT = timedelta(minutes=20)
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
 SETTING_BOUNDS = {
@@ -97,9 +106,6 @@ class Engine:
         for k, v in updates.items():
             if k not in DEFAULT_SETTINGS:
                 raise ValidationError(f"unknown setting {k}")
-            if k == "vwap_flatten_eod":
-                clean[k] = bool(v)
-                continue
             try:
                 num = float(v)
             except (TypeError, ValueError):
@@ -183,13 +189,19 @@ class Engine:
     def _process_symbol(self, sym: dict, now: datetime, s: dict) -> None:
         five = self.provider.five_min_bars(sym["symbol"], now)
         delay = timedelta(minutes=s["bar_close_delay_min"])
-        bars = [b for b in resample_hourly(five) if b.end + delay <= now]
+        # an hour counts as complete once the feed has printed through its end
+        # (delayed feeds lag), or 20 min later for names with no late prints
+        data_end = max((b.end for b in five), default=None)
+        bars = [b for b in resample_hourly(five)
+                if b.end + delay <= now
+                and ((data_end and data_end >= b.end) or b.end + max(delay, STALE_WAIT) <= now)]
         if not bars:
             raise RuntimeError("no completed hourly bars returned")
         closes = [b.close for b in bars]
         ind = {
             "e5": ema(closes, 5), "e10": ema(closes, 10), "e20": ema(closes, 20),
             "atr": atr(bars, int(s["atr_period"])),
+            "daily": daily_closes(five),
         }
         added = _dt(sym["added_at"])
         last = _dt(sym["last_bar_end"])
@@ -224,11 +236,27 @@ class Engine:
             for t in open_tr.values():
                 self._accrue_borrow(t, b.session, prev.close, s)
 
-        # 2. stops, checked against this bar's range (gap through = fill at open)
+        # 2. exits against this bar's range, stop before target
+        hod = max(x.high for x in bars[:i + 1] if x.session == b.session)  # incl. this bar
+        target = daily_sma(ind["daily"], b.session, 10)
         for sleeve, t in list(open_tr.items()):
             if b.end <= _dt(t["entry_time"]):
                 continue
-            stop = t["stop_price"]
+            if sleeve == "VWAP":  # Russo: new high of day stop, daily 10-MA target
+                stop = max(hod, t["entry_price"])
+                if b.high >= stop:
+                    self._close(t, stop, b.end, f"stop: new high of day {stop:.2f}", s)
+                elif target is not None and b.low <= target:
+                    # a gap below the target covers at the open, not above the bar
+                    self._close(t, min(target, b.open), b.end,
+                                f"target: daily 10-MA {target:.2f}", s)
+                else:
+                    self.store.x("UPDATE tranches SET stop_price=?, target_price=? WHERE id=?",
+                                 (stop, target, t["id"]))
+                    continue
+                del open_tr[sleeve]
+                continue
+            stop = t["stop_price"]  # EMA tranches: fixed ATR stop, gap = fill at open
             if t["side"] == "short" and b.high >= stop:
                 self._close(t, max(b.open, stop), b.end, "stop hit", s)
             elif t["side"] == "long" and b.low <= stop:
@@ -256,23 +284,17 @@ class Engine:
             return
         # Russo Trigger B, rising edge only: fires on the bar where it turns true
         lost = vwap_fail(bars, five, i) and not (i > 0 and vwap_fail(bars, five, i - 1))
-        last_bar = b.end.astimezone(ET).time() == RTH_CLOSE
-        t = open_tr.get("VWAP")
-        if t is not None:
-            if b.close > vwap:
-                self._close(t, b.close, b.end, f"reclaimed VWAP {vwap:.2f}", s)
-            elif last_bar and s["vwap_flatten_eod"]:
-                self._close(t, b.close, b.end, "end-of-session flatten", s)
-        elif lost:
-            if last_bar and s["vwap_flatten_eod"]:
-                self.store.log(b.end, "skip", "lost VWAP on the final bar; no entry "
-                               "(would flatten immediately)", name, "VWAP")
-            elif a is None:
-                self.store.log(b.end, "skip", "lost VWAP but ATR not ready", name, "VWAP")
-            else:
-                self._enter(sym, "VWAP", "short", b, a, s,
-                            f"VWAP fail: close {b.close:.2f} < VWAP {vwap:.2f}, "
-                            f"high {b.high:.2f} below HOD")
+        if lost and "VWAP" not in open_tr:
+            if target is not None and b.close <= target:
+                # Russo's arm gate (+100% in 5 sessions) keeps price far above the
+                # 10-MA; without it, a short already under its target has no room
+                self.store.log(b.end, "skip", f"VWAP fail but close {b.close:.2f} is already "
+                               f"at/below the daily 10-MA target {target:.2f}", name, "VWAP")
+                return
+            self._enter(sym, "VWAP", "short", b, None, s,
+                        f"VWAP fail: close {b.close:.2f} < VWAP {vwap:.2f}, "
+                        f"high {b.high:.2f} below HOD {hod:.2f}",
+                        stop_level=hod, target=target)
 
     def _ema_sleeve(self, sym, sleeve, t, b: Bar, a: float, s, down: bool, up: bool):
         label = "5/10" if sleeve == "EMA5_10" else "10/20"
@@ -290,15 +312,20 @@ class Engine:
                 self._enter(sym, sleeve, "long", b, a, s, f"{label} EMA crossed up")
 
     # ------------------------------------------------------------ fills
-    def _enter(self, sym, sleeve, side, b: Bar, a: float, s, why: str) -> None:
+    def _enter(self, sym, sleeve, side, b: Bar, a: float | None, s, why: str,
+               stop_level: float | None = None, target: float | None = None) -> None:
         name = sym["symbol"]
         if sym["status"] != "active":
             self.store.log(b.end, "skip", f"{why}: symbol paused, no entry", name, sleeve)
             return
         slip = s["slippage_bps"] / 1e4
         fill = b.close * (1 + slip) if side == "long" else b.close * (1 - slip)
-        dist = s["stop_atr_mult"] * a
-        stop = fill - dist if side == "long" else fill + dist
+        if stop_level is not None:  # structural stop (VWAP tranche: session HOD)
+            stop = max(stop_level, fill) if side == "short" else min(stop_level, fill)
+            dist = abs(stop - fill)
+        else:
+            dist = s["stop_atr_mult"] * a
+            stop = fill - dist if side == "long" else fill + dist
         if dist <= 0 or stop <= 0:
             self.store.log(b.end, "skip", f"{why}: invalid stop distance", name, sleeve)
             return
@@ -316,13 +343,14 @@ class Engine:
             return
         self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
-               entry_price, stop_price, risk_dollars, fee_through)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (sym["id"], name, sleeve, side, qty, b.end.isoformat(), fill, stop,
+               entry_price, stop_price, target_price, risk_dollars, fee_through)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (sym["id"], name, sleeve, side, qty, b.end.isoformat(), fill, stop, target,
              qty * dist, b.session.isoformat()))
         note = " (capped by max leverage)" if capped else ""
+        tgt = f", target {target:.2f}" if target is not None else ""
         self.store.log(b.end, "entry",
-                       f"{why} -> {side.upper()} {qty} @ {fill:.2f}, stop {stop:.2f}, "
+                       f"{why} -> {side.upper()} {qty} @ {fill:.2f}, stop {stop:.2f}{tgt}, "
                        f"risk ${qty * dist:,.0f}{note}", name, sleeve)
 
     def _close(self, t: dict, price: float, when: datetime, reason: str, s) -> None:

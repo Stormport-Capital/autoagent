@@ -1,6 +1,7 @@
 """Tranche dashboard: local web server + hourly scheduler.
 
     python app.py                      # live prices from Yahoo, http://127.0.0.1:8050
+    python app.py --provider polygon   # Polygon data (POLYGON_API_KEY), recommended
     python app.py --provider alpaca    # Alpaca market data (keys via env)
     python app.py --demo               # synthetic prices on a fast simulated clock
 
@@ -209,7 +210,7 @@ def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--provider", default=os.environ.get("TRANCHE_PROVIDER", "yahoo"),
-                    choices=["yahoo", "alpaca", "demo"])
+                    choices=["polygon", "yahoo", "alpaca", "demo"])
     ap.add_argument("--db", default=None, help="SQLite file (default tranche.db / demo.db)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8050)

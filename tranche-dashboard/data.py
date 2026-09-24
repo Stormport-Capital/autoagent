@@ -1,6 +1,9 @@
 """Market-data providers. Each returns 5-minute bars; hourly bars and VWAP are
 derived from them in indicators.py so every provider behaves identically.
 
+  polygon - needs POLYGON_API_KEY. Consolidated (all-exchange) volume, so VWAP
+            is accurate. Real-time on paid real-time plans; Starter-tier data
+            is 15-minute delayed (the engine waits for each hour's data).
   yahoo   - no key; unofficial chart endpoint (can rate-limit or change).
   alpaca  - needs APCA_API_KEY_ID / APCA_API_SECRET_KEY. Free plan = IEX feed,
             whose volume is a small slice of the tape, so VWAP is approximate.
@@ -54,6 +57,36 @@ class YahooProvider:
             start = datetime.fromtimestamp(t, tz=timezone.utc).astimezone(ET)
             if start + FIVE_MIN <= now:
                 bars.append(Bar(start, start + FIVE_MIN, o, h, l, c, float(v or 0)))
+        return bars
+
+
+class PolygonProvider:
+    name = "polygon"
+
+    def __init__(self):
+        self.key = os.environ.get("POLYGON_API_KEY")
+        self.base = os.environ.get("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/")
+        if not self.key:
+            raise DataError("Set POLYGON_API_KEY for the polygon provider")
+
+    def five_min_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        start = (now - timedelta(days=35)).date().isoformat()
+        url = (f"{self.base}/v2/aggs/ticker/{symbol}/range/5/minute/"
+               f"{start}/{now.date().isoformat()}")
+        params = {"adjusted": "false", "sort": "asc", "limit": 50000, "apiKey": self.key}
+        bars: list[Bar] = []
+        while url:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code != 200:
+                raise DataError(f"Polygon HTTP {r.status_code} for {symbol}: {r.text[:200]}")
+            body = r.json()
+            for b in body.get("results") or []:
+                t0 = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).astimezone(ET)
+                if t0 + FIVE_MIN <= now:
+                    bars.append(Bar(t0, t0 + FIVE_MIN, b["o"], b["h"], b["l"], b["c"],
+                                    float(b.get("v") or 0)))
+            url = body.get("next_url")
+            params = {"apiKey": self.key}  # next_url already carries the cursor
         return bars
 
 
@@ -147,6 +180,8 @@ class DemoProvider:
 def make_provider(name: str, demo_origin: date | None = None):
     if name == "yahoo":
         return YahooProvider()
+    if name == "polygon":
+        return PolygonProvider()
     if name == "alpaca":
         return AlpacaProvider()
     if name == "demo":

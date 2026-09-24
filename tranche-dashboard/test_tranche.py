@@ -254,29 +254,103 @@ class EngineTests(unittest.TestCase):
         eng.tick(now)
         self.assertEqual(len(self.store.q("SELECT * FROM tranches")), n)
 
-    def test_vwap_tranche_edge_entry_and_reclaim_exit(self):
-        self.store.save_settings({"stop_atr_mult": 10.0})  # isolate the reclaim exit
-        ds = weekdays(date(2026, 8, 3), 9)
+    def russo_vwap(self, entry_day_rest, next_day=None):
+        """10 flat sessions at 45 (daily 10-MA ~45), then a session whose second
+        hour is a VWAP fail (short 49.5, HOD 52), then `entry_day_rest` for
+        hours 2-6 and optionally a next session. Returns the VWAP tranches."""
+        ds = weekdays(date(2026, 8, 3), 12)
         bars = []
-        for d in ds[:-1]:
-            bars += day_from_closes(d, [50.0] * 7)
-        d = ds[-1]
-        bars += hour_bars(d, 0, 50.0, 52.0, 49.8, 51.5)   # closes above VWAP, HOD 52
-        bars += hour_bars(d, 1, 51.5, 51.8, 49.4, 49.5)   # VWAP fail -> short
-        bars += hour_bars(d, 2, 49.5, 49.9, 49.1, 49.3)   # still true: no second entry
-        bars += hour_bars(d, 3, 49.3, 51.9, 49.2, 51.8)   # closes back above VWAP -> cover
-        for k in range(4, 7):
-            bars += hour_bars(d, k, 51.8, 51.9, 51.7, 51.8)
+        for d in ds[:10]:
+            bars += day_from_closes(d, [45.0] * 7)
+        d = ds[10]
+        bars += hour_bars(d, 0, 48.0, 52.0, 47.8, 51.5)   # closes above VWAP, HOD 52
+        bars += hour_bars(d, 1, 51.5, 51.8, 49.4, 49.5)   # VWAP fail -> short 49.5
+        for k, spec in enumerate(entry_day_rest, start=2):
+            bars += hour_bars(d, k, *spec)
+        end = datetime.combine(d, time(16, 5), tzinfo=ET)
+        if next_day:
+            for k, spec in enumerate(next_day):
+                bars += hour_bars(ds[11], k, *spec)
+            end = datetime.combine(ds[11], time(16, 5), tzinfo=ET)
         eng = self.engine(bars)
         eng.add_symbols("VWP", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
-        eng.tick(datetime.combine(d, time(16, 5), tzinfo=ET))
-        v = self.store.q("SELECT * FROM tranches WHERE sleeve='VWAP'")
-        self.assertEqual(len(v), 1)
-        self.assertEqual(v[0]["side"], "short")
-        self.assertEqual(v[0]["entry_time"], session_hour_ends(d)[1].isoformat())
-        self.assertAlmostEqual(v[0]["entry_price"], 49.5)
-        self.assertTrue(v[0]["exit_reason"].startswith("reclaimed VWAP"))
-        self.assertEqual(v[0]["exit_time"], session_hour_ends(d)[3].isoformat())
+        eng.tick(end)
+        return self.store.q("SELECT * FROM tranches WHERE sleeve='VWAP' ORDER BY id"), d, ds
+
+    CALM = (49.3, 49.5, 48.8, 49.0)
+
+    def test_vwap_entry_is_edge_triggered_with_hod_stop(self):
+        v, d, _ = self.russo_vwap([(49.5, 49.9, 49.1, 49.3)] + [self.CALM] * 4)
+        self.assertEqual(len(v), 1)  # still true on hour 3: no second entry
+        t = v[0]
+        self.assertEqual(t["side"], "short")
+        self.assertEqual(t["entry_time"], session_hour_ends(d)[1].isoformat())
+        self.assertAlmostEqual(t["entry_price"], 49.5)
+        self.assertAlmostEqual(t["stop_price"], 52.0)          # session HOD
+        self.assertAlmostEqual(t["target_price"], 45.0)        # daily 10-MA
+        self.assertAlmostEqual(t["risk_dollars"], t["qty"] * 2.5)
+        self.assertEqual(t["status"], "open")                  # held overnight
+
+    def test_vwap_stop_on_new_high_of_day_fills_at_that_high(self):
+        v, d, _ = self.russo_vwap([self.CALM, (49.0, 52.6, 48.9, 50.0)] + [self.CALM] * 3)
+        t = v[0]
+        self.assertTrue(t["exit_reason"].startswith("stop: new high of day"))
+        self.assertAlmostEqual(t["exit_price"], 52.6)
+        self.assertEqual(t["exit_time"], session_hour_ends(d)[3].isoformat())
+
+    def test_vwap_stop_checked_before_target(self):
+        v, _, _ = self.russo_vwap([(49.5, 52.5, 44.0, 45.0)] + [self.CALM] * 4)
+        self.assertTrue(v[0]["exit_reason"].startswith("stop"))
+
+    def test_vwap_target_next_session_after_overnight_hold(self):
+        nxt = [(48.0, 48.5, 47.0, 47.5), (47.5, 47.6, 44.8, 45.5)] + [(45.5, 45.8, 45.2, 45.5)] * 5
+        v, _, ds = self.russo_vwap([self.CALM] * 5, next_day=nxt)
+        t = v[0]
+        target = (9 * 45.0 + 49.0) / 10   # 10-MA through the entry day's close
+        self.assertTrue(t["exit_reason"].startswith("target: daily 10-MA"))
+        self.assertAlmostEqual(t["exit_price"], target)
+        self.assertEqual(t["exit_time"], session_hour_ends(ds[11])[1].isoformat())
+        self.assertGreater(t["borrow_fees"], 0)            # one night held
+
+    def test_vwap_stop_next_session_needs_price_above_entry(self):
+        # next day: first bar is its own HOD but below entry -> no stop;
+        # second bar makes a new HOD above entry -> stopped at that high
+        nxt = [(48.0, 48.5, 47.0, 47.5), (47.5, 50.2, 47.4, 50.0)] + [self.CALM] * 5
+        v, _, ds = self.russo_vwap([self.CALM] * 5, next_day=nxt)
+        t = v[0]
+        self.assertTrue(t["exit_reason"].startswith("stop"))
+        self.assertAlmostEqual(t["exit_price"], 50.2)
+        self.assertEqual(t["exit_time"], session_hour_ends(ds[11])[1].isoformat())
+
+    def test_vwap_skips_entry_already_below_target(self):
+        ds = weekdays(date(2026, 8, 3), 11)
+        bars = []
+        for d in ds[:10]:
+            bars += day_from_closes(d, [60.0] * 7)          # 10-MA 60, above price
+        d = ds[10]
+        bars += hour_bars(d, 0, 48.0, 52.0, 47.8, 51.5)
+        bars += hour_bars(d, 1, 51.5, 51.8, 49.4, 49.5)     # VWAP fail below the 10-MA
+        eng = self.engine(bars)
+        eng.add_symbols("LOW", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng.tick(datetime.combine(d, time(11, 35), tzinfo=ET))
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE sleeve='VWAP'"))
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE sleeve='VWAP' AND kind='skip'"))
+
+    def test_vwap_target_gap_down_covers_at_open(self):
+        nxt = [(44.0, 44.5, 43.5, 44.2)] + [(44.2, 44.4, 44.0, 44.2)] * 6
+        v, _, ds = self.russo_vwap([self.CALM] * 5, next_day=nxt)
+        self.assertTrue(v[0]["exit_reason"].startswith("target"))
+        self.assertAlmostEqual(v[0]["exit_price"], 44.0)
+
+    def test_delayed_feed_does_not_close_partial_hour(self):
+        d = weekdays(date(2026, 8, 3), 1)[0]
+        bars = day_from_closes(d, [50.0] * 7)
+        cut = datetime.combine(d, time(10, 15), tzinfo=ET)   # feed lags: data to 10:15 only
+        eng = self.engine([b for b in bars if b.end <= cut])
+        eng.add_symbols("DLY", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        with self.assertRaises(RuntimeError):
+            eng._process_symbol(self.store.q("SELECT * FROM symbols")[0],
+                                datetime.combine(d, time(10, 32), tzinfo=ET), self.store.settings())
 
     def test_equity_accounting(self):
         bars, ds = self.uptrend_then_drop(8, lambda p: [p - 1.0, p - 2.5, p - 4, p - 3, p + 6, p + 7, p + 8])
