@@ -5,13 +5,18 @@ checks them after every hourly bar closes, and trades a **mock portfolio** in
 three thirds per symbol. Performance is tracked in total, per tranche, per side
 and per symbol.
 
-**Mock portfolio only.** It never talks to a broker and never places an order.
-Every fill is simulated.
+The model keeps its own books: simulated fills, per-tranche attribution and
+borrow fees. It can also be **linked to an Alpaca paper account**. With that on,
+after each hourly check the paper account is brought to the model's net
+position with market orders. It is paper only: the paper endpoint is hard-coded,
+and there is no live-trading setting. **Step-by-step keys and setup:
+[SETUP.md](SETUP.md).**
 
 ```
 pip install -r requirements.txt
-POLYGON_API_KEY=... python app.py --provider polygon   # recommended; open http://127.0.0.1:8050
-python app.py                   # no key: live prices from Yahoo
+cp .env.example .env            # then paste your keys (see SETUP.md)
+python app.py                   # uses Polygon when POLYGON_API_KEY is set; open http://127.0.0.1:8050
+python app.py --provider yahoo  # no key: prices from Yahoo
 python app.py --provider alpaca # Alpaca market data: set APCA_API_KEY_ID / APCA_API_SECRET_KEY
 python app.py --demo            # synthetic prices on a fast simulated clock (no network)
 python test_tranche.py          # offline test suite
@@ -46,12 +51,12 @@ Each tranche gets one third of that budget.
   from entry (default 1.5×). A stop is detected from each hourly bar's high or low
   and fills at the stop price, or at the bar's open if price gapped through it.
 - **VWAP tranche notes (as in the Russo engine):** if a bar makes a new high of
-  day and touches the 10-day average, it counts as a stop, not a win. Russo's setup
-  filter (+100% in 5 sessions) keeps price far above the 10-day average. This
-  dashboard doesn't apply that filter, so **a VWAP fail that closes at or below
-  the 10-day average is skipped** because it has no room to its target. That
-  skip is not in the Russo code. A bar that gaps below the target covers at its
-  open. The 20-day average second target is
+  day and touches the 10-day average, it counts as a stop, not a win. There are **no
+  setup or entry filters**: you choose the symbols. Russo's +100%-in-5-sessions
+  filter is not applied. So a VWAP fail that fires while price is already at or
+  below the 10-day average is still shorted, and it covers at the next bar's
+  open. That's roughly a scratch trade that costs slippage. A bar that gaps
+  below the target covers at its open. The 20-day average second target is
   not modelled: it only matters with scale-ins, and those are off in the Russo
   harness too. The target needs 10 prior sessions of data; with less history
   there is no target until there is.
@@ -74,7 +79,7 @@ Each tranche gets one third of that budget.
 | Provider | Key | Caveat |
 |---|---|---|
 | `polygon` (recommended) | `POLYGON_API_KEY` | Consolidated all-exchange volume, so VWAP is accurate. Plans without real-time data are 15 minutes delayed, and checks then land about 15 minutes after each hour |
-| `yahoo` (default) | none | Unofficial endpoint. It can rate-limit or change without notice |
+| `yahoo` (fallback without a Polygon key) | none | Unofficial endpoint. It can rate-limit or change without notice |
 | `alpaca` | `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` | The free plan's IEX feed carries only a small slice of total volume, so VWAP is approximate. Set `ALPACA_DATA_FEED=sip` if your plan includes consolidated data |
 | `demo` | none | Synthetic regime-switching prices. **Demo P&L means nothing**: the generator trends, and trend-following does well on it |
 
@@ -83,6 +88,7 @@ Each tranche gets one third of that budget.
 - `engine.py` — strategy rules, sizing, fills, borrow fees and performance stats
 - `indicators.py` — hourly resampling, EMA, ATR, session VWAP and crosses (pure functions)
 - `data.py` — Polygon, Yahoo, Alpaca and demo providers (5-minute bars)
+- `broker.py` — Alpaca paper link: net-position sync, order log, reconciliation
 - `store.py` — SQLite state (`tranche.db`), including settings defaults
 - `app.py` — web server and the hourly scheduler
 - `static/index.html` — the dashboard page

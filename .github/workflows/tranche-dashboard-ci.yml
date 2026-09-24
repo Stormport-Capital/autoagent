@@ -33,7 +33,7 @@ jobs:
 
       - name: Compile
         working-directory: tranche-dashboard
-        run: python -m py_compile app.py engine.py indicators.py data.py store.py test_tranche.py
+        run: python -m py_compile app.py broker.py engine.py indicators.py data.py store.py test_tranche.py
 
       - name: Run tests
         working-directory: tranche-dashboard

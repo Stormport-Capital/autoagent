@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, time, timedelta
 
+from broker import AlpacaPaper, BrokerError, BrokerSync
 from engine import Engine, ValidationError, vwap_fail
 from indicators import (ET, Bar, atr, crossed_below, ema, resample_hourly,
                         session_hour_ends, session_vwap)
@@ -322,7 +323,7 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(t["exit_price"], 50.2)
         self.assertEqual(t["exit_time"], session_hour_ends(ds[11])[1].isoformat())
 
-    def test_vwap_skips_entry_already_below_target(self):
+    def test_vwap_below_target_still_enters_and_covers_next_open(self):
         ds = weekdays(date(2026, 8, 3), 11)
         bars = []
         for d in ds[:10]:
@@ -330,11 +331,14 @@ class EngineTests(unittest.TestCase):
         d = ds[10]
         bars += hour_bars(d, 0, 48.0, 52.0, 47.8, 51.5)
         bars += hour_bars(d, 1, 51.5, 51.8, 49.4, 49.5)     # VWAP fail below the 10-MA
+        bars += hour_bars(d, 2, 49.6, 49.9, 49.2, 49.4)
         eng = self.engine(bars)
         eng.add_symbols("LOW", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
-        eng.tick(datetime.combine(d, time(11, 35), tzinfo=ET))
-        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE sleeve='VWAP'"))
-        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE sleeve='VWAP' AND kind='skip'"))
+        eng.tick(datetime.combine(d, time(12, 35), tzinfo=ET))
+        v = self.store.q("SELECT * FROM tranches WHERE sleeve='VWAP'")
+        self.assertEqual(len(v), 1)                        # no entry filter
+        self.assertTrue(v[0]["exit_reason"].startswith("target"))
+        self.assertAlmostEqual(v[0]["exit_price"], 49.6)   # next bar's open, not 60
 
     def test_vwap_target_gap_down_covers_at_open(self):
         nxt = [(44.0, 44.5, 43.5, 44.2)] + [(44.2, 44.4, 44.0, 44.2)] * 6
@@ -359,6 +363,140 @@ class EngineTests(unittest.TestCase):
         eng.tick(datetime.combine(ds[-1], time(16, 5), tzinfo=ET))
         s = eng.summary()
         self.assertAlmostEqual(s["equity"], 100_000 + s["realized_net"] + s["unrealized"], places=6)
+
+
+class FakeBroker:
+    """In-memory stand-in for AlpacaPaper: market orders fill instantly
+    unless `hold` is set, and `reject` names symbols to refuse."""
+
+    def __init__(self, positions=None, hold=False, reject=()):
+        self.pos = dict(positions or {})
+        self.hold, self.reject = hold, set(reject)
+        self.orders, self.sent = {}, []
+
+    def positions(self):
+        return {s: {"qty": str(q), "avg_entry_price": "10", "unrealized_pl": "0"}
+                for s, q in self.pos.items() if q}
+
+    def open_orders(self):
+        return [o for o in self.orders.values() if o["status"] == "accepted"]
+
+    def account(self):
+        return {"equity": "100000", "cash": "100000", "buying_power": "200000",
+                "last_equity": "100000", "status": "ACTIVE", "shorting_enabled": True}
+
+    def submit(self, symbol, qty, side, cid):
+        if symbol in self.reject:
+            raise BrokerError("Alpaca 403: asset not shortable")
+        self.sent.append((symbol, side, qty))
+        oid = f"o{len(self.orders)}"
+        o = {"id": oid, "symbol": symbol, "status": "accepted", "filled_qty": "0",
+             "filled_avg_price": None, "filled_at": None}
+        self.orders[oid] = o
+        if not self.hold:
+            self.fill(oid)
+        return dict(o)
+
+    def fill(self, oid):
+        o = self.orders[oid]
+        o.update(status="filled", filled_qty="1", filled_avg_price="10")
+        sym, side, qty = self.sent[int(oid[1:])]
+        self.pos[sym] = self.pos.get(sym, 0) + (qty if side == "buy" else -qty)
+
+    def get_order(self, oid):
+        return dict(self.orders[oid])
+
+
+class BrokerSyncTests(unittest.TestCase):
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = Store(self.path)
+        self.eng = Engine(self.store, ScriptedProvider([]))
+
+    def tearDown(self):
+        self.store.db.close()
+        os.remove(self.path)
+
+    def add(self, sym):
+        self.eng.add_symbols(sym, "long_short", 1.0, self.NOW)
+        return self.store.q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+
+    def tranche(self, sym, sleeve, side, qty):
+        sid = self.store.q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+        self.store.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                        entry_price, stop_price, risk_dollars, fee_through)
+                        VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21')""",
+                     (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
+
+    def test_refuses_live_endpoint(self):
+        with self.assertRaises(BrokerError):
+            AlpacaPaper("k", "s", base_url="https://api.alpaca.markets")
+        AlpacaPaper("k", "s")  # the paper default is accepted
+
+    def test_mirrors_net_position_and_is_idempotent(self):
+        self.add("AAA")
+        self.tranche("AAA", "EMA5_10", "short", 100)
+        self.tranche("AAA", "VWAP", "short", 50)
+        fb = FakeBroker()
+        sync = BrokerSync(self.store, fb, fill_wait_s=0)
+        sync.sync(self.NOW)
+        self.assertEqual(fb.sent, [("AAA", "sell", 150)])
+        sync.sync(self.NOW)
+        self.assertEqual(len(fb.sent), 1)
+        self.assertEqual(self.store.q("SELECT status FROM orders")[0]["status"], "filled")
+
+    def test_leaves_unmanaged_symbols_alone(self):
+        fb = FakeBroker(positions={"MANUAL": 300})
+        BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
+        self.assertEqual(fb.sent, [])
+
+    def test_reversal_closes_then_opens(self):
+        self.add("REV")
+        self.tranche("REV", "EMA5_10", "short", 80)
+        fb = FakeBroker(positions={"REV": 100})
+        BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
+        self.assertEqual(fb.sent, [("REV", "sell", 100), ("REV", "sell", 80)])
+        self.assertEqual(fb.pos["REV"], -80)
+
+    def test_working_order_blocks_duplicates(self):
+        self.add("SLO")
+        self.tranche("SLO", "EMA5_10", "long", 40)
+        fb = FakeBroker(hold=True)
+        sync = BrokerSync(self.store, fb, fill_wait_s=0)
+        sync.sync(self.NOW)
+        sync.sync(self.NOW)
+        self.assertEqual(fb.sent, [("SLO", "buy", 40)])
+        self.assertTrue(sync.needs_followup)
+
+    def test_rejection_is_recorded(self):
+        self.add("HTB")
+        self.tranche("HTB", "VWAP", "short", 25)
+        fb = FakeBroker(reject={"HTB"})
+        BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
+        o = self.store.q("SELECT * FROM orders")[0]
+        self.assertEqual(o["status"], "rejected")
+        self.assertIn("not shortable", o["message"])
+
+    def test_removed_symbol_is_closed_at_paper(self):
+        sid = self.add("BYE")
+        fb = FakeBroker(positions={"BYE": -60})
+        self.store.x("UPDATE symbols SET status='removed' WHERE id=?", (sid,))
+        BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
+        self.assertEqual(fb.sent, [("BYE", "buy", 60)])
+
+    def test_status_reports_mismatch(self):
+        self.add("MIS")
+        self.tranche("MIS", "EMA5_10", "long", 10)
+        st = BrokerSync(self.store, FakeBroker()).status()
+        self.assertEqual(st["reconciliation"][0]["model"], 10)
+        self.assertFalse(st["reconciliation"][0]["match"])
+
+    def test_sync_setting_is_boolean(self):
+        self.assertFalse(self.store.settings()["broker_sync_enabled"])
+        self.assertTrue(self.eng.update_settings({"broker_sync_enabled": True})["broker_sync_enabled"])
 
 
 if __name__ == "__main__":

@@ -8,13 +8,13 @@
 :root {
   --bg: #f6f7f9; --surface: #ffffff; --ink: #16181d; --ink-2: #4a505c; --muted: #7a808c;
   --line: #e3e6eb; --accent: #2f5fd0; --good: #1a7f4b; --bad: #c0362c; --warn: #9a6700;
-  --chip: #eef1f6; --series: #2f5fd0;
+  --chip: #eef1f6; --series: #2f5fd0; --series-2: #c2620b;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0f1115; --surface: #171a20; --ink: #e8eaee; --ink-2: #b4bac4; --muted: #858c98;
     --line: #2a2f38; --accent: #7aa2ff; --good: #4cc38a; --bad: #ff6b5e; --warn: #e3b341;
-    --chip: #222730; --series: #7aa2ff;
+    --chip: #222730; --series: #3987e5; --series-2: #d95926;
   }
 }
 * { box-sizing: border-box; }
@@ -74,7 +74,13 @@ tbody tr:hover { background: var(--chip); }
 .chart svg { width: 100%; height: 220px; display: block; }
 .chart .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12); display: none; white-space: nowrap; }
-.tabs { display: flex; gap: 4px; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); font-weight: 400; }
+.legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; }
+.switch { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--ink); font-size: 13px; cursor: pointer; }
+.switch input { width: auto; }
+.bk-kpis { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 12px; margin: 10px 0; font-variant-numeric: tabular-nums; }
+.bk-kpis div span { display: block; color: var(--muted); font-size: 11.5px; }
 .tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
 .log td { white-space: normal; text-align: left; }
 .log td.ts { white-space: nowrap; color: var(--muted); }
@@ -118,7 +124,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
       <section class="card">
         <h2>Portfolio settings</h2>
         <form id="setForm">
-          <label for="starting_capital">Mock portfolio size ($)</label>
+          <label for="starting_capital">Portfolio size ($)</label>
           <input id="starting_capital" type="number" min="1000" step="1000">
           <div class="row">
             <div><label for="borrow_rate_pct">Borrow rate (%/yr)</label><input id="borrow_rate_pct" type="number" step="0.5" min="0"></div>
@@ -144,6 +150,11 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           <div class="msg" id="setMsg"></div>
         </form>
       </section>
+
+      <section class="card">
+        <h2>Alpaca paper account <small id="bkState"></small></h2>
+        <div id="bkBody"></div>
+      </section>
     </div>
 
     <div style="display:grid; gap:16px; min-width:0">
@@ -153,7 +164,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
       </section>
 
       <section class="card">
-        <h2>Equity <small id="curveNote"></small></h2>
+        <h2>Equity <span class="legend" id="legend"></span></h2>
         <div class="chart" id="chart"><svg></svg><div class="tip"></div></div>
       </section>
 
@@ -170,6 +181,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
         <button data-tab="open" class="on">Open positions</button>
         <button data-tab="closed">Closed trades</button>
         <button data-tab="symbols">By symbol</button>
+        <button data-tab="orders">Paper orders</button>
         <button data-tab="log">Signal log</button>
       </div>
     </h2>
@@ -207,7 +219,7 @@ async function refresh() {
 function render() {
   const S = STATE, m = S.summary, o = m.overall;
   $("#meta").innerHTML = [
-    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : "Mock portfolio · no broker orders"}</span>`,
+    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : (S.settings.broker_sync_enabled ? "Model + Alpaca PAPER orders" : "Model only · no orders sent")}</span>`,
     `<span>Data: ${esc(S.provider)}</span>`,
     `<span>${S.demo ? "Sim time" : "Now"}: ${fmtT(S.now)} · market ${S.market_open ? "open" : "closed"}</span>`,
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
@@ -229,7 +241,8 @@ function render() {
 
   renderSettings(S.settings);
   renderWatch(S);
-  renderChart(m.curve, m.starting_capital);
+  renderBroker(S.broker);
+  renderChart(m.curve, m.starting_capital, S.broker.curve || []);
   renderPerf(m);
   renderTab();
 }
@@ -273,43 +286,90 @@ function renderWatch(S) {
   $("#watch").innerHTML = h + "</tbody>";
 }
 
-function renderChart(curve, start) {
+function renderChart(curve, start, paper) {
   const svg = $("#chart svg"), tip = $("#chart .tip");
   const W = svg.clientWidth || 600, H = 220, P = {l: 64, r: 12, t: 10, b: 24};
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-  $("#curveNote").textContent = curve.length ? `${curve.length} hourly snapshots` : "";
-  if (curve.length < 2) { svg.innerHTML = `<text x="${P.l}" y="${H / 2}" fill="var(--muted)" font-size="13">Equity curve appears after the first hourly checks.</text>`; return; }
-  const ys = curve.map(p => p.equity).concat([start]);
+  const series = [{name: "Model", color: "var(--series)", pts: curve}];
+  if (paper.length) series.push({name: "Alpaca paper", color: "var(--series-2)", pts: paper});
+  $("#legend").innerHTML = series.length > 1
+    ? series.map(se => `<span><i style="background:${se.color}"></i>${se.name}</span>`).join("") : "";
+  const all = series.flatMap(se => se.pts);
+  if (all.length < 2) { svg.innerHTML = `<text x="${P.l}" y="${H / 2}" fill="var(--muted)" font-size="13">Equity curve appears after the first hourly checks.</text>`; return; }
+  const ts = all.map(p => Date.parse(p.ts)), t0 = Math.min(...ts), t1 = Math.max(...ts) || t0 + 1;
+  const ys = all.map(p => p.equity).concat([start]);
   let lo = Math.min(...ys), hi = Math.max(...ys); const pad = (hi - lo) * 0.1 || hi * 0.005; lo -= pad; hi += pad;
-  const x = i => P.l + (W - P.l - P.r) * i / (curve.length - 1);
+  const x = t => P.l + (W - P.l - P.r) * (t1 === t0 ? 1 : (t - t0) / (t1 - t0));
   const y = v => P.t + (H - P.t - P.b) * (1 - (v - lo) / (hi - lo));
   let g = "";
   for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4;
     g += `<line x1="${P.l}" x2="${W - P.r}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/>` +
          `<text x="${P.l - 6}" y="${y(v) + 4}" text-anchor="end" fill="var(--muted)" font-size="11">${usd(v)}</text>`; }
   g += `<line x1="${P.l}" x2="${W - P.r}" y1="${y(start)}" y2="${y(start)}" stroke="var(--muted)" stroke-dasharray="3 3"/>`;
-  const first = new Date(curve[0].ts), last = new Date(curve.at(-1).ts);
-  const d8 = d => d.toLocaleDateString(undefined, {month: "short", day: "numeric", timeZone: "America/New_York"});
-  g += `<text x="${P.l}" y="${H - 6}" fill="var(--muted)" font-size="11">${d8(first)}</text>` +
-       `<text x="${W - P.r}" y="${H - 6}" text-anchor="end" fill="var(--muted)" font-size="11">${d8(last)}</text>`;
-  const path = curve.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.equity).toFixed(1)}`).join("");
-  g += `<path d="${path}" fill="none" stroke="var(--series)" stroke-width="2" stroke-linejoin="round"/>` +
-       `<line id="xh" y1="${P.t}" y2="${H - P.b}" stroke="var(--muted)" visibility="hidden"/>` +
-       `<circle id="dot" r="4" fill="var(--series)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>` +
+  const d8 = t => new Date(t).toLocaleDateString(undefined, {month: "short", day: "numeric", timeZone: "America/New_York"});
+  g += `<text x="${P.l}" y="${H - 6}" fill="var(--muted)" font-size="11">${d8(t0)}</text>` +
+       `<text x="${W - P.r}" y="${H - 6}" text-anchor="end" fill="var(--muted)" font-size="11">${d8(t1)}</text>`;
+  for (const [k, se] of series.entries()) {
+    if (!se.pts.length) continue;
+    const d = se.pts.map((p, i) => `${i ? "L" : "M"}${x(Date.parse(p.ts)).toFixed(1)},${y(p.equity).toFixed(1)}`).join("");
+    g += `<path d="${d}" fill="none" stroke="${se.color}" stroke-width="2" stroke-linejoin="round"/>` +
+         `<circle class="dot" data-k="${k}" r="4" fill="${se.color}" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>`;
+  }
+  g += `<line id="xh" y1="${P.t}" y2="${H - P.b}" stroke="var(--muted)" visibility="hidden"/>` +
        `<rect x="${P.l}" y="0" width="${W - P.l - P.r}" height="${H}" fill="transparent" id="hit"/>`;
   svg.innerHTML = g;
-  const hit = svg.querySelector("#hit"), xh = svg.querySelector("#xh"), dot = svg.querySelector("#dot");
+  const hit = svg.querySelector("#hit"), xh = svg.querySelector("#xh"), dots = svg.querySelectorAll(".dot");
+  const nearest = (pts, t) => pts.reduce((b, p) => Math.abs(Date.parse(p.ts) - t) < Math.abs(Date.parse(b.ts) - t) ? p : b, pts[0]);
   hit.onmousemove = ev => {
     const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
-    const i = Math.max(0, Math.min(curve.length - 1, Math.round((px - P.l) / (W - P.l - P.r) * (curve.length - 1))));
-    const p = curve[i];
-    xh.setAttribute("x1", x(i)); xh.setAttribute("x2", x(i)); xh.setAttribute("visibility", "visible");
-    dot.setAttribute("cx", x(i)); dot.setAttribute("cy", y(p.equity)); dot.setAttribute("visibility", "visible");
-    tip.style.display = "block";
-    tip.innerHTML = `<b>${usd(p.equity)}</b> <span class="${cls(p.equity - start)}">${signed(p.equity - start)}</span><br>${fmtT(p.ts)}`;
-    const tx = x(i) * r.width / W; tip.style.left = Math.min(tx + 10, r.width - 170) + "px"; tip.style.top = "8px";
+    const t = t0 + (t1 - t0) * Math.max(0, Math.min(1, (px - P.l) / (W - P.l - P.r)));
+    let html = "", xt = null;
+    series.forEach((se, k) => {
+      if (!se.pts.length) return;
+      const p = nearest(se.pts, t), dot = [...dots].find(el => el.dataset.k == k);
+      dot.setAttribute("cx", x(Date.parse(p.ts))); dot.setAttribute("cy", y(p.equity)); dot.setAttribute("visibility", "visible");
+      if (xt === null) xt = Date.parse(p.ts);
+      html += `${series.length > 1 ? se.name + ": " : ""}<b>${usd(p.equity)}</b>${k === 0 ? ` <span class="${cls(p.equity - start)}">${signed(p.equity - start)}</span>` : ""}<br>`;
+    });
+    xh.setAttribute("x1", x(xt)); xh.setAttribute("x2", x(xt)); xh.setAttribute("visibility", "visible");
+    tip.style.display = "block"; tip.innerHTML = html + fmtT(new Date(xt).toISOString());
+    const tx = x(xt) * r.width / W; tip.style.left = Math.min(tx + 10, r.width - 190) + "px"; tip.style.top = "8px";
   };
-  hit.onmouseleave = () => { tip.style.display = "none"; xh.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); };
+  hit.onmouseleave = () => { tip.style.display = "none"; xh.setAttribute("visibility", "hidden"); dots.forEach(d => d.setAttribute("visibility", "hidden")); };
+}
+
+function renderBroker(B) {
+  const on = STATE.settings.broker_sync_enabled;
+  if (!B.configured) {
+    $("#bkState").textContent = "not linked";
+    $("#bkBody").innerHTML = `<div class="hint">${esc(B.reason)}. See SETUP.md.</div>`;
+    return;
+  }
+  const a = B.account;
+  $("#bkState").innerHTML = on ? '<span class="pill long">sync on</span>' : '<span class="pill">sync off</span>';
+  const mism = (B.reconciliation || []).filter(r => !r.match);
+  let h = `<label class="switch"><input type="checkbox" id="bkToggle" ${on ? "checked" : ""}> Send the model's trades to Alpaca paper</label>
+    <div class="hint">Paper endpoint only (${esc(B.endpoint)}). Orders are market orders sent right after each hourly check.</div>`;
+  if (a) h += `<div class="bk-kpis">
+      <div><span>Paper equity</span>${usd(a.equity)}</div><div><span>Today</span><b class="${cls(a.day_pl)}">${signed(a.day_pl)}</b></div>
+      <div><span>Buying power</span>${usd(a.buying_power)}</div><div><span>Cash</span>${usd(a.cash)}</div></div>`;
+  if (a && (a.trading_blocked || a.shorting_enabled === false))
+    h += `<div class="msg err">${a.trading_blocked ? "Trading is blocked on this account. " : ""}${a.shorting_enabled === false ? "Shorting is disabled on this account." : ""}</div>`;
+  if (B.error) h += `<div class="msg err">${esc(B.error)}</div>`;
+  h += `<div class="hint">Last sync: ${fmtT(B.last_sync)} · ${!a || B.error ? '<span class="neg">position check unavailable</span>' : mism.length ? `<span class="neg">${mism.length} symbol(s) differ from the model</span>` : "paper matches the model"}</div>
+    <div class="row" style="margin-top:8px"><button type="button" id="bkSync" ${on ? "" : "disabled"}>Sync now</button></div>`;
+  if (a && !B.error && (B.reconciliation || []).length) {
+    h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>Paper</th><th>Paper P&amp;L</th></tr></thead><tbody>` +
+      B.reconciliation.map(r => `<tr><td class="sym">${esc(r.symbol)}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
+      `</tbody></table></div>`;
+  }
+  $("#bkBody").innerHTML = h;
+  $("#bkToggle").onchange = async e => {
+    if (e.target.checked && !confirm("Start sending orders to the Alpaca PAPER account? Any open model positions will be opened there at market.")) { e.target.checked = false; return; }
+    try { await api("/api/settings", {broker_sync_enabled: e.target.checked}); } catch (err) { alert(err.message); }
+    refresh();
+  };
+  $("#bkSync").onclick = async ev => { ev.target.disabled = true; try { await api("/api/broker/sync", {}); } catch (err) { alert(err.message); } refresh(); };
 }
 
 function statRow(name, st, extra = "") {
@@ -351,6 +411,13 @@ function renderTab() {
     const e = Object.entries(m.by_symbol);
     if (!e.length) return $("#tabBody").innerHTML = `<div class="empty">No closed trades yet.</div>`;
     h = `<table>${statHead("")}<tbody>` + e.map(([k, st]) => statRow(`<span class="sym">${esc(k)}</span>`, st)).join("");
+  } else if (TAB === "orders") {
+    const os = (STATE.broker && STATE.broker.orders) || [];
+    if (!os.length) return $("#tabBody").innerHTML = `<div class="empty">No paper orders yet.</div>`;
+    h = `<table><thead><tr><th class="l">Sent</th><th class="l">Symbol</th><th class="l">Side</th><th>Qty</th><th class="l">Status</th><th>Filled</th><th>Avg price</th><th class="l">Why</th></tr></thead><tbody>`;
+    for (const o of os) h += `<tr><td class="l">${fmtT(o.ts)}</td><td class="sym">${esc(o.symbol)}</td><td class="l">${o.side}</td><td>${o.qty}</td>
+      <td class="l"><span class="pill ${o.status === "filled" ? "long" : o.status === "rejected" ? "short" : "warn"}">${esc(o.status)}</span></td>
+      <td>${o.filled_qty ?? "—"}</td><td>${num(o.filled_avg_price)}</td><td class="l" style="white-space:normal">${esc(o.message || o.reason)}</td></tr>`;
   } else {
     const ev = STATE.events;
     if (!ev.length) return $("#tabBody").innerHTML = `<div class="empty">No events yet.</div>`;
@@ -397,7 +464,7 @@ $("#watch").onclick = async e => {
   refresh();
 };
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderTab(); });
-window.addEventListener("resize", () => STATE && renderChart(STATE.summary.curve, STATE.summary.starting_capital));
+window.addEventListener("resize", () => STATE && renderChart(STATE.summary.curve, STATE.summary.starting_capital, STATE.broker.curve || []));
 
 refresh();
 setInterval(refresh, 5000);

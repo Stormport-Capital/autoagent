@@ -5,7 +5,8 @@
     python app.py --provider alpaca    # Alpaca market data (keys via env)
     python app.py --demo               # synthetic prices on a fast simulated clock
 
-Mock portfolio only: nothing here talks to a broker or places an order.
+The model is simulated. Orders go only to an Alpaca PAPER account, only when
+linked (keys in .env) and switched on in the dashboard; see broker.py / SETUP.md.
 """
 
 from __future__ import annotations
@@ -20,12 +21,25 @@ from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from broker import AlpacaPaper, BrokerError, BrokerSync
 from data import make_provider
 from engine import SLEEVE_LABELS, Engine, ValidationError
 from indicators import ET, RTH_OPEN, session_hour_ends
 from store import Store
 
 HERE = Path(__file__).parent
+
+
+def load_dotenv(path: Path) -> None:
+    """KEY=VALUE lines from .env; real environment variables win."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 class RealClock:
@@ -76,9 +90,10 @@ def next_boundary(now: datetime, delay: timedelta) -> datetime:
 class Scheduler(threading.Thread):
     """Runs a tick shortly after each RTH hourly bar closes (10:30 ... 16:00 ET)."""
 
-    def __init__(self, engine: Engine, clock, demo_speed: float):
+    def __init__(self, engine: Engine, clock, demo_speed: float, sync: BrokerSync | None = None):
         super().__init__(daemon=True)
         self.engine, self.clock, self.demo_speed = engine, clock, demo_speed
+        self.sync = sync  # never set in demo mode
         self.last_tick: datetime | None = None
         self.last_error: str | None = None
         self.paused = False
@@ -94,6 +109,11 @@ class Scheduler(threading.Thread):
         except Exception as e:  # keep the loop alive; surface on the dashboard
             self.last_error = str(e)
         self.last_tick = now
+        self.run_sync()
+
+    def run_sync(self) -> None:
+        if self.sync and self.engine.store.settings()["broker_sync_enabled"]:
+            self.sync.sync(self.clock.now())
 
     def next_tick(self) -> datetime:
         return next_boundary(self.clock.now(), self.delay())
@@ -114,6 +134,9 @@ class Scheduler(threading.Thread):
             due = [b for b in boundaries(now.date(), self.delay()) if b <= now]
             if due and (self.last_tick is None or self.last_tick < due[-1]):
                 self.run_tick()
+            elif self.sync and self.sync.needs_followup and self.sync.last_sync \
+                    and (now - self.sync.last_sync).total_seconds() >= 60:
+                self.run_sync()  # an order was still working: finish the job
 
 
 def market_open(now: datetime) -> bool:
@@ -146,7 +169,17 @@ def build_state(engine: Engine, sched: Scheduler, provider_name: str) -> dict:
         "symbols": symbols,
         "summary": summ,
         "events": store.q("SELECT * FROM events ORDER BY id DESC LIMIT 300"),
+        "broker": broker_state(sched),
     }
+
+
+def broker_state(sched: Scheduler) -> dict:
+    if sched.clock.demo:
+        return {"configured": False, "reason": "disabled in demo mode"}
+    if sched.sync is None:
+        return {"configured": False,
+                "reason": "set APCA_API_KEY_ID and APCA_API_SECRET_KEY (paper keys) in .env"}
+    return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
 
 
 def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
@@ -181,7 +214,13 @@ def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
             try:
                 body = self._body()
                 if self.path == "/api/settings":
-                    engine.update_settings(body)
+                    was = engine.store.settings()["broker_sync_enabled"]
+                    s = engine.update_settings(body)
+                    if s["broker_sync_enabled"] and not was:
+                        if sched.sync is None:
+                            engine.update_settings({"broker_sync_enabled": False})
+                            raise ValidationError("Alpaca paper keys are not configured")
+                        threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif self.path == "/api/symbols":
                     added = engine.add_symbols(body.get("symbols", ""), body.get("mode"),
                                                body.get("risk_pct"), now)
@@ -192,10 +231,16 @@ def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
                         engine.set_status(int(m.group(1)), body.get("status"), now)
                     else:
                         engine.flatten(int(m.group(1)), now)
+                    threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif self.path == "/api/tick":
                     sched.run_tick()
                 elif self.path == "/api/reset":
                     engine.reset(now)
+                    threading.Thread(target=sched.run_sync, daemon=True).start()
+                elif self.path == "/api/broker/sync":
+                    if sched.sync is None:
+                        raise ValidationError("Alpaca paper keys are not configured")
+                    sched.sync.sync(now)
                 elif self.path == "/api/demo/pause" and sched.clock.demo:
                     sched.paused = not sched.paused
                 else:
@@ -209,7 +254,7 @@ def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--provider", default=os.environ.get("TRANCHE_PROVIDER", "yahoo"),
+    ap.add_argument("--provider", default=None,
                     choices=["polygon", "yahoo", "alpaca", "demo"])
     ap.add_argument("--db", default=None, help="SQLite file (default tranche.db / demo.db)")
     ap.add_argument("--host", default="127.0.0.1")
@@ -219,6 +264,9 @@ def main() -> None:
     ap.add_argument("--demo-days", type=int, default=15, help="weekdays of history to replay")
     ap.add_argument("--demo-speed", type=float, default=2.0, help="seconds per simulated hour")
     args = ap.parse_args()
+    load_dotenv(HERE / ".env")
+    args.provider = args.provider or os.environ.get("TRANCHE_PROVIDER") or (
+        "polygon" if os.environ.get("POLYGON_API_KEY") else "yahoo")
 
     if args.demo:
         args.provider = "demo"
@@ -236,11 +284,21 @@ def main() -> None:
         engine.add_symbols("DEMOA DEMOB", "long_short", 1.0, clock.now())
         engine.add_symbols("DEMOC", "short_only", 2.0, clock.now())
 
-    sched = Scheduler(engine, clock, args.demo_speed)
+    sync = None
+    if not args.demo:
+        try:
+            paper = AlpacaPaper.from_env()
+        except BrokerError as e:
+            raise SystemExit(str(e))
+        sync = BrokerSync(store, paper) if paper else None
+    elif store.settings()["broker_sync_enabled"]:
+        store.save_settings({"broker_sync_enabled": False})
+    sched = Scheduler(engine, clock, args.demo_speed, sync)
     sched.start()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(engine, sched, provider.name))
     print(f"Tranche dashboard on http://{args.host}:{args.port}  "
-          f"(provider={provider.name}, db={db}{', DEMO clock' if args.demo else ''})")
+          f"(provider={provider.name}, db={db}{', DEMO clock' if args.demo else ''}, "
+          f"alpaca paper={'linked' if sync else 'not configured'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -16,6 +16,7 @@ DEFAULT_SETTINGS = {
     "max_leverage": 2.0,           # gross exposure cap as a multiple of equity
     "slippage_bps": 5.0,           # adverse fill vs bar close / stop, each side
     "bar_close_delay_min": 2,      # wait this long after an hourly bar closes
+    "broker_sync_enabled": False,  # mirror the model into the Alpaca PAPER account
 }
 
 SCHEMA = """
@@ -59,6 +60,25 @@ CREATE TABLE IF NOT EXISTS events (
     sleeve TEXT,
     kind TEXT NOT NULL,
     message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    reason TEXT,
+    client_order_id TEXT NOT NULL,
+    broker_order_id TEXT,
+    status TEXT NOT NULL,
+    filled_qty REAL,
+    filled_avg_price REAL,
+    filled_at TEXT,
+    message TEXT
+);
+CREATE TABLE IF NOT EXISTS broker_equity (
+    ts TEXT PRIMARY KEY,
+    equity REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS equity (
     ts TEXT PRIMARY KEY,

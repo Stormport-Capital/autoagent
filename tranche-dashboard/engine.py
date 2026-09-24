@@ -16,8 +16,9 @@ third of the symbol's risk budget:
                        fills at that level - the worst price in the bar
               target = daily 10-day SMA of prior sessions' closes; covers when
                        an hourly low touches it, filled at the target (or the
-                       open if the bar gaps below it). Entries already at or
-                       below the target are skipped.
+                       open if the bar is already below it). No setup or entry
+                       filter: a short opened at/below its 10-MA covers at the
+                       next bar's open.
               held overnight; no end-of-session flatten.
 
 EMA tranches have a hard stop at stop_atr_mult x hourly ATR from entry.
@@ -106,6 +107,9 @@ class Engine:
         for k, v in updates.items():
             if k not in DEFAULT_SETTINGS:
                 raise ValidationError(f"unknown setting {k}")
+            if k == "broker_sync_enabled":
+                clean[k] = v is True or v == "true"
+                continue
             try:
                 num = float(v)
             except (TypeError, ValueError):
@@ -285,12 +289,6 @@ class Engine:
         # Russo Trigger B, rising edge only: fires on the bar where it turns true
         lost = vwap_fail(bars, five, i) and not (i > 0 and vwap_fail(bars, five, i - 1))
         if lost and "VWAP" not in open_tr:
-            if target is not None and b.close <= target:
-                # Russo's arm gate (+100% in 5 sessions) keeps price far above the
-                # 10-MA; without it, a short already under its target has no room
-                self.store.log(b.end, "skip", f"VWAP fail but close {b.close:.2f} is already "
-                               f"at/below the daily 10-MA target {target:.2f}", name, "VWAP")
-                return
             self._enter(sym, "VWAP", "short", b, None, s,
                         f"VWAP fail: close {b.close:.2f} < VWAP {vwap:.2f}, "
                         f"high {b.high:.2f} below HOD {hod:.2f}",
