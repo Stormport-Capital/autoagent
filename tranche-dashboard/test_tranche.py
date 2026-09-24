@@ -346,6 +346,20 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(v[0]["exit_reason"].startswith("target"))
         self.assertAlmostEqual(v[0]["exit_price"], 44.0)
 
+    def test_behind_reports_unprocessed_hour(self):
+        d = weekdays(date(2026, 8, 3), 1)[0]
+        bars = day_from_closes(d, [50.0] * 7)
+        cut = datetime.combine(d, time(10, 15), tzinfo=ET)   # delayed feed
+        feed = ScriptedProvider([b for b in bars if b.end <= cut])
+        eng = Engine(self.store, feed)
+        eng.add_symbols("DLY", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        hour_end = session_hour_ends(d)[0]
+        eng.tick(datetime.combine(d, time(10, 32), tzinfo=ET))
+        self.assertTrue(eng.behind(hour_end))                 # still waiting
+        feed.bars = bars                                        # data arrives
+        eng.tick(datetime.combine(d, time(10, 47), tzinfo=ET))
+        self.assertFalse(eng.behind(hour_end))
+
     def test_delayed_feed_does_not_close_partial_hour(self):
         d = weekdays(date(2026, 8, 3), 1)[0]
         bars = day_from_closes(d, [50.0] * 7)

@@ -18,17 +18,21 @@ import re
 import threading
 import time as _time
 import webbrowser
+
+import requests
 from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from broker import AlpacaPaper, BrokerError, BrokerSync
-from data import make_provider
+from data import make_provider, redact
 from engine import SLEEVE_LABELS, Engine, ValidationError
 from indicators import ET, RTH_OPEN, session_hour_ends
 from store import Store
 
 HERE = Path(__file__).parent
+RETRY_EVERY = timedelta(minutes=3)
+RETRY_WINDOW = timedelta(minutes=40)
 
 
 class Server(ThreadingHTTPServer):
@@ -136,13 +140,20 @@ class Scheduler(threading.Thread):
             self.engine.tick(now)
             self.last_error = None
         except Exception as e:  # keep the loop alive; surface on the dashboard
-            self.last_error = str(e)
+            self.last_error = redact(e)
         self.last_tick = now
         self.run_sync()
 
     def run_sync(self) -> None:
         if self.sync and self.engine.store.settings()["broker_sync_enabled"]:
             self.sync.sync(self.clock.now())
+
+    def retry_due(self, now: datetime, boundary: datetime) -> bool:
+        """Re-check every 3 min for up to 40 min after a boundary while some
+        symbol is still missing that hour (15-minute-delayed data plans)."""
+        return (now - boundary <= RETRY_WINDOW
+                and self.last_tick is not None and now - self.last_tick >= RETRY_EVERY
+                and self.engine.behind(boundary - self.delay()))
 
     def next_tick(self) -> datetime:
         return next_boundary(self.clock.now(), self.delay())
@@ -163,9 +174,45 @@ class Scheduler(threading.Thread):
             due = [b for b in boundaries(now.date(), self.delay()) if b <= now]
             if due and (self.last_tick is None or self.last_tick < due[-1]):
                 self.run_tick()
+            elif due and self.retry_due(now, due[-1]):
+                self.run_tick()  # the feed hadn't finished that hour yet: look again
             elif self.sync and self.sync.needs_followup and self.sync.last_sync \
                     and (now - self.sync.last_sync).total_seconds() >= 60:
                 self.run_sync()  # an order was still working: finish the job
+
+
+def _short(e: Exception) -> str:
+    if isinstance(e, requests.RequestException):
+        return f"can't connect ({type(e).__name__}) - check your internet connection"
+    return redact(e)[:200]
+
+
+def connection_check(provider, paper, now: datetime) -> list[str]:
+    """One live call to each service, so the launcher window shows whether the
+    keys actually work (not just whether they are present)."""
+    lines = []
+    try:
+        bars = provider.five_min_bars("SPY", now)
+        if bars:
+            lag = (now - bars[-1].end).total_seconds() / 60
+            lines.append(f"{provider.name}: OK - SPY data through "
+                         f"{bars[-1].end.astimezone(ET):%a %H:%M} ET"
+                         + (f" ({lag:.0f} min ago)" if market_open(now) else ""))
+        else:
+            lines.append(f"{provider.name}: connected, but no SPY bars came back")
+    except Exception as e:
+        lines.append(f"{provider.name}: FAILED - {redact(e)[:200]}")
+    if paper is None:
+        lines.append("Alpaca paper: not configured (keys missing from .env)")
+    else:
+        try:
+            a = paper.account()
+            lines.append(f"Alpaca paper: OK - equity ${float(a['equity']):,.2f}, "
+                         f"shorting {'enabled' if a.get('shorting_enabled') else 'DISABLED'}"
+                         + (", TRADING BLOCKED" if a.get("trading_blocked") else ""))
+        except Exception as e:
+            lines.append(f"Alpaca paper: FAILED - {_short(e)}")
+    return lines
 
 
 def market_open(now: datetime) -> bool:
@@ -334,6 +381,10 @@ def main() -> None:
         sync = BrokerSync(store, paper) if paper else None
     elif store.settings()["broker_sync_enabled"]:
         store.save_settings({"broker_sync_enabled": False})
+    if not args.demo:
+        print("Checking connections...")
+        for line in connection_check(provider, sync.broker if sync else None, clock.now()):
+            print("  " + line)
     sched = Scheduler(engine, clock, args.demo_speed, sync)
     sched.start()
     server.RequestHandlerClass = make_handler(engine, sched, provider.name)

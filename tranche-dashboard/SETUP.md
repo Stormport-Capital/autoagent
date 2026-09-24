@@ -150,3 +150,35 @@ orders are needed to match.
 - The equity chart shows both lines, model and Alpaca paper. The Alpaca card
   shows paper equity, today's P&L and a model-vs-paper position check for each
   symbol.
+
+## Daily use: when to add symbols
+
+The app checks every watched symbol right after each hourly bar closes:
+**10:30, 11:30, 12:30, 13:30, 14:30, 15:30 and 16:00 ET**, plus a couple of
+minutes of delay. With a 15-minute-delayed data plan, it keeps re-checking every
+3 minutes until the full hour of data has arrived.
+
+- **Add symbols whenever you like.** Only hours that finish *after* you add a
+  symbol can trigger trades, so it never acts on old signals.
+- **Added before the open:** the first check is at about 10:32, on the
+  9:30–10:30 bar. The EMA lines already carry the previous days' history, so an
+  EMA cross can trigger at that first check. The VWAP tranche needs an earlier
+  hour of *today* that closed above VWAP, so its earliest possible entry is the
+  11:30 check.
+- **Added after the open** (say 11:05): the first check is at 11:32. The hours
+  already finished aren't traded, but they still count as today's history for
+  VWAP and the high of day. A cross that already happened before you added the
+  symbol is not acted on; only the next new cross is.
+- **Added after 16:00:** nothing happens until about 10:32 the next trading day.
+- **Symbols stay on the watchlist** until you click **Remove**. You don't
+  re-enter them each day. **Pause** stops new entries but still manages open
+  positions. **Flatten** closes that symbol's positions now.
+- **Positions carry overnight**:
+  - EMA tranches: until the opposite cross or the stop.
+  - VWAP tranche: until a new high of day above entry, or the 10-day average.
+- **Paper orders** go out right after each check. Orders from the 16:00 check
+  queue and fill at the next day's open.
+- **If the app was closed** during checks, it catches up when you start it. The
+  model books those missed hours at their historical closes; the paper account
+  can only trade at the current price. So the two can differ after downtime.
+- **Check now** re-runs the check immediately. It never duplicates a trade.

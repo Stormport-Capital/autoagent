@@ -38,6 +38,7 @@ from datetime import date, datetime, time, timedelta
 
 from indicators import (ET, Bar, atr, crossed_above, crossed_below, daily_closes,
                         daily_sma, ema, resample_hourly, session_vwap)
+from data import redact
 from store import DEFAULT_SETTINGS, Store
 
 SLEEVES = ("EMA5_10", "EMA10_20", "VWAP")
@@ -186,9 +187,20 @@ class Engine:
                 try:
                     self._process_symbol(sym, now, s)
                 except Exception as e:  # one bad symbol must not stop the rest
-                    self.store.x("UPDATE symbols SET error=? WHERE id=?", (str(e)[:300], sym["id"]))
-                    self.store.log(now, "error", str(e)[:300], sym["symbol"])
+                    msg = redact(e)[:300]
+                    self.store.x("UPDATE symbols SET error=? WHERE id=?", (msg, sym["id"]))
+                    self.store.log(now, "error", msg, sym["symbol"])
             self.store.record_equity(now, self.equity(s))
+
+    def behind(self, bar_end: datetime) -> bool:
+        """True if any watched symbol has not yet processed the hourly bar
+        ending at `bar_end` (e.g. a delayed feed had not printed it yet)."""
+        for r in self.store.q("SELECT added_at, last_bar_end FROM symbols WHERE status!='removed'"):
+            if _dt(r["added_at"]) >= bar_end:
+                continue
+            if r["last_bar_end"] is None or _dt(r["last_bar_end"]) < bar_end:
+                return True
+        return False
 
     def _process_symbol(self, sym: dict, now: datetime, s: dict) -> None:
         five = self.provider.five_min_bars(sym["symbol"], now)

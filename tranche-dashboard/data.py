@@ -17,6 +17,7 @@ import hashlib
 import math
 import os
 import random
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -28,6 +29,19 @@ FIVE_MIN = timedelta(minutes=5)
 
 class DataError(RuntimeError):
     pass
+
+
+SECRET_ENV = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
+
+
+def redact(msg: str) -> str:
+    """Strip API keys from any text that may be shown, logged or pasted."""
+    msg = re.sub(r"(?i)(apikey|api_key|token)=[^&\s'\"]+", r"\1=***", str(msg))
+    for k in SECRET_ENV:
+        v = os.environ.get(k)
+        if v and len(v) >= 4:
+            msg = msg.replace(v, "***")
+    return msg
 
 
 class YahooProvider:
@@ -73,12 +87,16 @@ class PolygonProvider:
         start = (now - timedelta(days=35)).date().isoformat()
         url = (f"{self.base}/v2/aggs/ticker/{symbol}/range/5/minute/"
                f"{start}/{now.date().isoformat()}")
-        params = {"adjusted": "false", "sort": "asc", "limit": 50000, "apiKey": self.key}
+        params = {"adjusted": "false", "sort": "asc", "limit": 50000}
+        headers = {"Authorization": f"Bearer {self.key}"}  # never in the URL
         bars: list[Bar] = []
         while url:
-            r = requests.get(url, params=params, timeout=20)
+            try:
+                r = requests.get(url, params=params, headers=headers, timeout=20)
+            except requests.RequestException as e:
+                raise DataError(f"can't reach Polygon ({type(e).__name__})") from None
             if r.status_code != 200:
-                raise DataError(f"Polygon HTTP {r.status_code} for {symbol}: {r.text[:200]}")
+                raise DataError(redact(f"Polygon HTTP {r.status_code} for {symbol}: {r.text[:200]}"))
             body = r.json()
             for b in body.get("results") or []:
                 t0 = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).astimezone(ET)
@@ -86,7 +104,7 @@ class PolygonProvider:
                     bars.append(Bar(t0, t0 + FIVE_MIN, b["o"], b["h"], b["l"], b["c"],
                                     float(b.get("v") or 0)))
             url = body.get("next_url")
-            params = {"apiKey": self.key}  # next_url already carries the cursor
+            params = None  # next_url already carries the query and cursor
         return bars
 
 

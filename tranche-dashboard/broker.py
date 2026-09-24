@@ -28,6 +28,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from data import redact
+
 PAPER_URL = "https://paper-api.alpaca.markets"
 PAPER_HOST = "paper-api.alpaca.markets"
 FINAL = {"filled", "canceled", "expired", "rejected", "done_for_day", "replaced", "failed"}
@@ -40,7 +42,7 @@ class BrokerError(RuntimeError):
 def _msg(e: Exception) -> str:
     if isinstance(e, requests.RequestException):
         return f"can't reach Alpaca paper ({type(e).__name__}); will retry on the next check"
-    return str(e)
+    return redact(e)
 
 
 class AlpacaPaper:
