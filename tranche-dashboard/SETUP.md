@@ -236,3 +236,37 @@ as the hourly book's.
 
 Without these keys the 15-min book still runs and tracks performance. It just
 doesn't send paper orders.
+
+## Comparing data sources (Polygon vs FMP)
+
+How fast the data is matters more than anything else for this app. A
+15-minute-delayed feed makes every signal late, and the 15-min book about one
+full bar late. To compare, add both keys to `.env`:
+
+```
+POLYGON_API_KEY=...
+FMP_API_KEY=...
+```
+
+At startup the black window tests both and labels each one:
+
+```
+  polygon [in use]: OK - SPY data through Fri 10:50 ET (13 min ago - DELAYED)
+  fmp [not in use]: OK - SPY data through Fri 11:00 ET (3 min ago - real-time)
+```
+
+The minutes figure only shows during market hours, so compare while the
+market is open. Trade from whichever is real-time: add one line to `.env` and
+restart.
+
+```
+TRANCHE_PROVIDER=fmp
+```
+
+FMP key: log in at <https://site.financialmodelingprep.com> → **Dashboard** →
+copy your API key.
+
+**Check after switching:** open **Bars** for a symbol and compare a few bars
+with Finviz. If every FMP bar looks shifted by 5 minutes, add
+`FMP_BAR_TIME=end` to `.env` and restart. FMP's docs don't say clearly whether
+its time stamps mark the start or the end of a bar.

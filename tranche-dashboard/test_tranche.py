@@ -185,6 +185,90 @@ class EmaSizingTests(unittest.TestCase):
         self.assertEqual(percentile([0.05], 0.75), 0.05)
 
 
+class FakeResp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+        self.text = str(body)
+
+    def json(self):
+        return self._body
+
+
+class FakeFmp:
+    """Records calls; answers the stable endpoint unless told it's legacy-only."""
+
+    def __init__(self, rows, legacy_only=False):
+        self.rows, self.legacy_only, self.calls = rows, legacy_only, []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, dict(params)))
+        if self.legacy_only and "/stable/" in url:
+            return FakeResp(200, {"Error Message": "Legacy endpoint only"})
+        lo, hi = params["from"], params["to"]
+        return FakeResp(200, [r for r in self.rows if lo <= r["date"][:10] <= hi][::-1])
+
+
+class FmpTests(unittest.TestCase):
+    ROWS = [{"date": f"2026-09-24 {h:02d}:{m:02d}:00", "open": 10 + i * 0.1, "high": 10.5 + i * 0.1,
+             "low": 9.9 + i * 0.1, "close": 10.2 + i * 0.1, "volume": 1000}
+            for i, (h, m) in enumerate([(9, 30), (9, 35), (9, 40), (9, 45)])]
+
+    def setUp(self):
+        os.environ["FMP_API_KEY"] = "fmpsecret123"
+        os.environ.pop("FMP_BAR_TIME", None)
+
+    def tearDown(self):
+        os.environ.pop("FMP_API_KEY", None)
+        os.environ.pop("FMP_BAR_TIME", None)
+
+    def provider(self, fake):
+        from data import FmpProvider
+        return FmpProvider(session=fake)
+
+    def test_parses_new_york_time_as_bar_start(self):
+        fake = FakeFmp(self.ROWS)
+        now = datetime(2026, 9, 24, 9, 49, tzinfo=ET)          # 9:45-9:50 bar still forming
+        bars = self.provider(fake).five_min_bars("AIXC", now)
+        self.assertEqual([b.start.strftime("%H:%M") for b in bars], ["09:30", "09:35", "09:40"])
+        self.assertEqual(bars[0].open, 10)                       # oldest first
+        self.assertTrue(all("/stable/" in u for u, _ in fake.calls))
+
+    def test_falls_back_to_legacy_endpoint(self):
+        fake = FakeFmp(self.ROWS, legacy_only=True)
+        bars = self.provider(fake).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+        self.assertEqual(len(bars), 4)
+        self.assertTrue(any("/api/v3/historical-chart/5min/AIXC" in u for u, _ in fake.calls))
+
+    def test_bar_time_end_setting_shifts_back(self):
+        os.environ["FMP_BAR_TIME"] = "end"
+        bars = self.provider(FakeFmp(self.ROWS)).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+        self.assertEqual(bars[0].start.strftime("%H:%M"), "09:25")
+
+    def test_second_fetch_is_incremental(self):
+        fake = FakeFmp(self.ROWS)
+        prov = self.provider(fake)
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+        first = len(fake.calls)
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 5, tzinfo=ET))
+        self.assertGreater(first, 1)                             # ~35 days in weekly chunks
+        self.assertEqual(len(fake.calls) - first, 1)             # then only the last days
+
+    def test_session_open_is_the_930_minute(self):
+        rows = [{"date": "2026-09-24 09:29:00", "open": 9.0, "high": 9, "low": 9, "close": 9, "volume": 1},
+                {"date": "2026-09-24 09:30:00", "open": 1.54, "high": 1.6, "low": 1.5, "close": 1.55, "volume": 1}]
+        price = self.provider(FakeFmp(rows)).session_open("AIXC", date(2026, 9, 24),
+                                                        datetime(2026, 9, 24, 9, 32, tzinfo=ET))
+        self.assertEqual(price, 1.54)
+
+    def test_errors_never_show_the_key(self):
+        class Down:
+            def get(self, url, params=None, timeout=None):
+                return FakeResp(401, f"bad key {params['apikey']} at {url}?apikey={params['apikey']}")
+        with self.assertRaises(Exception) as cm:
+            self.provider(Down()).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+        self.assertNotIn("fmpsecret123", str(cm.exception))
+
+
 class VwapFailTests(unittest.TestCase):
     d = date(2026, 9, 21)
 

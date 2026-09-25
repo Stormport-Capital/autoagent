@@ -57,7 +57,8 @@ class Server(ThreadingHTTPServer):
 
 
 KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
-OPTIONAL_KEYS = ("APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")  # 15-min book's paper account
+OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
+                 "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")  # 15-min book's paper account
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -91,8 +92,7 @@ def load_dotenv(path: Path) -> list[str]:
         if os.environ.get(k):
             notes.append(f"{k}: found ({len(os.environ[k])} chars)")
         else:
-            notes.append(f"{k}: not set (optional - only to link the 15-min book to "
-                         f"its own Alpaca paper account)")
+            notes.append(f"{k}: not set (optional)")
     return notes
 
 
@@ -253,21 +253,41 @@ def _short(e: Exception) -> str:
     return redact(e)[:200]
 
 
+def extra_sources(active: str) -> list:
+    """Other data sources with keys configured, so startup can compare them."""
+    out = []
+    for name, env in (("polygon", "POLYGON_API_KEY"), ("fmp", "FMP_API_KEY")):
+        if name != active and os.environ.get(env):
+            try:
+                out.append(make_provider(name))
+            except Exception:
+                pass
+    return out
+
+
 def connection_check(provider, papers: list, now: datetime) -> list[str]:
     """One live call to each service, so the launcher window shows whether the
     keys actually work (not just whether they are present)."""
     lines = []
-    try:
-        bars = provider.five_min_bars("SPY", now)
-        if bars:
-            lag = (now - bars[-1].end).total_seconds() / 60
-            lines.append(f"{provider.name}: OK - SPY data through "
-                         f"{bars[-1].end.astimezone(ET):%a %H:%M} ET"
-                         + (f" ({lag:.0f} min ago)" if market_open(now) else ""))
-        else:
-            lines.append(f"{provider.name}: connected, but no SPY bars came back")
-    except Exception as e:
-        lines.append(f"{provider.name}: FAILED - {redact(e)[:200]}")
+    sources = [provider] + [p for p in extra_sources(provider.name)]
+    for src in sources:
+        tag = "in use" if src is provider else "not in use"
+        try:
+            bars = src.five_min_bars("SPY", now)
+            if bars:
+                lag = (now - bars[-1].end).total_seconds() / 60
+                speed = ""
+                if market_open(now):
+                    speed = f" ({lag:.0f} min ago - " + ("real-time" if lag < 8 else "DELAYED") + ")"
+                lines.append(f"{src.name} [{tag}]: OK - SPY data through "
+                             f"{bars[-1].end.astimezone(ET):%a %H:%M} ET{speed}")
+            else:
+                lines.append(f"{src.name} [{tag}]: connected, but no SPY bars came back")
+        except Exception as e:
+            lines.append(f"{src.name} [{tag}]: FAILED - {redact(e)[:200]}")
+    if len(sources) > 1:
+        lines.append("to switch data source, add TRANCHE_PROVIDER=polygon or "
+                     "TRANCHE_PROVIDER=fmp to .env and restart")
     for label, paper, note in papers:
         if paper is None:
             lines.append(f"Alpaca paper ({label}): not linked - {note}")
@@ -489,7 +509,7 @@ def link_papers(demo: bool) -> dict[str, tuple]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--provider", default=None,
-                    choices=["polygon", "yahoo", "alpaca", "demo"])
+                    choices=["polygon", "fmp", "yahoo", "alpaca", "demo"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--demo", action="store_true",
@@ -511,8 +531,9 @@ def main() -> None:
         return
     for note in load_dotenv(HERE / ".env"):
         print("  .env:", note)
-    args.provider = args.provider or os.environ.get("TRANCHE_PROVIDER") or (
-        "polygon" if os.environ.get("POLYGON_API_KEY") else "yahoo")
+    args.provider = (args.provider or os.environ.get("TRANCHE_PROVIDER", "").strip().lower()
+                     or ("polygon" if os.environ.get("POLYGON_API_KEY") else
+                         "fmp" if os.environ.get("FMP_API_KEY") else "yahoo"))
     if args.demo:
         args.provider = "demo"
 

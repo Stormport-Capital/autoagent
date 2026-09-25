@@ -33,7 +33,7 @@ class DataError(RuntimeError):
     pass
 
 
-SECRET_ENV = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
+SECRET_ENV = ("POLYGON_API_KEY", "FMP_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
               "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")
 
 
@@ -148,6 +148,92 @@ class PolygonProvider:
         rows = [(datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc), b["o"])
                 for b in r.json().get("results") or []]
         return _first_rth_open(rows, day)
+
+
+class FmpProvider:
+    """Financial Modeling Prep intraday bars (FMP_API_KEY).
+
+    Uses the current "stable" API and falls back to the legacy v3 path.
+    FMP stamps intraday bars in exchange (New York) time; by default the stamp
+    is taken as the bar START. If the Bars table shows every bar shifted by
+    5 minutes against your charts, set FMP_BAR_TIME=end in .env.
+    Keeps a per-symbol cache and only re-fetches the last couple of days.
+    """
+
+    name = "fmp"
+    STABLE = "https://financialmodelingprep.com/stable/historical-chart/{tf}"
+    LEGACY = "https://financialmodelingprep.com/api/v3/historical-chart/{tf}/{sym}"
+
+    def __init__(self, session=None):
+        self.key = os.environ.get("FMP_API_KEY")
+        if not self.key:
+            raise DataError("Set FMP_API_KEY for the fmp provider")
+        self.shift = {"start": 0, "end": -1}.get(os.environ.get("FMP_BAR_TIME", "start").lower(), 0)
+        self.http = session or requests
+        self._bars: dict[str, dict[datetime, Bar]] = {}
+        self._lock = threading.Lock()
+
+    def _rows(self, tf: str, symbol: str, start: date, end: date) -> list[dict]:
+        attempts = [
+            (self.STABLE.format(tf=tf), {"symbol": symbol}),
+            (self.LEGACY.format(tf=tf, sym=symbol), {}),
+        ]
+        last = "no response"
+        for url, extra in attempts:
+            params = {**extra, "from": start.isoformat(), "to": end.isoformat(), "apikey": self.key}
+            try:
+                r = self.http.get(url, params=params, timeout=20)
+            except requests.RequestException as e:
+                last = f"can't reach FMP ({type(e).__name__})"
+                continue
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, list):
+                    return body
+                last = f"FMP returned {str(body)[:200]}"
+            else:
+                last = f"FMP HTTP {r.status_code}: {r.text[:200]}"
+        raise DataError(redact(f"{last} for {symbol}"))
+
+    def _to_bar(self, r: dict, step: timedelta) -> Bar | None:
+        try:
+            t = datetime.strptime(r["date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET)
+            start = t + self.shift * step
+            return Bar(start, start + step, float(r["open"]), float(r["high"]),
+                       float(r["low"]), float(r["close"]), float(r.get("volume") or 0))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def five_min_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        today = now.astimezone(ET).date()
+        with self._lock:
+            have = self._bars.setdefault(symbol, {})
+            first = today - timedelta(days=35) if not have else today - timedelta(days=2)
+        chunks, d = [], first
+        while d <= today:
+            e = min(d + timedelta(days=6), today)
+            chunks.append((d, e))
+            d = e + timedelta(days=1)
+        fetched = []
+        for a, b in chunks:
+            for r in self._rows("5min", symbol, a, b):
+                bar = self._to_bar(r, FIVE_MIN)
+                if bar:
+                    fetched.append(bar)
+        with self._lock:
+            for bar in fetched:
+                have[bar.start] = bar
+            lo = now - timedelta(days=35)
+            return sorted((x for x in have.values() if lo <= x.start and x.end <= now),
+                          key=lambda x: x.start)
+
+    def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
+        try:
+            rows = self._rows("1min", symbol, day, day)
+        except DataError:
+            return None
+        bars = [b for b in (self._to_bar(r, timedelta(minutes=1)) for r in rows) if b]
+        return _first_rth_open(sorted(((b.start, b.open) for b in bars)), day)
 
 
 class AlpacaProvider:
@@ -294,6 +380,8 @@ def make_provider(name: str, demo_origin: date | None = None):
         return YahooProvider()
     if name == "polygon":
         return PolygonProvider()
+    if name == "fmp":
+        return FmpProvider()
     if name == "alpaca":
         return AlpacaProvider()
     if name == "demo":
