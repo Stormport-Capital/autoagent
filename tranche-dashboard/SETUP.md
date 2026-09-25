@@ -1,0 +1,303 @@
+# Setup: Polygon data + Alpaca paper account
+
+About 20 minutes, one time. You need three keys:
+
+| Name (exact spelling) | Where it comes from | What it's for |
+|---|---|---|
+| `POLYGON_API_KEY` | Polygon dashboard | Price and volume data (EMAs, VWAP) |
+| `APCA_API_KEY_ID` | Alpaca **paper** dashboard | Paper trading account |
+| `APCA_API_SECRET_KEY` | Alpaca **paper** dashboard (shown once) | Paper trading account |
+
+**Where the keys go:** a file named `.env` in the `tranche-dashboard` folder on
+the computer that runs the app. They do **not** go into GitHub secrets. The app
+runs on your machine, not on GitHub, so GitHub secrets would never reach it.
+Don't paste keys into chat, email or any committed file. `.env` is git-ignored.
+
+---
+
+## 1. Polygon API key
+
+Polygon renamed itself **Massive** in late 2025. The old polygon.io links
+redirect, and the key and API work the same way.
+
+1. Sign in at <https://polygon.io/dashboard> (it may redirect to massive.com).
+2. In the left menu, open **Keys** (or **API Keys**): <https://polygon.io/dashboard/keys>.
+3. Copy the default key, or click **New Key** and name it `tranche-dashboard`.
+4. **Check your plan** (dashboard → **Subscriptions** / **Billing**). The app
+   needs same-day intraday bars:
+   - **Free/Basic**: won't work. It has no same-day data, so the app would never
+     see the current session.
+   - **Starter / Developer** tiers: work, but the data is **15 minutes delayed**.
+     Each hourly check then happens about 15–20 minutes after the bar closes.
+     The app waits for the full hour of data and never trades a half-finished bar.
+   - **Advanced** (real-time): checks happen about 2 minutes after each bar closes.
+
+   Tier names and what they include change. If unsure, the plan page lists
+   whether stocks data is "real-time" or "15-minute delayed".
+
+## 2. Alpaca paper account and keys
+
+1. Create an account at <https://app.alpaca.markets/signup> and verify your
+   email. A paper account needs no funding and no identity documents.
+2. Open the **paper** dashboard: <https://app.alpaca.markets/paper/dashboard/overview>.
+   The account switcher in the top-left must say **Paper**, not Live. Paper and
+   live keys are different, and this app only accepts paper.
+3. **Set the paper balance to match the dashboard's portfolio size** (the app
+   defaults to $100,000). From the paper account menu (top-left), choose
+   reset/new paper account and enter the amount. Keep it at **$25,000 or more**:
+   below that, pattern-day-trader rules can block same-day round trips.
+4. On the paper dashboard's home page, find the **API Keys** panel (right side)
+   and click **Generate New Keys**. If you already had keys, click **Regenerate**.
+5. Copy both values **now**:
+   - **API Key ID** → `APCA_API_KEY_ID`
+   - **Secret Key** → `APCA_API_SECRET_KEY`. It's shown only once; if you lose
+     it, regenerate.
+
+## 3. Get the code and put the keys in `.env`
+
+You need **Python 3.11 or newer**: <https://www.python.org/downloads/>. On
+Windows, tick "Add Python to PATH" in the installer.
+
+```bash
+git clone https://github.com/Stormport-Capital/autoagent.git
+cd autoagent
+git checkout claude/dashboard-stock-trading-9iy2hb   # until the PR is merged
+cd tranche-dashboard
+pip install -r requirements.txt
+```
+
+Create `.env` from the template:
+
+- **Mac/Linux:** `cp .env.example .env`, then `open -e .env` (Mac) or `nano .env`
+- **Windows (PowerShell):** `copy .env.example .env`, then `notepad .env`
+
+Fill it in. No quotes and no spaces around `=`. Paste each key **inside the
+file**, after its `=`. Don't type anything into Notepad's "File name" box: the
+file name stays exactly `.env`.
+
+```
+POLYGON_API_KEY=abc123...
+APCA_API_KEY_ID=PK...
+APCA_API_SECRET_KEY=...
+```
+
+(Alpaca paper key IDs usually start with `PK`.)
+
+## 4. Run it: double-click
+
+In the `tranche-dashboard` folder, double-click **`Start Dashboard.bat`**
+(Windows) or **`Start Dashboard.command`** (Mac). It:
+1. gets the latest version and installs anything missing;
+2. on the very first run, creates `.env` and opens it in Notepad for your keys;
+3. starts the dashboard and opens it in your browser.
+
+**Keep the black window open while it runs; close it to stop.** If you
+double-click again while it's already running, it just opens the browser. A
+second copy never starts.
+
+For a desktop icon on Windows, right-click `Start Dashboard.bat` → **Show more
+options** → **Send to** → **Desktop (create shortcut)**.
+
+The black window lists each key as `found`, `EMPTY` or `missing` (never the
+key itself), then shows `provider=polygon` and `alpaca paper=linked` once
+everything is in place.
+
+(From a terminal, `python app.py --open` does the same thing.)
+
+In the dashboard:
+1. **Portfolio settings**: set the portfolio size (match your paper balance)
+   and save.
+2. **Add symbols**: enter them, pick *Short only* or *Long & short*, and set risk.
+3. **Alpaca paper account** card: check that the paper equity shows up. Then
+   tick **"Send the model's trades to Alpaca paper."** Until you tick it, the
+   model trades only on its own books.
+
+## 5. Keep it running
+
+The app has to be running during market hours (9:30–16:00 ET) to check each
+hour and send orders.
+- **On your computer:** leave the terminal open and stop the computer from
+  sleeping during market hours.
+- **Always-on alternative:** any small Linux VM works. Copy the folder and
+  `.env` there and run `python app.py` under `systemd` or `tmux`.
+
+If it was off, on restart it catches up on the hours it missed. The model fills
+those at the historical bar closes, and then sends the paper account whatever
+orders are needed to match.
+
+## How the paper link behaves
+
+- **Paper only.** The paper endpoint `paper-api.alpaca.markets` is hard-coded.
+  Any other address raises an error before sending anything. There is no live
+  setting.
+- **Orders:** after each hourly check, the app compares each symbol's model net
+  position (all tranches added up) with the paper position. It sends a market
+  order for the difference. A switch from long to short goes out as two orders:
+  close, then open.
+- **Only your symbols:** it only touches symbols you added in the app. Anything
+  else in the paper account is left alone. Removing a symbol, or resetting the
+  portfolio, also closes that position at Alpaca.
+- **No resting stop orders at Alpaca.** The EMA tranches have no stop at all.
+  The VWAP tranche's stop is checked at each bar close, like the model, so a
+  stock can move past it inside a bar.
+- **The last bar of the day (15:00–16:00)** is acted on at the **next day's
+  9:30 open check**. The model fills at the official opening price, and the
+  paper order goes out at about 9:32.
+- **Shorting:** the model assumes every stock can be borrowed. Alpaca may still
+  **reject** shorts in hard-to-borrow names. A rejected order shows in the
+  **Paper orders** tab, and the symbol shows as a mismatch on the Alpaca card.
+- **Borrow fees:** the model charges its 10%/yr. As far as I know, Alpaca paper
+  doesn't charge borrow fees, so paper P&L won't include them.
+- The equity chart shows both lines, model and Alpaca paper. The Alpaca card
+  shows paper equity, today's P&L and a model-vs-paper position check for each
+  symbol.
+
+## Daily use: when to add symbols
+
+Hourly bars are clock-aligned, like standard hourly charts: the first bar is the
+half hour **9:30–10:00**, then 10–11, 11–12, 12–1, 1–2, 2–3 and 3–4.
+
+**Checks run at 9:30, 10:00, 11:00, 12:00, 1:00, 2:00 and 3:00 ET**, plus a
+couple of minutes so the data can arrive:
+- **10:00 through 3:00:** each check acts on the bar that just closed, and
+  fills at that bar's close.
+- **9:30 open:** acts on **yesterday's 3:00–4:00 bar** (an EMA cross or VWAP
+  fail that printed at the end of the day) and fills at the opening price.
+  There is no separate 4:00 pm check.
+- **Delayed data:** with a 15-minute-delayed plan, each check keeps retrying
+  every 3 minutes until the data is complete.
+
+- **Add symbols whenever you like.** A signal only trades if it would execute
+  *after* you added the symbol, so it never acts on stale signals.
+- **Added before the open:** at the 9:30 check it acts on a signal from
+  yesterday's last bar, then checks every hour from 10:00. The EMA lines
+  already carry the previous days' history. The VWAP tranche needs an earlier
+  bar of *today* that closed above VWAP, so its earliest intraday entry is the
+  11:00 check (the 9:30–10:00 bar is the first "earlier" bar).
+- **Added after the open** (say 10:40): the first check is at 11:00. Earlier
+  bars today aren't traded, but they still count as today's history for VWAP
+  and the high of day. A cross that already happened before you added the
+  symbol is not acted on; only the next new cross is.
+- **Added after 3:00 pm:** the 3–4 bar is acted on at the next morning's 9:30
+  check.
+- **Symbols stay on the watchlist** until you click **Remove**. You don't
+  re-enter them each day. **Pause** stops new entries but still manages open
+  positions. **Flatten** closes that symbol's positions now.
+- **Positions carry overnight**:
+  - EMA tranches: until the opposite cross (no stop).
+  - VWAP tranche: until a new high of day above entry, or the 10-day average.
+- **Paper orders** go out right after each check, including the 9:30 open
+  check.
+- **If the app was closed** during checks, it catches up when you start it. The
+  model books those missed hours at their historical closes; the paper account
+  can only trade at the current price. So the two can differ after downtime.
+- **Check now** re-runs the check immediately. It never duplicates a trade.
+
+## The 15-minute book
+
+The dashboard runs **two books side by side with identical rules**: the
+**Hourly** book and the **15-min** book. Switch between them with the tabs at the
+top. Each book has its own portfolio size, settings, positions, performance,
+equity curve and signal log, so you can compare the two timeframes directly.
+
+- **15-minute bars:** 9:30–9:45, 9:45–10:00 … 15:45–16:00. The EMAs (5/10/20),
+  ATR, VWAP fail, high of day and every exit work exactly as in the hourly book,
+  just on 15-minute bars. The daily 10-day-average target is the same.
+- **Checks:** at 9:30 (the open check, for yesterday's 15:45–16:00 bar), then
+  9:45, 10:00, 10:15 … 15:45.
+- **Adding symbols:** the Add form has two boxes, **Hourly book** and
+  **15-min book**. Both are ticked by default, so a symbol goes into both. Untick
+  one to add to a single book. Each book's watchlist is managed separately after
+  that (pause, flatten, remove).
+- **Data delay matters more here:** with a 15-minute-delayed data plan, every
+  15-minute signal is acted on roughly one full bar late. The hourly book
+  tolerates delayed data; the 15-minute book really needs real-time data.
+
+### Linking the 15-min book to Alpaca paper (optional)
+
+Alpaca holds **one net position per stock per account**. If both books traded
+the same stock in the same paper account, they would partly cancel each other
+out and neither book's results would match. So the 15-min book needs its **own,
+separate paper account**. The app refuses to link it if its keys are the same
+as the hourly book's.
+
+1. In the Alpaca dashboard, open the account menu (top left) and create an
+   **additional paper account**. Give it the same starting balance as the
+   15-min book's portfolio size. Alpaca allows more than one paper account per
+   login; the menu wording may differ.
+2. Switch to that new paper account and **Generate New Keys** there.
+3. Add them to `.env` under these names:
+   ```
+   APCA_15M_API_KEY_ID=PK...
+   APCA_15M_API_SECRET_KEY=...
+   ```
+4. Restart the dashboard. The startup window shows one Alpaca line per book.
+   On the 15-min tab, tick **Send the model's trades to Alpaca paper**.
+
+Without these keys the 15-min book still runs and tracks performance. It just
+doesn't send paper orders.
+
+## Comparing data sources (Polygon vs FMP)
+
+How fast the data is matters more than anything else for this app. A
+15-minute-delayed feed makes every signal late, and the 15-min book about one
+full bar late. To compare, add both keys to `.env`:
+
+```
+POLYGON_API_KEY=...
+FMP_API_KEY=...
+```
+
+At startup the black window tests both and labels each one:
+
+```
+  polygon [in use]: OK - SPY data through Fri 10:50 ET (13 min ago - DELAYED)
+  fmp [not in use]: OK - SPY data through Fri 11:00 ET (3 min ago - real-time)
+```
+
+The minutes figure only shows during market hours, so compare while the
+market is open. Trade from whichever is real-time: add one line to `.env` and
+restart.
+
+```
+TRANCHE_PROVIDER=fmp
+```
+
+FMP key: log in at <https://site.financialmodelingprep.com> → **Dashboard** →
+copy your API key.
+
+**Check after switching:** open **Bars** for a symbol and compare a few bars
+with Finviz. If every FMP bar looks shifted by 5 minutes, add
+`FMP_BAR_TIME=end` to `.env` and restart. FMP's docs don't say clearly whether
+its time stamps mark the start or the end of a bar.
+
+## Backups (Google Drive)
+
+All trades, signals, equity and paper orders live in `tranche.db` (Hourly) and
+`tranche_15m.db` (15-min) in the app folder. **Don't move those files or the
+app folder into Google Drive.** Drive syncs files while they're being written,
+which can corrupt a live database. The folder also holds `.env` with your keys.
+
+Instead, the app saves **safe copies** into a folder you choose:
+
+- when it starts,
+- every trading day after the close (about 4:10 PM ET),
+- right before any **Reset portfolio**. If that copy fails, the reset is
+  cancelled.
+
+Each copy is written completely under a temporary name and only then renamed,
+so Drive never uploads a half-written file. Daily copies
+(`tranche_1h_2026-09-25.db`) are kept for 30 days. Pre-reset copies
+(`tranche_15m_pre-reset_2026-09-25_1118.db`) are kept for good.
+
+To send them to Google Drive, add this line to `.env` and restart. Use your own
+Drive path; with Google Drive for desktop it's usually `G:\My Drive`. Check in
+File Explorer.
+
+```
+TRANCHE_BACKUP_DIR=G:\My Drive\Tranche backups
+```
+
+The startup window prints `backup: OK - 2 files -> ...`, and the dashboard
+header shows when the last backup ran. To restore, stop the app and copy a
+backup file back over `tranche.db` or `tranche_15m.db`.

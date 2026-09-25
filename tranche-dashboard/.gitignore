@@ -1,0 +1,8 @@
+*.db
+*.db-journal
+*.partial
+__pycache__/
+backups/
+# any .env variant (e.g. .env.txt or a mis-named copy) can hold keys
+.env*
+!.env.example

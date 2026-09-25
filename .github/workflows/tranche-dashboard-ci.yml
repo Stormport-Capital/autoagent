@@ -1,0 +1,40 @@
+name: Tranche dashboard CI
+
+# Offline validation: compile and run the pure-logic + engine test suite.
+# No network, no secrets.
+
+on:
+  push:
+    paths:
+      - "tranche-dashboard/**"
+      - ".github/workflows/tranche-dashboard-ci.yml"
+  pull_request:
+    paths:
+      - "tranche-dashboard/**"
+      - ".github/workflows/tranche-dashboard-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        working-directory: tranche-dashboard
+        run: pip install -r requirements.txt
+
+      - name: Compile
+        working-directory: tranche-dashboard
+        run: python -m py_compile app.py backup.py broker.py engine.py indicators.py data.py store.py test_tranche.py
+
+      - name: Run tests
+        working-directory: tranche-dashboard
+        run: python test_tranche.py
