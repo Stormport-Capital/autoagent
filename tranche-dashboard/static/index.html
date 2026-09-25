@@ -75,6 +75,11 @@ tbody tr:hover { background: var(--chip); }
 .chart .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12); display: none; white-space: nowrap; }
 .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.booktabs button { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
+.booktabs small { font-size: 11px; opacity: .85; font-variant-numeric: tabular-nums; }
+.checks { display: flex; gap: 14px; margin-top: 2px; }
+.checks label { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--ink); }
+.checks input { width: auto; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); font-weight: 400; }
 .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; }
 .switch { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--ink); font-size: 13px; cursor: pointer; }
@@ -91,6 +96,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
 <body>
 <header>
   <h1>Tranche Dashboard</h1>
+  <div class="tabs booktabs" id="bookTabs"></div>
   <div class="meta" id="meta"></div>
   <div class="spacer"></div>
   <div class="row" style="flex:0">
@@ -116,6 +122,11 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           <label for="risk">Risk per symbol: <b id="riskOut">1.0</b>% of equity</label>
           <input id="risk" type="range" min="0.5" max="3" step="0.25" value="1">
           <div class="hint">Split evenly across the 3 tranches. The VWAP tranche is always short-only.</div>
+          <label>Add to</label>
+          <div class="checks">
+            <label><input type="checkbox" id="toBook1h" checked>Hourly book</label>
+            <label><input type="checkbox" id="toBook15m" checked>15-min book</label>
+          </div>
           <div style="margin-top:10px"><button class="primary" type="submit">Add to watchlist</button></div>
           <div class="msg" id="addMsg"></div>
         </form>
@@ -132,7 +143,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
               <select id="borrow_day_count"><option value="360">360</option><option value="365">365</option></select></div>
           </div>
           <div class="row">
-            <div><label for="stop_atr_mult">EMA stop (× hourly ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
+            <div><label for="stop_atr_mult">EMA stop (× bar ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
             <div><label for="atr_period">ATR period</label><input id="atr_period" type="number" step="1" min="2"></div>
           </div>
           <div class="row">
@@ -192,6 +203,10 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
 <script>
 const $ = s => document.querySelector(s);
 let STATE = null, TAB = "open";
+// which book is on screen: "1h" (hourly bars) or "15m"; kept in the URL hash
+let BOOK = location.hash === "#15m" ? "15m" : "1h";
+const bk = path => path.replace(/^\/api\//, `/api/${BOOK}/`);
+const TF = () => (STATE && STATE.book.minutes === 15) ? "15m" : "1h";
 
 const usd = (v, d = 0) => v == null ? "—" :
   (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
@@ -212,12 +227,22 @@ async function api(path, body) {
 }
 
 async function refresh() {
-  try { STATE = await api("/api/state"); render(); }
+  try { STATE = await api(bk("/api/state")); render(); }
   catch (e) { $("#meta").innerHTML = `<span class="neg">Dashboard server unreachable: ${esc(e.message)}</span>`; }
+}
+
+function renderBooks(S) {
+  $("#bookTabs").innerHTML = S.books.map(b => {
+    const r = b.equity / b.start - 1;
+    return `<button data-book="${b.key}" class="${b.key === BOOK ? "on" : ""}">${esc(b.label)} book
+      <small>${usd(b.equity)} · ${pct(r, 2)}${b.sync_on ? " · paper on" : ""}</small></button>`;
+  }).join("");
+  document.title = `Tranche Dashboard - ${S.book.label}`;
 }
 
 function render() {
   const S = STATE, m = S.summary, o = m.overall;
+  renderBooks(S);
   $("#meta").innerHTML = [
     `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : (S.settings.broker_sync_enabled ? "Model + Alpaca PAPER orders" : "Model only · no orders sent")}</span>`,
     `<span>Data: ${esc(S.provider)}</span>`,
@@ -261,9 +286,9 @@ function trancheCell(t, sleeve, mode) {
 
 function renderWatch(S) {
   const rows = S.symbols;
-  $("#watchNote").textContent = `${rows.length} symbols · checked hourly after each bar closes`;
+  $("#watchNote").textContent = `${rows.length} symbols · ${STATE.book.label} bars · checked as each bar closes`;
   if (!rows.length) { $("#watch").innerHTML = `<tr><td class="empty">Add symbols to start monitoring.</td></tr>`; return; }
-  let h = `<thead><tr><th>Symbol</th><th class="l">Setup</th><th>Last</th><th>EMA 5 / 10 / 20 (1h)</th><th>VWAP</th>
+  let h = `<thead><tr><th>Symbol</th><th class="l">Setup</th><th>Last</th><th>EMA 5 / 10 / 20 (${TF()})</th><th>VWAP</th>
     <th class="l">5/10 tranche</th><th class="l">10/20 tranche</th><th class="l">VWAP tranche</th><th>Open P&amp;L</th><th></th></tr></thead><tbody>`;
   for (const s of rows) {
     const n = s.snapshot || {};
@@ -295,7 +320,7 @@ function renderChart(curve, start, paper) {
   $("#legend").innerHTML = series.length > 1
     ? series.map(se => `<span><i style="background:${se.color}"></i>${se.name}</span>`).join("") : "";
   const all = series.flatMap(se => se.pts);
-  if (all.length < 2) { svg.innerHTML = `<text x="${P.l}" y="${H / 2}" fill="var(--muted)" font-size="13">Equity curve appears after the first hourly checks.</text>`; return; }
+  if (all.length < 2) { svg.innerHTML = `<text x="${P.l}" y="${H / 2}" fill="var(--muted)" font-size="13">Equity curve appears after the first checks.</text>`; return; }
   const ts = all.map(p => Date.parse(p.ts)), t0 = Math.min(...ts), t1 = Math.max(...ts) || t0 + 1;
   const ys = all.map(p => p.equity).concat([start]);
   let lo = Math.min(...ys), hi = Math.max(...ys); const pad = (hi - lo) * 0.1 || hi * 0.005; lo -= pad; hi += pad;
@@ -349,7 +374,7 @@ function renderBroker(B) {
   $("#bkState").innerHTML = on ? '<span class="pill long">sync on</span>' : '<span class="pill">sync off</span>';
   const mism = (B.reconciliation || []).filter(r => !r.match);
   let h = `<label class="switch"><input type="checkbox" id="bkToggle" ${on ? "checked" : ""}> Send the model's trades to Alpaca paper</label>
-    <div class="hint">Paper endpoint only (${esc(B.endpoint)}). Orders are market orders sent right after each hourly check.</div>`;
+    <div class="hint">Paper endpoint only (${esc(B.endpoint)}). Orders are market orders sent right after each ${esc(STATE.book.label)} check.</div>`;
   if (a) h += `<div class="bk-kpis">
       <div><span>Paper equity</span>${usd(a.equity)}</div><div><span>Today</span><b class="${cls(a.day_pl)}">${signed(a.day_pl)}</b></div>
       <div><span>Buying power</span>${usd(a.buying_power)}</div><div><span>Cash</span>${usd(a.cash)}</div></div>`;
@@ -366,10 +391,10 @@ function renderBroker(B) {
   $("#bkBody").innerHTML = h;
   $("#bkToggle").onchange = async e => {
     if (e.target.checked && !confirm("Start sending orders to the Alpaca PAPER account? Any open model positions will be opened there at market.")) { e.target.checked = false; return; }
-    try { await api("/api/settings", {broker_sync_enabled: e.target.checked}); } catch (err) { alert(err.message); }
+    try { await api(bk("/api/settings"), {broker_sync_enabled: e.target.checked}); } catch (err) { alert(err.message); }
     refresh();
   };
-  $("#bkSync").onclick = async ev => { ev.target.disabled = true; try { await api("/api/broker/sync", {}); } catch (err) { alert(err.message); } refresh(); };
+  $("#bkSync").onclick = async ev => { ev.target.disabled = true; try { await api(bk("/api/broker/sync"), {}); } catch (err) { alert(err.message); } refresh(); };
 }
 
 function statRow(name, st, extra = "") {
@@ -390,7 +415,7 @@ function renderPerf(m) {
 
 function renderTab() {
   const m = STATE.summary, L = STATE.sleeves;
-  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB));
+  document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB));
   let h = "";
   if (TAB === "open") {
     if (!m.open.length) return $("#tabBody").innerHTML = `<div class="empty">No open positions.</div>`;
@@ -433,9 +458,16 @@ $("#risk").oninput = e => $("#riskOut").textContent = Number(e.target.value).toF
 $("#addForm").onsubmit = async e => {
   e.preventDefault(); const msg = $("#addMsg");
   try {
-    const r = await api("/api/symbols", {symbols: $("#symbols").value,
-      mode: document.querySelector("input[name=mode]:checked").value, risk_pct: Number($("#risk").value)});
-    msg.className = "msg ok"; msg.textContent = `Added ${r.added.join(", ")}`; $("#symbols").value = "";
+    const targets = [["1h", "Hourly"], ["15m", "15-min"]].filter(([k]) => $(`#toBook${k}`).checked);
+    if (!targets.length) throw new Error("Tick at least one book to add to.");
+    const body = {symbols: $("#symbols").value,
+      mode: document.querySelector("input[name=mode]:checked").value, risk_pct: Number($("#risk").value)};
+    const done = [];
+    for (const [k, label] of targets) {
+      try { const r = await api(`/api/${k}/symbols`, body); done.push(`${label}: ${r.added.join(", ")}`); }
+      catch (err) { done.push(`${label}: ${err.message}`); }
+    }
+    msg.className = "msg ok"; msg.textContent = done.join(" · "); $("#symbols").value = "";
     setTimeout(refresh, 1500);
   } catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
   refresh();
@@ -445,25 +477,29 @@ $("#setForm").onsubmit = async e => {
   e.preventDefault(); const msg = $("#setMsg"), body = {};
   for (const el of document.querySelectorAll("#setForm input, #setForm select"))
     body[el.id] = Number(el.value);
-  try { await api("/api/settings", body); settingsDirty = false; msg.className = "msg ok"; msg.textContent = "Saved."; }
+  try { await api(bk("/api/settings"), body); settingsDirty = false; msg.className = "msg ok"; msg.textContent = "Saved."; }
   catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
   refresh();
 };
 $("#resetBtn").onclick = async () => {
-  if (!confirm("Reset the mock portfolio? All trades, history and the equity curve are deleted. Symbols stay and restart from now.")) return;
-  await api("/api/reset", {}); refresh();
+  if (!confirm(`Reset the ${STATE.book.label} book? Its trades, history and equity curve are deleted. Its symbols stay and restart from now. The other book is not affected.`)) return;
+  await api(bk("/api/reset"), {}); refresh();
 };
-$("#runNow").onclick = async e => { e.target.disabled = true; try { await api("/api/tick", {}); } finally { e.target.disabled = false; refresh(); } };
+$("#runNow").onclick = async e => { e.target.disabled = true; try { await api(bk("/api/tick"), {}); } finally { e.target.disabled = false; refresh(); } };
 $("#demoPause").onclick = async () => { await api("/api/demo/pause", {}); refresh(); };
 $("#watch").onclick = async e => {
   const b = e.target.closest("button[data-act]"); if (!b) return;
   if (b.dataset.v === "removed" && !confirm("Remove this symbol? Open tranches are closed at the last price.")) return;
   if (b.dataset.act === "flatten" && !confirm("Close all open tranches for this symbol at the last price?")) return;
-  try { await api(`/api/symbols/${b.dataset.id}/${b.dataset.act}`, b.dataset.act === "status" ? {status: b.dataset.v} : {}); }
+  try { await api(bk(`/api/symbols/${b.dataset.id}/${b.dataset.act}`), b.dataset.act === "status" ? {status: b.dataset.v} : {}); }
   catch (err) { alert(err.message); }
   refresh();
 };
-document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderTab(); });
+document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderTab(); });
+$("#bookTabs").onclick = e => {
+  const b = e.target.closest("button[data-book]"); if (!b || b.dataset.book === BOOK) return;
+  BOOK = b.dataset.book; location.hash = BOOK; settingsDirty = false; STATE = null; refresh();
+};
 window.addEventListener("resize", () => STATE && renderChart(STATE.summary.curve, STATE.summary.starting_capital, STATE.broker.curve || []));
 
 refresh();

@@ -5,8 +5,10 @@ checks them after every hourly bar closes, and trades a **mock portfolio** in
 three thirds per symbol. Performance is tracked in total, per tranche, per side
 and per symbol.
 
-The model keeps its own books: simulated fills, per-tranche attribution and
-borrow fees. It can also be **linked to an Alpaca paper account**. With that on,
+It runs **two books with identical rules**, an **Hourly** book and a **15-min**
+book, side by side in one dashboard. Each has its own portfolio, settings and
+performance, and optionally its own Alpaca paper account. Each book keeps its
+own records: simulated fills, per-tranche attribution and borrow fees. It can also be **linked to an Alpaca paper account**. With that on,
 after each hourly check the paper account is brought to the model's net
 position with market orders. It is paper only: the paper endpoint is hard-coded,
 and there is no live-trading setting. **Step-by-step keys and setup:

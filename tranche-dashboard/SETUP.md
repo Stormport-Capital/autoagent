@@ -191,3 +191,47 @@ couple of minutes so the data can arrive:
   model books those missed hours at their historical closes; the paper account
   can only trade at the current price. So the two can differ after downtime.
 - **Check now** re-runs the check immediately. It never duplicates a trade.
+
+## The 15-minute book
+
+The dashboard runs **two books side by side with identical rules**: the
+**Hourly** book and the **15-min** book. Switch between them with the tabs at the
+top. Each book has its own portfolio size, settings, positions, performance,
+equity curve and signal log, so you can compare the two timeframes directly.
+
+- **15-minute bars:** 9:30–9:45, 9:45–10:00 … 15:45–16:00. The EMAs (5/10/20),
+  ATR, VWAP fail, high of day and every exit work exactly as in the hourly book,
+  just on 15-minute bars. The daily 10-day-average target is the same.
+- **Checks:** at 9:30 (the open check, for yesterday's 15:45–16:00 bar), then
+  9:45, 10:00, 10:15 … 15:45.
+- **Adding symbols:** the Add form has two boxes, **Hourly book** and
+  **15-min book**. Both are ticked by default, so a symbol goes into both. Untick
+  one to add to a single book. Each book's watchlist is managed separately after
+  that (pause, flatten, remove).
+- **Data delay matters more here:** with a 15-minute-delayed data plan, every
+  15-minute signal is acted on roughly one full bar late. The hourly book
+  tolerates delayed data; the 15-minute book really needs real-time data.
+
+### Linking the 15-min book to Alpaca paper (optional)
+
+Alpaca holds **one net position per stock per account**. If both books traded
+the same stock in the same paper account, they would partly cancel each other
+out and neither book's results would match. So the 15-min book needs its **own,
+separate paper account**. The app refuses to link it if its keys are the same
+as the hourly book's.
+
+1. In the Alpaca dashboard, open the account menu (top left) and create an
+   **additional paper account**. Give it the same starting balance as the
+   15-min book's portfolio size. Alpaca allows more than one paper account per
+   login; the menu wording may differ.
+2. Switch to that new paper account and **Generate New Keys** there.
+3. Add them to `.env` under these names:
+   ```
+   APCA_15M_API_KEY_ID=PK...
+   APCA_15M_API_SECRET_KEY=...
+   ```
+4. Restart the dashboard. The startup window shows one Alpaca line per book.
+   On the 15-min tab, tick **Send the model's trades to Alpaca paper**.
+
+Without these keys the 15-min book still runs and tracks performance. It just
+doesn't send paper orders.

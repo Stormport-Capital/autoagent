@@ -39,7 +39,7 @@ from datetime import date, datetime, time, timedelta
 
 from indicators import (ET, RTH_OPEN, Bar, atr, crossed_above, crossed_below,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
-                        resample_hourly, session_vwap)
+                        resample, session_vwap)
 from data import redact
 from store import DEFAULT_SETTINGS, Store
 
@@ -109,9 +109,10 @@ def vwap_fail(bars: list[Bar], five: list[Bar], i: int) -> bool:
 
 
 class Engine:
-    def __init__(self, store: Store, provider):
+    def __init__(self, store: Store, provider, minutes: int = 60):
         self.store = store
         self.provider = provider
+        self.minutes = minutes  # bar size: 60 (hourly) or 15
 
     # ------------------------------------------------------------------ setup
     def update_settings(self, updates: dict) -> dict:
@@ -221,7 +222,7 @@ class Engine:
         # an hour counts as complete once the feed has printed through its end
         # (delayed feeds lag), or 20 min later for names with no late prints
         data_end = max((b.end for b in five), default=None)
-        bars = [b for b in resample_hourly(five)
+        bars = [b for b in resample(five, self.minutes)
                 if b.end + delay <= now
                 and ((data_end and data_end >= b.end) or b.end + max(delay, STALE_WAIT) <= now)]
         if not bars:
@@ -328,7 +329,7 @@ class Engine:
         j = i - 1
         ema_ready = i > 0 and e20[j] is not None and a is not None
         if not ema_ready:
-            self.store.log(b.end, "warmup", "not enough hourly history for EMA20/ATR yet", name)
+            self.store.log(b.end, "warmup", "not enough bar history for EMA20/ATR yet", name)
         else:
             self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, a, s,
                              crossed_below(e5[j], e10[j], e5[i], e10[i]),

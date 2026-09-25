@@ -8,10 +8,12 @@ import unittest
 from datetime import date, datetime, time, timedelta
 
 from broker import AlpacaPaper, BrokerError, BrokerSync
+import app
 from app import bar_for_boundary, boundaries
 from engine import Engine, ValidationError, vwap_fail
-from indicators import (ET, Bar, atr, crossed_below, ema, resample_hourly,
-                        session_hour_ends, session_vwap)
+from indicators import (ET, Bar, atr, bar_bucket, crossed_below, ema, resample,
+                        resample_hourly, session_bar_ends, session_hour_ends,
+                        session_vwap)
 from store import Store
 
 FIVE = timedelta(minutes=5)
@@ -99,6 +101,33 @@ class IndicatorTests(unittest.TestCase):
         self.assertIsNotNone(a[3])
         self.assertTrue(crossed_below(2, 1, 0.5, 1))
         self.assertFalse(crossed_below(0.5, 1, 0.4, 1))
+
+
+class FifteenMinuteTests(unittest.TestCase):
+    d = date(2026, 9, 21)
+
+    def test_buckets_and_session_ends(self):
+        at = lambda h, m: datetime.combine(self.d, time(h, m), tzinfo=ET)
+        self.assertEqual(bar_bucket(at(9, 40), 15), (at(9, 30), at(9, 45)))
+        self.assertEqual(bar_bucket(at(15, 55), 15), (at(15, 45), at(16, 0)))
+        self.assertEqual(bar_bucket(at(9, 40), 60), (at(9, 30), at(10, 0)))  # hourly unchanged
+        ends = session_bar_ends(self.d, 15)
+        self.assertEqual(len(ends), 26)
+        self.assertEqual((ends[0], ends[-1]), (at(9, 45), at(16, 0)))
+
+    def test_resample_15(self):
+        bars = day_from_closes(self.d, [10, 11, 12, 13, 14, 15, 16])
+        q = resample(bars, 15)
+        self.assertEqual(len(q), 26)
+        self.assertEqual(q[0].open, 10)
+        self.assertEqual(q[-1].close, 16)
+        self.assertEqual(sum(b.volume for b in q), sum(b.volume for b in bars))
+
+    def test_check_schedule_15(self):
+        got = [b.strftime("%H:%M") for b in boundaries(self.d, timedelta(minutes=2), 15)]
+        self.assertEqual(got[:4], ["09:32", "09:47", "10:02", "10:17"])
+        self.assertEqual(got[-1], "15:47")          # the 15:45-16:00 bar acts at the next open
+        self.assertEqual(len(got), 26)
 
 
 class VwapFailTests(unittest.TestCase):
@@ -407,6 +436,28 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(end, datetime.combine(date(2026, 9, 18), time(16), tzinfo=ET))  # Friday close
         self.assertEqual(acts, datetime.combine(d, time(9, 30), tzinfo=ET))
 
+    def test_15m_book_trades_on_15m_bars(self):
+        # steady uptrend, then a sharp drop inside the 10:00-10:15 bar: the
+        # 15-minute book shorts at 10:15; the hourly book can't act before 11:00
+        ds = weekdays(date(2026, 8, 3), 6)
+        bars, p = [], 50.0
+        for d in ds[:-1]:
+            closes = [p + 0.1 * (k + 1) for k in range(7)]
+            bars += day_from_closes(d, closes)
+            p = closes[-1]
+        d = ds[-1]
+        bars += hour_bars(d, 0, p, p + 0.3, p - 0.1, p + 0.2)
+        t = datetime.combine(d, time(10, 0), tzinfo=ET)
+        for k, c in enumerate([p - 1.5, p - 1.6, p - 1.7]):  # 10:00-10:15 selloff
+            bars.append(Bar(t + k * FIVE, t + (k + 1) * FIVE, c + 0.5, c + 0.6, c - 0.1, c, 1000.0))
+        eng15 = Engine(self.store, ScriptedProvider(bars), minutes=15)
+        eng15.add_symbols("QTR", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng15.tick(datetime.combine(d, time(10, 17), tzinfo=ET))
+        t15 = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA5_10'")
+        self.assertEqual(len(t15), 1)
+        self.assertEqual(t15[0]["entry_time"], datetime.combine(d, time(10, 15), tzinfo=ET).isoformat())
+        self.assertAlmostEqual(t15[0]["entry_price"], p - 1.7)
+
     def test_behind_reports_unprocessed_hour(self):
         d = weekdays(date(2026, 8, 3), 1)[0]
         bars = day_from_closes(d, [50.0] * 7)
@@ -505,6 +556,25 @@ class BrokerSyncTests(unittest.TestCase):
                         entry_price, stop_price, risk_dollars, fee_through)
                         VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21')""",
                      (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
+
+    def test_books_never_share_a_paper_account(self):
+        env = {"APCA_API_KEY_ID": "PKSAME", "APCA_API_SECRET_KEY": "s1",
+               "APCA_15M_API_KEY_ID": "PKSAME", "APCA_15M_API_SECRET_KEY": "s2"}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            links = app.link_papers(demo=False)
+            self.assertIsNotNone(links["1h"][0])
+            self.assertIsNone(links["15m"][0])
+            self.assertIn("separate Alpaca paper account", links["15m"][1])
+            os.environ["APCA_15M_API_KEY_ID"] = "PKOTHER"
+            self.assertIsNotNone(app.link_papers(demo=False)["15m"][0])
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_refuses_live_endpoint(self):
         with self.assertRaises(BrokerError):

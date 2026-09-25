@@ -1,4 +1,8 @@
-"""Tranche dashboard: local web server + hourly scheduler.
+"""Tranche dashboard: local web server + schedulers for two books.
+
+Two independent books run side by side with identical rules: "1h" on hourly
+bars and "15m" on 15-minute bars. Each has its own database, settings, capital,
+performance and (optionally) its own Alpaca paper account.
 
     python app.py                      # live prices from Yahoo, http://127.0.0.1:8050
     python app.py --provider polygon   # Polygon data (POLYGON_API_KEY), recommended
@@ -27,12 +31,19 @@ from pathlib import Path
 from broker import AlpacaPaper, BrokerError, BrokerSync
 from data import make_provider, redact
 from engine import SLEEVE_LABELS, Engine, ValidationError
-from indicators import ET, RTH_OPEN, session_hour_ends
+from data import CachedProvider
+from indicators import ET, RTH_OPEN, session_bar_ends
 from store import Store
 
 HERE = Path(__file__).parent
 RETRY_EVERY = timedelta(minutes=3)
 RETRY_WINDOW = timedelta(minutes=40)
+
+# (key, bar minutes, label, env prefix for its Alpaca paper keys, db file)
+BOOKS = (
+    ("1h", 60, "Hourly", "APCA", "tranche.db"),
+    ("15m", 15, "15-min", "APCA_15M", "tranche_15m.db"),
+)
 
 
 class Server(ThreadingHTTPServer):
@@ -43,6 +54,7 @@ class Server(ThreadingHTTPServer):
 
 
 KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
+OPTIONAL_KEYS = ("APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")  # 15-min book's paper account
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -72,6 +84,12 @@ def load_dotenv(path: Path) -> list[str]:
             notes.append(f"{k}: EMPTY in .env - paste the key after the = and save")
         else:
             notes.append(f"{k}: missing from .env")
+    for k in OPTIONAL_KEYS:
+        if os.environ.get(k):
+            notes.append(f"{k}: found ({len(os.environ[k])} chars)")
+        else:
+            notes.append(f"{k}: not set (optional - only to link the 15-min book to "
+                         f"its own Alpaca paper account)")
     return notes
 
 
@@ -87,13 +105,14 @@ class SimClock:
 
     demo = True
 
-    def __init__(self, days: int, delay_min: int):
+    def __init__(self, days: int, delay_min: int, minutes: int = 15):
         d = datetime.now(ET).date()
         while days:
             d -= timedelta(days=1)
             days -= d.weekday() < 5
         self._now = datetime.combine(d, time(9, 0), tzinfo=ET)
         self.delay = timedelta(minutes=delay_min)
+        self.minutes = minutes
         self.lock = threading.Lock()
 
     def now(self) -> datetime:
@@ -102,18 +121,18 @@ class SimClock:
 
     def step(self) -> datetime:
         with self.lock:
-            nxt = next_boundary(self._now, self.delay)
+            nxt = next_boundary(self._now, self.delay, self.minutes)
             self._now = nxt
             return nxt
 
 
-def boundaries(day: date, delay: timedelta) -> list[datetime]:
-    """Check times: the 9:30 open (acts on yesterday's 15:00-16:00 bar), then
-    10:00, 11:00, ..., 15:00 as each intraday bar closes. The 16:00 bar is not
-    checked at 16:00; its signals execute at the next open."""
+def boundaries(day: date, delay: timedelta, minutes: int = 60) -> list[datetime]:
+    """Check times: the 9:30 open (acts on yesterday's last bar), then each
+    intraday bar close - hourly 10:00 ... 15:00, 15-min 9:45 ... 15:45. The
+    last bar of the day is not checked at 16:00; it executes at the next open."""
     if day.weekday() >= 5:
         return []
-    ends = session_hour_ends(day)[:-1]
+    ends = session_bar_ends(day, minutes)[:-1]
     return [datetime.combine(day, RTH_OPEN, tzinfo=ET) + delay] + [e + delay for e in ends]
 
 
@@ -133,26 +152,26 @@ def bar_for_boundary(boundary: datetime, delay: timedelta) -> tuple[datetime, da
     return t, t
 
 
-def next_boundary(now: datetime, delay: timedelta) -> datetime:
+def next_boundary(now: datetime, delay: timedelta, minutes: int = 60) -> datetime:
     d = now.date()
     while True:
-        for b in boundaries(d, delay):
+        for b in boundaries(d, delay, minutes):
             if b > now:
                 return b
         d += timedelta(days=1)
 
 
 class Scheduler(threading.Thread):
-    """Runs a tick at the 9:30 open (for yesterday's 15:00-16:00 bar) and as
-    each intraday bar closes at 10:00, 11:00, ..., 15:00 ET."""
+    """One book's clock: a tick at the 9:30 open (for yesterday's last bar)
+    and as each intraday bar closes."""
 
-    def __init__(self, engine: Engine, clock, demo_speed: float, sync: BrokerSync | None = None):
+    def __init__(self, engine: Engine, clock, sync: BrokerSync | None = None):
         super().__init__(daemon=True)
-        self.engine, self.clock, self.demo_speed = engine, clock, demo_speed
+        self.engine, self.clock = engine, clock
+        self.minutes = engine.minutes
         self.sync = sync  # never set in demo mode
         self.last_tick: datetime | None = None
         self.last_error: str | None = None
-        self.paused = False
 
     def delay(self) -> timedelta:
         return timedelta(minutes=self.engine.store.settings()["bar_close_delay_min"])
@@ -174,27 +193,20 @@ class Scheduler(threading.Thread):
     def retry_due(self, now: datetime, boundary: datetime) -> bool:
         """Re-check every 3 min for up to 40 min after a boundary while some
         symbol is still missing that hour (15-minute-delayed data plans)."""
-        return (now - boundary <= RETRY_WINDOW
+        window = min(RETRY_WINDOW, timedelta(minutes=self.minutes))
+        return (now - boundary <= window
                 and self.last_tick is not None and now - self.last_tick >= RETRY_EVERY
                 and self.engine.behind(*bar_for_boundary(boundary, self.delay())))
 
     def next_tick(self) -> datetime:
-        return next_boundary(self.clock.now(), self.delay())
+        return next_boundary(self.clock.now(), self.delay(), self.minutes)
 
     def run(self) -> None:
-        if self.clock.demo:
-            while True:
-                _time.sleep(self.demo_speed)
-                if self.clock.now() >= datetime.now(ET):
-                    self.paused = True  # replay has caught up with the present
-                if not self.paused:
-                    self.clock.step()
-                    self.run_tick()
         self.run_tick()  # catch up on bars completed while the app was down
         while True:
             _time.sleep(20)
             now = self.clock.now()
-            due = [b for b in boundaries(now.date(), self.delay()) if b <= now]
+            due = [b for b in boundaries(now.date(), self.delay(), self.minutes) if b <= now]
             if due and (self.last_tick is None or self.last_tick < due[-1]):
                 self.run_tick()
             elif due and self.retry_due(now, due[-1]):
@@ -204,13 +216,41 @@ class Scheduler(threading.Thread):
                 self.run_sync()  # an order was still working: finish the job
 
 
+class DemoDriver(threading.Thread):
+    """Demo only: steps the simulated clock one 15-minute boundary at a time
+    and runs every book (a book with no new bar simply finds nothing to do)."""
+
+    def __init__(self, clock, scheds: list, speed: float):
+        super().__init__(daemon=True)
+        self.clock, self.scheds, self.speed = clock, scheds, speed
+        self.paused = False
+
+    def run(self) -> None:
+        while True:
+            _time.sleep(self.speed)
+            if self.clock.now() >= datetime.now(ET):
+                self.paused = True  # replay has caught up with the present
+            if not self.paused:
+                self.clock.step()
+                for s in self.scheds:
+                    s.run_tick()
+
+
+class Book:
+    def __init__(self, key: str, minutes: int, label: str, engine: Engine, sched: Scheduler,
+                 link_note: str | None = None):
+        self.key, self.minutes, self.label = key, minutes, label
+        self.engine, self.sched = engine, sched
+        self.link_note = link_note  # why the paper link is off, if it is
+
+
 def _short(e: Exception) -> str:
     if isinstance(e, requests.RequestException):
         return f"can't connect ({type(e).__name__}) - check your internet connection"
     return redact(e)[:200]
 
 
-def connection_check(provider, paper, now: datetime) -> list[str]:
+def connection_check(provider, papers: list, now: datetime) -> list[str]:
     """One live call to each service, so the launcher window shows whether the
     keys actually work (not just whether they are present)."""
     lines = []
@@ -225,16 +265,17 @@ def connection_check(provider, paper, now: datetime) -> list[str]:
             lines.append(f"{provider.name}: connected, but no SPY bars came back")
     except Exception as e:
         lines.append(f"{provider.name}: FAILED - {redact(e)[:200]}")
-    if paper is None:
-        lines.append("Alpaca paper: not configured (keys missing from .env)")
-    else:
+    for label, paper, note in papers:
+        if paper is None:
+            lines.append(f"Alpaca paper ({label}): not linked - {note}")
+            continue
         try:
             a = paper.account()
-            lines.append(f"Alpaca paper: OK - equity ${float(a['equity']):,.2f}, "
+            lines.append(f"Alpaca paper ({label}): OK - equity ${float(a['equity']):,.2f}, "
                          f"shorting {'enabled' if a.get('shorting_enabled') else 'DISABLED'}"
                          + (", TRADING BLOCKED" if a.get("trading_blocked") else ""))
         except Exception as e:
-            lines.append(f"Alpaca paper: FAILED - {_short(e)}")
+            lines.append(f"Alpaca paper ({label}): FAILED - {_short(e)}")
     return lines
 
 
@@ -242,7 +283,8 @@ def market_open(now: datetime) -> bool:
     return now.weekday() < 5 and RTH_OPEN <= now.time() < time(16, 0)
 
 
-def build_state(engine: Engine, sched: Scheduler, provider_name: str) -> dict:
+def build_state(book: Book, books: list, provider_name: str, demo) -> dict:
+    engine, sched = book.engine, book.sched
     store = engine.store
     now = sched.clock.now()
     summ = engine.summary()
@@ -255,9 +297,14 @@ def build_state(engine: Engine, sched: Scheduler, provider_name: str) -> dict:
         s["tranches"] = by_sym.get(s["id"], {})
         s["unrealized"] = sum(t["unrealized"] - t["borrow_fees"] for t in s["tranches"].values())
     return {
+        "book": {"key": book.key, "label": book.label, "minutes": book.minutes},
+        "books": [{"key": b.key, "label": b.label, "equity": b.engine.equity(),
+                   "start": b.engine.store.settings()["starting_capital"],
+                   "linked": b.sched.sync is not None,
+                   "sync_on": b.engine.store.settings()["broker_sync_enabled"]} for b in books],
         "now": now.isoformat(),
         "demo": sched.clock.demo,
-        "paused": sched.paused,
+        "paused": bool(demo and demo.paused),
         "provider": provider_name,
         "market_open": market_open(now),
         "last_tick": sched.last_tick.isoformat() if sched.last_tick else None,
@@ -268,20 +315,22 @@ def build_state(engine: Engine, sched: Scheduler, provider_name: str) -> dict:
         "symbols": symbols,
         "summary": summ,
         "events": store.q("SELECT * FROM events ORDER BY id DESC LIMIT 300"),
-        "broker": broker_state(sched),
+        "broker": broker_state(book),
     }
 
 
-def broker_state(sched: Scheduler) -> dict:
+def broker_state(book: Book) -> dict:
+    sched = book.sched
     if sched.clock.demo:
         return {"configured": False, "reason": "disabled in demo mode"}
     if sched.sync is None:
-        return {"configured": False,
-                "reason": "set APCA_API_KEY_ID and APCA_API_SECRET_KEY (paper keys) in .env"}
+        return {"configured": False, "reason": book.link_note or "paper keys not configured"}
     return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
 
 
-def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
+def make_handler(books: dict, provider_name: str, demo):
+    ordered = list(books.values())
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep the console quiet
             pass
@@ -299,49 +348,64 @@ def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
             n = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+        def _route(self) -> tuple[Book | None, str]:
+            """/api/<book>/<rest>; the old /api/<rest> means the hourly book."""
+            m = re.fullmatch(r"/api/(1h|15m)(/.*)", self.path)
+            if m:
+                return books[m.group(1)], m.group(2)
+            if self.path.startswith("/api/"):
+                return books["1h"], self.path[4:]
+            return None, self.path
+
         def do_GET(self):
             if self.path in ("/", "/index.html"):
-                self._send(200, (HERE / "static" / "index.html").read_bytes(),
-                           "text/html; charset=utf-8")
-            elif self.path == "/api/state":
-                self._send(200, build_state(engine, sched, provider_name))
-            else:
-                self._send(404, {"error": "not found"})
+                return self._send(200, (HERE / "static" / "index.html").read_bytes(),
+                                  "text/html; charset=utf-8")
+            book, rest = self._route()
+            if book and rest == "/state":
+                return self._send(200, build_state(book, ordered, provider_name, demo))
+            self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path == "/api/demo/pause" and demo:
+                demo.paused = not demo.paused
+                return self._send(200, {"ok": True})
+            book, rest = self._route()
+            if book is None:
+                return self._send(404, {"error": "not found"})
+            engine, sched = book.engine, book.sched
             now = sched.clock.now()
             try:
                 body = self._body()
-                if self.path == "/api/settings":
+                if rest == "/settings":
                     was = engine.store.settings()["broker_sync_enabled"]
                     s = engine.update_settings(body)
                     if s["broker_sync_enabled"] and not was:
                         if sched.sync is None:
                             engine.update_settings({"broker_sync_enabled": False})
-                            raise ValidationError("Alpaca paper keys are not configured")
+                            raise ValidationError(f"{book.label} book is not linked to an "
+                                                  f"Alpaca paper account: {book.link_note}")
                         threading.Thread(target=sched.run_sync, daemon=True).start()
-                elif self.path == "/api/symbols":
+                elif rest == "/symbols":
                     added = engine.add_symbols(body.get("symbols", ""), body.get("mode"),
                                                body.get("risk_pct"), now)
                     threading.Thread(target=sched.run_tick, daemon=True).start()
                     return self._send(200, {"added": added})
-                elif m := re.fullmatch(r"/api/symbols/(\d+)/(status|flatten)", self.path):
+                elif m := re.fullmatch(r"/symbols/(\d+)/(status|flatten)", rest):
                     if m.group(2) == "status":
                         engine.set_status(int(m.group(1)), body.get("status"), now)
                     else:
                         engine.flatten(int(m.group(1)), now)
                     threading.Thread(target=sched.run_sync, daemon=True).start()
-                elif self.path == "/api/tick":
+                elif rest == "/tick":
                     sched.run_tick()
-                elif self.path == "/api/reset":
+                elif rest == "/reset":
                     engine.reset(now)
                     threading.Thread(target=sched.run_sync, daemon=True).start()
-                elif self.path == "/api/broker/sync":
+                elif rest == "/broker/sync":
                     if sched.sync is None:
-                        raise ValidationError("Alpaca paper keys are not configured")
+                        raise ValidationError(f"{book.label} book is not linked to Alpaca paper")
                     sched.sync.sync(now)
-                elif self.path == "/api/demo/pause" and sched.clock.demo:
-                    sched.paused = not sched.paused
                 else:
                     return self._send(404, {"error": "not found"})
                 self._send(200, {"ok": True})
@@ -351,17 +415,40 @@ def make_handler(engine: Engine, sched: Scheduler, provider_name: str):
     return Handler
 
 
+def link_papers(demo: bool) -> dict[str, tuple]:
+    """(AlpacaPaper | None, note) per book. The two books must never share a
+    paper account: Alpaca nets one position per symbol per account, so two
+    books trading the same symbol there would fight each other."""
+    out = {}
+    for key, _minutes, _label, prefix, _db in BOOKS:
+        if demo:
+            out[key] = (None, "disabled in demo mode")
+            continue
+        try:
+            paper = AlpacaPaper.from_env(prefix)
+        except BrokerError as e:
+            raise SystemExit(str(e))
+        note = None if paper else (f"set {prefix}_API_KEY_ID and {prefix}_API_SECRET_KEY "
+                                   f"(paper keys) in .env")
+        out[key] = (paper, note)
+    k1, k15 = os.environ.get("APCA_API_KEY_ID"), os.environ.get("APCA_15M_API_KEY_ID")
+    if out.get("15m", (None,))[0] and k1 and k1 == k15:
+        out["15m"] = (None, "its keys are the same as the hourly book's; it needs a "
+                            "separate Alpaca paper account (see SETUP.md)")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--provider", default=None,
                     choices=["polygon", "yahoo", "alpaca", "demo"])
-    ap.add_argument("--db", default=None, help="SQLite file (default tranche.db / demo.db)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--demo", action="store_true",
-                    help="synthetic prices + simulated clock (fresh demo.db each run)")
+                    help="synthetic prices + simulated clock (fresh demo databases each run)")
     ap.add_argument("--demo-days", type=int, default=15, help="weekdays of history to replay")
-    ap.add_argument("--demo-speed", type=float, default=2.0, help="seconds per simulated hour")
+    ap.add_argument("--demo-speed", type=float, default=1.0,
+                    help="seconds per simulated 15 minutes")
     ap.add_argument("--open", action="store_true", help="open the dashboard in the browser")
     args = ap.parse_args()
     url = f"http://{args.host}:{args.port}"
@@ -378,42 +465,52 @@ def main() -> None:
         print("  .env:", note)
     args.provider = args.provider or os.environ.get("TRANCHE_PROVIDER") or (
         "polygon" if os.environ.get("POLYGON_API_KEY") else "yahoo")
-
     if args.demo:
         args.provider = "demo"
-        db = args.db or str(HERE / "demo.db")
-        if os.path.exists(db):
-            os.remove(db)
-    else:
-        db = args.db or str(HERE / "tranche.db")
-    store = Store(db)
-    delay = store.settings()["bar_close_delay_min"]
-    clock = SimClock(args.demo_days, delay) if args.demo else RealClock()
-    provider = make_provider(args.provider, demo_origin=clock.now().date() - timedelta(days=60))
-    engine = Engine(store, provider)
-    if args.demo:
-        engine.add_symbols("DEMOA DEMOB", "long_short", 1.0, clock.now())
-        engine.add_symbols("DEMOC", "short_only", 2.0, clock.now())
 
-    sync = None
-    if not args.demo:
-        try:
-            paper = AlpacaPaper.from_env()
-        except BrokerError as e:
-            raise SystemExit(str(e))
+    stores = {}
+    for key, _m, _l, _p, db in BOOKS:
+        path = HERE / (("demo_" + db) if args.demo else db)
+        if args.demo and path.exists():
+            path.unlink()
+        stores[key] = Store(str(path))
+    delay = stores["1h"].settings()["bar_close_delay_min"]
+    clock = SimClock(args.demo_days, delay) if args.demo else RealClock()
+    provider = CachedProvider(make_provider(
+        args.provider, demo_origin=clock.now().date() - timedelta(days=60)))
+    papers = link_papers(args.demo)
+
+    books: dict[str, Book] = {}
+    for key, minutes, label, _prefix, _db in BOOKS:
+        store = stores[key]
+        engine = Engine(store, provider, minutes)
+        paper, note = papers[key]
         sync = BrokerSync(store, paper) if paper else None
-    elif store.settings()["broker_sync_enabled"]:
-        store.save_settings({"broker_sync_enabled": False})
+        if sync is None and store.settings()["broker_sync_enabled"]:
+            store.save_settings({"broker_sync_enabled": False})
+        if args.demo:
+            engine.add_symbols("DEMOA DEMOB", "long_short", 1.0, clock.now())
+            engine.add_symbols("DEMOC", "short_only", 2.0, clock.now())
+        books[key] = Book(key, minutes, label, engine, Scheduler(engine, clock, sync), note)
+
     if not args.demo:
         print("Checking connections...")
-        for line in connection_check(provider, sync.broker if sync else None, clock.now()):
+        for line in connection_check(
+                provider, [(b.label, papers[k][0], papers[k][1]) for k, b in books.items()],
+                clock.now()):
             print("  " + line)
-    sched = Scheduler(engine, clock, args.demo_speed, sync)
-    sched.start()
-    server.RequestHandlerClass = make_handler(engine, sched, provider.name)
-    print(f"Tranche dashboard on {url}  "
-          f"(provider={provider.name}, db={db}{', DEMO clock' if args.demo else ''}, "
-          f"alpaca paper={'linked' if sync else 'not configured'})")
+    demo = None
+    if args.demo:
+        demo = DemoDriver(clock, [b.sched for b in books.values()], args.demo_speed)
+        demo.start()
+    else:
+        for b in books.values():
+            b.sched.start()
+    server.RequestHandlerClass = make_handler(books, provider.name, demo)
+    linked = ", ".join(f"{b.label} {'linked' if b.sched.sync else 'not linked'}"
+                       for b in books.values())
+    print(f"Tranche dashboard on {url}  (provider={provider.name}"
+          f"{', DEMO clock' if args.demo else ''}; alpaca paper: {linked})")
     if args.open:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     try:

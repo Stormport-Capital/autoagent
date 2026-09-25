@@ -35,21 +35,35 @@ def in_rth(ts: datetime) -> bool:
     return RTH_OPEN <= t < RTH_CLOSE
 
 
-def hourly_bucket(ts: datetime) -> tuple[datetime, datetime]:
-    """Clock-aligned hourly bucket, as on standard hourly charts: the first
-    bar is the half hour 9:30-10:00, then 10-11, 11-12, ..., 15-16."""
+def bar_bucket(ts: datetime, minutes: int = 60) -> tuple[datetime, datetime]:
+    """Clock-aligned bucket, as on standard charts. Hourly: the first bar is the
+    half hour 9:30-10:00, then 10-11 ... 15-16. 15-minute: 9:30-9:45 ... 15:45-16:00."""
     local = ts.astimezone(ET)
     day = local.date()
-    if local.time() < time(10, 0):
-        return (datetime.combine(day, RTH_OPEN, tzinfo=ET),
-                datetime.combine(day, time(10, 0), tzinfo=ET))
-    start = datetime.combine(day, time(local.hour, 0), tzinfo=ET)
-    return start, start + timedelta(hours=1)
+    midnight = datetime.combine(day, time(0, 0), tzinfo=ET)
+    mins = local.hour * 60 + local.minute
+    start = midnight + timedelta(minutes=mins - mins % minutes)
+    open_dt = datetime.combine(day, RTH_OPEN, tzinfo=ET)
+    close_dt = datetime.combine(day, RTH_CLOSE, tzinfo=ET)
+    return max(start, open_dt), min(start + timedelta(minutes=minutes), close_dt)
+
+
+def hourly_bucket(ts: datetime) -> tuple[datetime, datetime]:
+    return bar_bucket(ts, 60)
+
+
+def session_bar_ends(day: date, minutes: int = 60) -> list[datetime]:
+    """End times of a session's RTH bars (hourly: 10:00, 11:00, ..., 16:00)."""
+    ends, t = [], datetime.combine(day, RTH_OPEN, tzinfo=ET)
+    close_dt = datetime.combine(day, RTH_CLOSE, tzinfo=ET)
+    while t < close_dt:
+        t = bar_bucket(t, minutes)[1]
+        ends.append(t)
+    return ends
 
 
 def session_hour_ends(day: date) -> list[datetime]:
-    """End times of the seven RTH hourly bars: 10:00, 11:00, ..., 16:00."""
-    return [datetime.combine(day, time(h, 0), tzinfo=ET) for h in range(10, 17)]
+    return session_bar_ends(day, 60)
 
 
 def is_final_bar(b: "Bar") -> bool:
@@ -57,13 +71,17 @@ def is_final_bar(b: "Bar") -> bool:
 
 
 def resample_hourly(bars: list[Bar]) -> list[Bar]:
-    """Aggregate intraday (e.g. 5-minute) bars into RTH-anchored hourly bars."""
+    return resample(bars, 60)
+
+
+def resample(bars: list[Bar], minutes: int = 60) -> list[Bar]:
+    """Aggregate 5-minute bars into clock-aligned RTH bars of `minutes`."""
     out: list[Bar] = []
     cur: dict | None = None
     for b in sorted(bars, key=lambda x: x.start):
         if not in_rth(b.start):
             continue
-        start, end = hourly_bucket(b.start)
+        start, end = bar_bucket(b.start, minutes)
         if cur is None or cur["start"] != start:
             if cur is not None:
                 out.append(Bar(**cur))

@@ -18,6 +18,8 @@ import math
 import os
 import random
 import re
+import threading
+import time as _time
 from datetime import date, datetime, timedelta, timezone
 
 import requests
@@ -31,7 +33,8 @@ class DataError(RuntimeError):
     pass
 
 
-SECRET_ENV = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
+SECRET_ENV = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
+              "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")
 
 
 def redact(msg: str) -> str:
@@ -256,6 +259,34 @@ class DemoProvider:
             if b.session == day:
                 return b.open  # the opening print exists from 9:30
         return None
+
+
+class CachedProvider:
+    """Shares one fetch per symbol between the hourly and 15-minute books when
+    they check at the same moment (every hour both run within seconds)."""
+
+    def __init__(self, inner, ttl_s: float = 60.0):
+        self.inner, self.ttl_s = inner, ttl_s
+        self.name = inner.name
+        self._cache: dict = {}
+        self._lock = threading.Lock()
+
+    def five_min_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        key = (symbol, now.replace(second=0, microsecond=0))
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit and _time.monotonic() - hit[0] < self.ttl_s:
+                return hit[1]
+        bars = self.inner.five_min_bars(symbol, now)
+        with self._lock:
+            if len(self._cache) > 500:
+                self._cache.clear()
+            self._cache[key] = (_time.monotonic(), bars)
+        return bars
+
+    def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
+        getter = getattr(self.inner, "session_open", None)
+        return getter(symbol, day, now) if getter else None
 
 
 def make_provider(name: str, demo_origin: date | None = None):

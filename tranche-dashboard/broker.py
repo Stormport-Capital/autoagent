@@ -54,8 +54,11 @@ class AlpacaPaper:
         self.http.headers.update({"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
 
     @classmethod
-    def from_env(cls) -> "AlpacaPaper | None":
-        key, secret = os.environ.get("APCA_API_KEY_ID"), os.environ.get("APCA_API_SECRET_KEY")
+    def from_env(cls, prefix: str = "APCA") -> "AlpacaPaper | None":
+        """APCA_API_KEY_ID / APCA_API_SECRET_KEY for the hourly book;
+        APCA_15M_API_KEY_ID / APCA_15M_API_SECRET_KEY for the 15-minute book."""
+        key = os.environ.get(f"{prefix}_API_KEY_ID")
+        secret = os.environ.get(f"{prefix}_API_SECRET_KEY")
         return cls(key, secret) if key and secret else None
 
     def _req(self, method: str, path: str, **kw):
