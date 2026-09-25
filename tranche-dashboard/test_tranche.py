@@ -927,5 +927,27 @@ class BrokerSyncTests(unittest.TestCase):
         self.assertTrue(self.eng.update_settings({"broker_sync_enabled": True})["broker_sync_enabled"])
 
 
+class DotenvTest(unittest.TestCase):
+    def test_last_duplicate_wins_and_is_reported(self):
+        keys = ("APCA_15M_API_KEY_ID", "TRANCHE_TEST_ONLY")
+        saved = {k: os.environ.pop(k, None) for k in keys}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                env = Path(d) / ".env"
+                env.write_text("APCA_15M_API_KEY_ID=OLDKEY\nTRANCHE_TEST_ONLY=x\n"
+                               "APCA_15M_API_KEY_ID=NEWKEY\n")
+                notes = app.load_dotenv(env)
+            self.assertEqual(os.environ["APCA_15M_API_KEY_ID"], "NEWKEY")
+            dup = [n for n in notes if "set on 2 lines (1, 3)" in n]
+            self.assertEqual(len(dup), 1)
+            self.assertNotIn("OLDKEY", " ".join(notes))  # values are never printed
+            self.assertNotIn("NEWKEY", " ".join(notes))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

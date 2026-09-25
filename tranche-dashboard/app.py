@@ -74,17 +74,25 @@ def load_dotenv(path: Path) -> list[str]:
         notes.append(f"{path} not found" + (f" - but {alt.name} exists: rename it to .env"
                                             if alt.exists() else ""))
         return notes
-    empty = []
-    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+    empty, values, seen = [], {}, {}
+    for n, line in enumerate(path.read_text(encoding="utf-8-sig", errors="replace").splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
         k, v = k.strip(), v.strip().strip('"').strip("'")
+        seen.setdefault(k, []).append(n)
         if not v:
             empty.append(k)
-        elif not os.environ.get(k):
+        else:
+            values[k] = v  # the last line for a key wins, as in other .env loaders
+    for k, v in values.items():
+        if not os.environ.get(k):
             os.environ[k] = v
+    for k, lines in seen.items():
+        if len(lines) > 1:
+            notes.append(f"{k}: set on {len(lines)} lines ({', '.join(map(str, lines))}) - "
+                         f"the last one is used; delete the others")
     for k in KEYS:
         if os.environ.get(k):
             notes.append(f"{k}: found ({len(os.environ[k])} chars)")
