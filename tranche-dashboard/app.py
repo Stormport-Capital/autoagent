@@ -31,6 +31,7 @@ from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync
 from data import make_provider, redact
 from engine import SLEEVE_LABELS, Engine, ValidationError
@@ -351,7 +352,7 @@ def broker_state(book: Book) -> dict:
     return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
 
 
-def make_handler(books: dict, provider_name: str, demo):
+def make_handler(books: dict, provider_name: str, demo, backups=None):
     ordered = list(books.values())
 
     class Handler(BaseHTTPRequestHandler):
@@ -386,7 +387,9 @@ def make_handler(books: dict, provider_name: str, demo):
                                   "text/html; charset=utf-8")
             book, rest = self._route()
             if book and rest == "/state":
-                return self._send(200, build_state(book, ordered, provider_name, demo))
+                st = build_state(book, ordered, provider_name, demo)
+                st["backup"] = backups.status() if backups else None
+                return self._send(200, st)
             m = re.fullmatch(r"/bars/([A-Z][A-Z0-9.\-]{0,9})(\.csv)?", rest or "")
             if book and m:
                 try:
@@ -436,6 +439,11 @@ def make_handler(books: dict, provider_name: str, demo):
                 elif rest == "/tick":
                     sched.run_tick()
                 elif rest == "/reset":
+                    if backups:  # never wipe history without a copy first
+                        try:
+                            backups.run_backup("pre-reset", only=[book.key])
+                        except Exception as e:
+                            raise ValidationError(f"Reset cancelled - could not back up first: {e}")
                     engine.reset(now)
                     threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif rest == "/broker/sync":
@@ -575,7 +583,16 @@ def main() -> None:
     else:
         for b in books.values():
             b.sched.start()
-    server.RequestHandlerClass = make_handler(books, provider.name, demo)
+    backups = None
+    if not args.demo:
+        backups = Backups({k: b.engine.store for k, b in books.items()}, backup_folder(HERE), clock)
+        try:
+            written = backups.run_backup("startup")
+            print(f"  backup: OK - {len(written)} files -> {backups.folder}")
+        except Exception as e:
+            print(f"  backup: FAILED - {e}")
+        backups.start()
+    server.RequestHandlerClass = make_handler(books, provider.name, demo, backups)
     linked = ", ".join(f"{b.label} {'linked' if b.sched.sync else 'not linked'}"
                        for b in books.values())
     print(f"Tranche dashboard on {url}  (provider={provider.name}"

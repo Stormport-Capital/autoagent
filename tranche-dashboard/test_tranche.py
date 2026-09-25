@@ -5,6 +5,7 @@ import math
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from datetime import date, datetime, time, timedelta
 
 from broker import AlpacaPaper, BrokerError, BrokerSync
@@ -267,6 +268,63 @@ class FmpTests(unittest.TestCase):
         with self.assertRaises(Exception) as cm:
             self.provider(Down()).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
         self.assertNotIn("fmpsecret123", str(cm.exception))
+
+
+class BackupTests(unittest.TestCase):
+    class Clock:
+        def __init__(self, now):
+            self._now = now
+
+        def now(self):
+            return self._now
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = Store(self.path)
+        Engine(self.store, ScriptedProvider([])).add_symbols(
+            "BKP", "short_only", 1.0, datetime(2026, 9, 25, 8, tzinfo=ET))
+
+    def tearDown(self):
+        import shutil
+        self.store.db.close()
+        os.remove(self.path)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def backups(self, now):
+        from backup import Backups
+        return Backups({"1h": self.store}, Path(self.dir), self.Clock(now))
+
+    def test_copy_is_a_complete_readable_database(self):
+        import sqlite3
+        written = self.backups(datetime(2026, 9, 25, 16, 10, tzinfo=ET)).run_backup("daily")
+        self.assertEqual([w.name for w in written], ["tranche_1h_2026-09-25.db"])
+        rows = sqlite3.connect(written[0]).execute("SELECT symbol FROM symbols").fetchall()
+        self.assertEqual(rows, [("BKP",)])
+        self.assertFalse(list(Path(self.dir).glob("*.partial")))
+
+    def test_pre_reset_copies_are_timestamped(self):
+        w = self.backups(datetime(2026, 9, 25, 11, 42, tzinfo=ET)).run_backup("pre-reset")
+        self.assertEqual(w[0].name, "tranche_1h_pre-reset_2026-09-25_1142.db")
+
+    def test_old_daily_copies_are_pruned_but_pre_reset_kept(self):
+        old_daily = Path(self.dir) / "tranche_1h_2026-07-01.db"
+        old_reset = Path(self.dir) / "tranche_1h_pre-reset_2026-07-01_1000.db"
+        old_daily.write_text("x")
+        old_reset.write_text("x")
+        self.backups(datetime(2026, 9, 25, 16, 10, tzinfo=ET)).run_backup("daily")
+        self.assertFalse(old_daily.exists())
+        self.assertTrue(old_reset.exists())
+
+    def test_failure_is_reported(self):
+        blocker = Path(self.dir) / "file"
+        blocker.write_text("x")
+        from backup import Backups
+        b = Backups({"1h": self.store}, blocker / "sub", self.Clock(datetime(2026, 9, 25, tzinfo=ET)))
+        with self.assertRaises(Exception):
+            b.run_backup("daily")
+        self.assertIn("failed", b.status()["error"])
 
 
 class VwapFailTests(unittest.TestCase):

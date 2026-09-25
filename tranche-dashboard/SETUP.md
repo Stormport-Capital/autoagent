@@ -270,3 +270,34 @@ copy your API key.
 with Finviz. If every FMP bar looks shifted by 5 minutes, add
 `FMP_BAR_TIME=end` to `.env` and restart. FMP's docs don't say clearly whether
 its time stamps mark the start or the end of a bar.
+
+## Backups (Google Drive)
+
+All trades, signals, equity and paper orders live in `tranche.db` (Hourly) and
+`tranche_15m.db` (15-min) in the app folder. **Don't move those files or the
+app folder into Google Drive.** Drive syncs files while they're being written,
+which can corrupt a live database. The folder also holds `.env` with your keys.
+
+Instead, the app saves **safe copies** into a folder you choose:
+
+- when it starts,
+- every trading day after the close (about 4:10 PM ET),
+- right before any **Reset portfolio**. If that copy fails, the reset is
+  cancelled.
+
+Each copy is written completely under a temporary name and only then renamed,
+so Drive never uploads a half-written file. Daily copies
+(`tranche_1h_2026-09-25.db`) are kept for 30 days. Pre-reset copies
+(`tranche_15m_pre-reset_2026-09-25_1118.db`) are kept for good.
+
+To send them to Google Drive, add this line to `.env` and restart. Use your own
+Drive path; with Google Drive for desktop it's usually `G:\My Drive`. Check in
+File Explorer.
+
+```
+TRANCHE_BACKUP_DIR=G:\My Drive\Tranche backups
+```
+
+The startup window prints `backup: OK - 2 files -> ...`, and the dashboard
+header shows when the last backup ran. To restore, stop the app and copy a
+backup file back over `tranche.db` or `tranche_15m.db`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
@@ -133,6 +134,18 @@ class Store:
 
     def record_equity(self, ts: datetime, equity: float) -> None:
         self.x("INSERT OR REPLACE INTO equity VALUES (?, ?)", (ts.isoformat(), equity))
+
+    def backup_to(self, path: str) -> None:
+        """Consistent copy of the live database (SQLite online backup), written
+        under a temporary name and renamed when complete."""
+        tmp = path + ".partial"
+        with self.lock:
+            dest = sqlite3.connect(tmp)
+            try:
+                self.db.backup(dest)
+            finally:
+                dest.close()
+        os.replace(tmp, path)
 
     def reset_portfolio(self) -> None:
         with self.lock:
