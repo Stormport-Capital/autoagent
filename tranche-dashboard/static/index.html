@@ -143,7 +143,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
               <select id="borrow_day_count"><option value="360">360</option><option value="365">365</option></select></div>
           </div>
           <div class="row">
-            <div><label for="stop_atr_mult">EMA stop (× bar ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
+            <div><label for="stop_atr_mult" title="EMA tranches have no stop. Shares = risk budget / (this × bar ATR)">EMA sizing (× bar ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
             <div><label for="atr_period">ATR period</label><input id="atr_period" type="number" step="1" min="2"></div>
           </div>
           <div class="row">
@@ -280,7 +280,7 @@ function renderSettings(s) {
 
 function trancheCell(t, sleeve, mode) {
   if (!t) return `<span class="pill">flat</span>`;
-  return `<span class="pill ${t.side}" title="entry ${num(t.entry_price)} · stop ${num(t.stop_price)}${t.target_price == null ? "" : " · target " + num(t.target_price)} · ${t.qty} sh">${t.side === "short" ? "S" : "L"} ${t.qty}</span>` +
+  return `<span class="pill ${t.side}" title="entry ${num(t.entry_price)} · ${t.sleeve === "VWAP" ? "stop " + num(t.stop_price) : "exits on the opposite cross"}${t.target_price == null ? "" : " · target " + num(t.target_price)} · ${t.qty} sh">${t.side === "short" ? "S" : "L"} ${t.qty}</span>` +
          `<span class="${cls(t.unrealized)}">${signed(t.unrealized)}</span>`;
 }
 
@@ -423,7 +423,7 @@ function renderTab() {
     h = `<table><thead><tr><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Side</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Target</th><th>Mark</th>
       <th>Notional</th><th>Risk</th><th>Borrow so far</th><th>Open P&amp;L (net)</th><th class="l">Opened</th></tr></thead><tbody>`;
     for (const t of m.open) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
-      <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${num(t.stop_price)}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
+      <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${t.sleeve === "VWAP" ? num(t.stop_price) : "on cross"}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
       <td>${usd(t.risk_dollars)}</td><td>${usd(t.borrow_fees, 2)}</td><td class="${cls(t.unrealized - t.borrow_fees)}">${signed(t.unrealized - t.borrow_fees)}</td><td class="l">${fmtT(t.entry_time)}</td></tr>`;
   } else if (TAB === "closed") {
     if (!m.closed.length) return $("#tabBody").innerHTML = `<div class="empty">No closed trades yet.</div>`;

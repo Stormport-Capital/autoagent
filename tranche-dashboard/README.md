@@ -38,8 +38,8 @@ Each tranche gets one third of that budget.
 
 | Tranche | Entry (hourly chart) | Exit |
 |---|---|---|
-| **5/10 EMA** | 5 EMA crosses **below** 10 EMA → short. In *long & short* mode, 5 crosses **above** 10 → long | Opposite cross (it reverses in long & short mode), or the stop |
-| **10/20 EMA** | Same rule using the 10 and 20 EMA | Opposite cross, or the stop |
+| **5/10 EMA** | 5 EMA crosses **below** 10 EMA → short. In *long & short* mode, 5 crosses **above** 10 → long | **Only** the opposite cross (it reverses in long & short mode). No stop |
+| **10/20 EMA** | Same rule using the 10 and 20 EMA | Only the opposite cross. No stop |
 | **VWAP** (always short) | **Russo "VWAP fail"** (Trigger B): an earlier hourly bar this session closed above VWAP, **and** this bar closes below VWAP, **and** this bar's high is below the session high so far. It fires only on the first bar where all three are true. There is no red-candle test, so a green bar can trigger it | **Russo exits**, stop checked first. **Stop:** the first later bar whose high reaches `max(high of day including that bar, entry)`, meaning a new high of day. On a later session that also requires trading back above entry. It fills at that level, the worst price in the bar. **Target:** the daily 10-day simple moving average of prior sessions' closes, filled at the target when an hourly low touches it. **Held overnight**, with no flatten at the close |
 
 - **Setup choices, made per symbol:** *short only* or *long & short* for the two
@@ -57,9 +57,18 @@ Each tranche gets one third of that budget.
   A signal only trades if it executes after you added the symbol. So a name
   added pre-market can act on yesterday's last bar at the open, but never on
   anything older.
-- **EMA stops:** the two EMA tranches have a hard stop at `EMA stop × hourly ATR(14)`
-  from entry (default 1.5×). A stop is detected from each hourly bar's high or low
-  and fills at the stop price, or at the bar's open if price gapped through it.
+- **EMA tranches have no stop.** They enter on a cross and exit only on the
+  opposite cross, at that bar's close (or at the next open for the day's last
+  bar), whatever the loss. There is no ATR stop and no gap exit.
+- **What counts as a cross:** EMAs are compared at the price a chart shows:
+  cents at $1 and up, 4 decimals below $1. **Equal EMAs are never a signal.**
+  A cross fires on the first bar where one line is clearly on the other side,
+  and the last bar where they differed had it on the opposite side. Touching and
+  bouncing back the same way is not a cross.
+- **VWAP signals never carry overnight.** VWAP resets each session. A VWAP fail
+  on the day's last bar is logged and skipped, not traded at the next open.
+  The VWAP tranche can only enter intraday, after an earlier bar of *that day*
+  closed above VWAP.
 - **VWAP tranche notes (as in the Russo engine):** if a bar makes a new high of
   day and touches the 10-day average, it counts as a stop, not a win. There are **no
   setup or entry filters**: you choose the symbols. Russo's +100%-in-5-sessions
@@ -70,8 +79,12 @@ Each tranche gets one third of that budget.
   not modelled: it only matters with scale-ins, and those are off in the Russo
   harness too. The target needs 10 prior sessions of data; with less history
   there is no target until there is.
-- **Sizing:** `shares = (equity × risk% ÷ 3) ÷ stop distance`. For the VWAP
-  tranche, the stop distance is from entry up to the session high. Sizing uses the current
+- **Sizing:** `shares = (equity × risk% ÷ 3) ÷ risk per share`. For the VWAP
+  tranche, risk per share is the distance from entry up to the session high,
+  its real stop. The EMA tranches have no stop, so risk per share is a
+  volatility yardstick: `EMA sizing × bar ATR(14)` (default 1.5×). It only
+  sets the size, never an exit. A loss on an EMA trade can therefore be larger
+  than the risk %. Sizing uses the current
   mark-to-market equity. Gross exposure is capped at `Max gross leverage × equity`
   (default 2×). An entry that works out to less than one share is skipped and
   logged.

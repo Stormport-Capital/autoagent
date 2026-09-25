@@ -11,7 +11,7 @@ DEFAULT_SETTINGS = {
     "starting_capital": 100_000.0,
     "borrow_rate_pct": 10.0,       # annual hard-to-borrow fee on short notional
     "borrow_day_count": 360,       # broker convention: rate / 360 per calendar night
-    "stop_atr_mult": 1.5,          # per-tranche stop = entry -/+ mult x hourly ATR
+    "stop_atr_mult": 1.5,          # EMA sizing unit: risk budget / (mult x bar ATR); NOT a stop
     "atr_period": 14,
     "max_leverage": 2.0,           # gross exposure cap as a multiple of equity
     "slippage_bps": 5.0,           # adverse fill vs bar close / stop, each side

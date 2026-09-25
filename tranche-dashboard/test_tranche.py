@@ -11,7 +11,8 @@ from broker import AlpacaPaper, BrokerError, BrokerSync
 import app
 from app import bar_for_boundary, boundaries
 from engine import Engine, ValidationError, vwap_fail
-from indicators import (ET, Bar, atr, bar_bucket, crossed_below, ema, resample,
+from indicators import (ET, Bar, atr, bar_bucket, crossed_below, ema, ema_cross,
+                        price_tick, resample,
                         resample_hourly, session_bar_ends, session_hour_ends,
                         session_vwap)
 from store import Store
@@ -130,6 +131,30 @@ class FifteenMinuteTests(unittest.TestCase):
         self.assertEqual(len(got), 26)
 
 
+class EmaCrossTests(unittest.TestCase):
+    def test_equal_at_chart_precision_is_not_a_signal(self):
+        # 10 EMA 1.537 vs 20 EMA 1.538: both show 1.54 on a chart -> no cross
+        self.assertEqual(ema_cross([1.56, 1.537], [1.55, 1.538], 1, 0.01), 0)
+
+    def test_cross_needs_clear_separation(self):
+        self.assertEqual(ema_cross([1.56, 1.52], [1.55, 1.54], 1, 0.01), -1)
+        self.assertEqual(ema_cross([1.50, 1.56], [1.52, 1.54], 1, 0.01), 1)
+
+    def test_touch_then_separate_counts_once(self):
+        a = [1.56, 1.54, 1.54, 1.52, 1.51]   # above, equal, equal, below, below
+        b = [1.55, 1.54, 1.54, 1.54, 1.54]
+        self.assertEqual([ema_cross(a, b, i, 0.01) for i in range(1, 5)], [0, 0, -1, 0])
+
+    def test_touch_and_bounce_same_side_is_not_a_cross(self):
+        a = [1.56, 1.54, 1.57]
+        b = [1.55, 1.54, 1.55]
+        self.assertEqual(ema_cross(a, b, 2, 0.01), 0)
+
+    def test_sub_dollar_uses_four_decimals(self):
+        self.assertEqual(price_tick(0.85), 0.0001)
+        self.assertEqual(ema_cross([0.8512, 0.8501], [0.8505, 0.8504], 1, 0.0001), -1)
+
+
 class VwapFailTests(unittest.TestCase):
     d = date(2026, 9, 21)
 
@@ -203,7 +228,7 @@ class EngineTests(unittest.TestCase):
         eng.tick(datetime.combine(ds[-1], time(17), tzinfo=ET))
         self.assertEqual(self.store.q("SELECT * FROM tranches"), [])
 
-    def test_ema_cross_short_sizing_and_stop(self):
+    def test_ema_cross_short_sizing_and_cross_exit(self):
         bars, ds = self.uptrend_then_drop(8, lambda p: [p - 1.0, p - 2.5, p - 4, p - 3, p + 6, p + 7, p + 8])
         eng = self.engine(bars)
         added = datetime.combine(ds[-1], time(9), tzinfo=ET)
@@ -216,11 +241,12 @@ class EngineTests(unittest.TestCase):
         hourly = [b for b in resample_hourly(bars) if b.end <= datetime.fromisoformat(first["entry_time"])]
         a = atr(hourly, 14)[-1]
         dist = 1.5 * a
-        self.assertAlmostEqual(first["stop_price"], first["entry_price"] + dist, places=6)
         self.assertEqual(first["qty"], math.floor(100_000 * 0.015 / 3 / dist))
-        # the rip to p+6 blows through the stop: stopped at the gapped open or the stop
-        self.assertTrue(first["exit_reason"].startswith("stop hit"))
-        self.assertGreaterEqual(first["exit_price"], first["stop_price"])
+        # no stop: the rip to p+6 does not stop it out; it covers only when the
+        # 5 EMA crosses back above the 10, at that bar's close
+        self.assertTrue(first["exit_reason"].startswith("5/10 EMA crossed up"), first["exit_reason"])
+        exit_bar = [b for b in resample_hourly(bars) if b.end == datetime.fromisoformat(first["exit_time"])][0]
+        self.assertAlmostEqual(first["exit_price"], exit_bar.close, places=6)  # slippage is 0 in these tests
         self.assertLess(first["gross_pnl"], 0)
         # short_only: the bullish recross never opens a long
         self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE side='long'"))
@@ -413,6 +439,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(t["entry_time"], datetime.combine(nxt, time(9, 30), tzinfo=ET).isoformat())
         self.assertAlmostEqual(t["entry_price"], 47.0)         # the opening print
 
+    def test_vwap_fail_on_last_bar_is_not_traded_at_open(self):
+        ds = weekdays(date(2026, 8, 3), 12)
+        bars = []
+        for d in ds[:10]:
+            bars += day_from_closes(d, [45.0] * 7)
+        d, nxt = ds[10], ds[11]
+        bars += hour_bars(d, 0, 48.0, 52.0, 47.8, 51.5)          # closes above VWAP, HOD 52
+        for k in range(1, 6):
+            bars += hour_bars(d, k, 51.5, 51.8, 51.2, 51.5)
+        bars += hour_bars(d, 6, 51.5, 51.6, 49.0, 49.2)           # VWAP fail on the LAST bar
+        bars += day_from_closes(nxt, [49.0] * 7)
+        eng = self.engine(bars)
+        eng.add_symbols("VCL", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng.tick(datetime.combine(nxt, time(9, 32), tzinfo=ET))
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE sleeve='VWAP'"))
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE sleeve='VWAP' AND kind='skip' "
+                                     "AND message LIKE '%resets overnight%'"))
+
     def test_bar_table_shows_the_signal_and_when_it_acts(self):
         bars, d, nxt = self.last_bar_cross()
         eng = self.engine(bars)
@@ -420,7 +464,7 @@ class EngineTests(unittest.TestCase):
         last = rows[-1]
         self.assertTrue(last["bar_start_et"].endswith("15:00"))
         self.assertIn("5/10 cross DOWN", last["signals"])
-        self.assertEqual(last["acts_at"], "next session 9:30 open")
+        self.assertEqual(last["acts_at"], "next session 9:30 open (EMA only)")
         self.assertIsNotNone(last["ema5"])
 
     def test_entry_log_explains_the_numbers(self):

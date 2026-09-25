@@ -168,3 +168,34 @@ def crossed_above(a_prev, b_prev, a, b) -> bool:
     if None in (a_prev, b_prev, a, b):
         return False
     return a_prev <= b_prev and a > b
+
+
+def price_tick(price: float) -> float:
+    """What a chart shows: cents at $1 and up, 4 decimals below $1."""
+    return 0.01 if price >= 1 else 0.0001
+
+
+def ema_cross(a: list, b: list, i: int, tick: float, lookback: int = 60) -> int:
+    """-1 if line a crossed below line b on bar i, +1 if it crossed above, else 0.
+
+    Compared at the chart's price tick, so lines that show as EQUAL are not a
+    signal. A cross needs a on the other side of b now, and the most recent
+    earlier bar where the two differed had a on the opposite side. Touching
+    (equal) and separating again the same way is not a cross.
+    """
+    def side(k):
+        if a[k] is None or b[k] is None:
+            return None
+        ra, rb = round(a[k] / tick), round(b[k] / tick)
+        return (ra > rb) - (ra < rb)
+
+    now = side(i)
+    if not now:
+        return 0
+    for k in range(i - 1, max(-1, i - 1 - lookback), -1):
+        prev = side(k)
+        if prev is None:
+            return 0
+        if prev:
+            return now if prev != now else 0
+    return 0

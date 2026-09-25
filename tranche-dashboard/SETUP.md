@@ -137,8 +137,9 @@ orders are needed to match.
 - **Only your symbols:** it only touches symbols you added in the app. Anything
   else in the paper account is left alone. Removing a symbol, or resetting the
   portfolio, also closes that position at Alpaca.
-- **Stops are hourly, like the model.** There are no resting stop orders at
-  Alpaca, so a stock can move past a stop inside the hour, just as in the model.
+- **No resting stop orders at Alpaca.** The EMA tranches have no stop at all.
+  The VWAP tranche's stop is checked at each bar close, like the model, so a
+  stock can move past it inside a bar.
 - **The last bar of the day (15:00–16:00)** is acted on at the **next day's
   9:30 open check**. The model fills at the official opening price, and the
   paper order goes out at about 9:32.
@@ -183,7 +184,7 @@ couple of minutes so the data can arrive:
   re-enter them each day. **Pause** stops new entries but still manages open
   positions. **Flatten** closes that symbol's positions now.
 - **Positions carry overnight**:
-  - EMA tranches: until the opposite cross or the stop.
+  - EMA tranches: until the opposite cross (no stop).
   - VWAP tranche: until a new high of day above entry, or the 10-day average.
 - **Paper orders** go out right after each check, including the 9:30 open
   check.

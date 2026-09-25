@@ -21,7 +21,11 @@ third of the symbol's risk budget:
                        next bar's open.
               held overnight; no end-of-session flatten.
 
-EMA tranches have a hard stop at stop_atr_mult x hourly ATR from entry.
+EMA tranches have NO stop: they enter and exit only on crossovers (the
+opposite cross closes the position, and reverses it in long_short mode).
+Crosses are judged at the chart's price tick, so equal EMAs never signal.
+Sizing still uses a volatility yardstick, stop_atr_mult x bar ATR, as the
+"risk per share" that the risk % budget is divided by - it is not an exit.
 Sizing: qty = (equity x risk_pct / 3) / stop distance, capped so gross exposure
 stays <= equity x max_leverage. Fills are simulated at the hourly close (entries,
 signal exits) or at the stop / gapped open (stops), with slippage_bps adverse.
@@ -37,7 +41,7 @@ from dataclasses import dataclass
 import re
 from datetime import date, datetime, time, timedelta
 
-from indicators import (ET, RTH_OPEN, Bar, atr, crossed_above, crossed_below,
+from indicators import (ET, RTH_OPEN, Bar, atr, ema_cross, price_tick,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
                         resample, session_vwap)
 from data import redact
@@ -57,7 +61,7 @@ SETTING_BOUNDS = {
     "starting_capital": (1_000.0, 1e9),
     "borrow_rate_pct": (0.0, 200.0),
     "borrow_day_count": (360, 365),
-    "stop_atr_mult": (0.25, 10.0),
+    "stop_atr_mult": (0.25, 10.0),   # EMA sizing unit (x ATR); not a stop
     "atr_period": (2, 50),
     "max_leverage": (0.1, 10.0),
     "slippage_bps": (0.0, 200.0),
@@ -248,16 +252,14 @@ class Engine:
             e5, e10, e20 = ind["e5"], ind["e10"], ind["e20"]
             sig = []
             if i > 0:
-                if crossed_below(e5[j], e10[j], e5[i], e10[i]):
-                    sig.append("5/10 cross DOWN")
-                if crossed_above(e5[j], e10[j], e5[i], e10[i]):
-                    sig.append("5/10 cross UP")
-                if crossed_below(e10[j], e20[j], e10[i], e20[i]):
-                    sig.append("10/20 cross DOWN")
-                if crossed_above(e10[j], e20[j], e10[i], e20[i]):
-                    sig.append("10/20 cross UP")
+                tick = price_tick(b.close)
+                for name, x, y in (("5/10", e5, e10), ("10/20", e10, e20)):
+                    c = ema_cross(x, y, i, tick)
+                    if c:
+                        sig.append(f"{name} cross {'UP' if c > 0 else 'DOWN'}")
                 if vwap_fail(bars, five, i) and not vwap_fail(bars, five, j):
-                    sig.append("VWAP fail")
+                    sig.append("VWAP fail" + (" (last bar: not carried to the open)"
+                                              if is_final_bar(b) else ""))
             vw = session_vwap(five, b.session, b.end)
             r = lambda v: None if v is None else round(v, 4)
             rows.append({
@@ -267,7 +269,7 @@ class Engine:
                 "volume": int(b.volume), "ema5": r(e5[i]), "ema10": r(e10[i]),
                 "ema20": r(e20[i]), "atr": r(ind["atr"][i]), "vwap": r(vw),
                 "signals": "; ".join(sig),
-                "acts_at": ("next session 9:30 open" if is_final_bar(b) else
+                "acts_at": ("next session 9:30 open (EMA only)" if is_final_bar(b) else
                             b.end.astimezone(ET).strftime("%H:%M")) if sig else "",
             })
         return rows
@@ -356,18 +358,7 @@ class Engine:
                     continue
                 del open_tr[sleeve]
                 continue
-            stop = t["stop_price"]  # EMA tranches: fixed ATR stop, gap = fill at open
-            if t["side"] == "short" and b.high >= stop:
-                self._close(t, max(b.open, stop), b.end,
-                            f"stop hit: {bar_txt} high >= stop {stop:.4g}"
-                            + (" (opened above it: filled at the open)" if b.open > stop else ""), s)
-            elif t["side"] == "long" and b.low <= stop:
-                self._close(t, min(b.open, stop), b.end,
-                            f"stop hit: {bar_txt} low <= stop {stop:.4g}"
-                            + (" (opened below it: filled at the open)" if b.open < stop else ""), s)
-            else:
-                continue
-            del open_tr[sleeve]
+            # EMA tranches have no stop: they only exit on the opposite cross (step 3)
 
         # held into the next session (final bar): charge that night's borrow
         if fill.session != b.session:
@@ -383,19 +374,24 @@ class Engine:
         else:
             ctx = (f"on the {bar_txt}; EMA5 {e5[j]:.4g}->{e5[i]:.4g}, EMA10 {e10[j]:.4g}->"
                    f"{e10[i]:.4g}, EMA20 {e20[j]:.4g}->{e20[i]:.4g}; filled {fill.how}")
+            tick = price_tick(b.close)
+            c1, c2 = ema_cross(e5, e10, i, tick), ema_cross(e10, e20, i, tick)
             self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, a, s,
-                             crossed_below(e5[j], e10[j], e5[i], e10[i]),
-                             crossed_above(e5[j], e10[j], e5[i], e10[i]), ctx)
+                             c1 < 0, c1 > 0, ctx)
             self._ema_sleeve(sym, "EMA10_20", open_tr.get("EMA10_20"), fill, a, s,
-                             crossed_below(e10[j], e20[j], e10[i], e20[i]),
-                             crossed_above(e10[j], e20[j], e10[i], e20[i]), ctx)
+                             c2 < 0, c2 > 0, ctx)
 
         vwap = session_vwap(five, b.session, b.end)
         if vwap is None:
             return
         # Russo Trigger B, rising edge only: fires on the bar where it turns true
         lost = vwap_fail(bars, five, i) and not (i > 0 and vwap_fail(bars, five, i - 1))
-        if lost and "VWAP" not in open_tr:
+        if lost and fill.session != b.session:
+            # VWAP resets every session: a fail on the last bar is not carried to the open
+            self.store.log(b.end, "skip", f"VWAP fail on the last bar of the day ({bar_txt}) - "
+                           "VWAP resets overnight, so it is not traded at the next open",
+                           name, "VWAP")
+        elif lost and "VWAP" not in open_tr:
             at_open = " (bar closed at 16:00: entered at the next open)" if fill.session != b.session else ""
             self._enter(sym, "VWAP", "short", fill, None, s,
                         f"VWAP fail: close {b.close:.2f} < VWAP {vwap:.2f}, "
@@ -434,10 +430,10 @@ class Engine:
             dist = abs(stop - fill)
             math_txt = f"stop = high of day {stop:.4g}"
         else:
-            dist = s["stop_atr_mult"] * a
+            dist = s["stop_atr_mult"] * a  # sizing yardstick only - EMA tranches have no stop
             stop = fill - dist if side == "long" else fill + dist
-            math_txt = (f"stop = {fill:.4g} {'-' if side == 'long' else '+'} "
-                        f"{s['stop_atr_mult']:g} x ATR {a:.4g}")
+            math_txt = (f"no stop - exits only on the opposite cross; sizing unit = "
+                        f"{s['stop_atr_mult']:g} x ATR {a:.4g} = {dist:.4g}/share")
         if dist <= 0 or stop <= 0:
             self.store.log(f.when, "skip", f"{why}: invalid stop distance", name, sleeve)
             return
@@ -462,7 +458,8 @@ class Engine:
         note = " (capped by max leverage)" if capped else ""
         tgt = f", target {target:.2f}" if target is not None else ""
         self.store.log(f.when, "entry",
-                       f"{why} -> {side.upper()} {qty} @ {fill:.2f}, stop {stop:.2f}{tgt}, "
+                       f"{why} -> {side.upper()} {qty} @ {fill:.2f}, "
+                       f"{'stop ' + format(stop, '.2f') if sleeve == 'VWAP' else 'no stop'}{tgt}, "
                        f"risk ${qty * dist:,.0f}{note} [{math_txt}; size = "
                        f"${budget:,.0f} budget / {dist:.4g} per share]", name, sleeve)
 
