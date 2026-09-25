@@ -150,6 +150,18 @@ class EmaCrossTests(unittest.TestCase):
         b = [1.55, 1.54, 1.55]
         self.assertEqual(ema_cross(a, b, 2, 0.01), 0)
 
+    def test_aixc_sep24_finviz_case(self):
+        # Finviz 15-min AIXC. Bars: ... 3:15, 3:30, 3:45 (last bar Sep 24), 9:30 Sep 25.
+        # 3:30 values are backed out from the 3:45 readings (+/- rounding).
+        e5 = [1.60, 1.5695, 1.52, 1.56]
+        e10 = [1.58, 1.5700, 1.54, 1.56]
+        e20 = [1.55, 1.5530, 1.54, 1.55]
+        tick = price_tick(1.42)
+        # 5/10: the sub-cent dip at 3:30 is "equal" on the chart, 3:45 is the cross
+        self.assertEqual([ema_cross(e5, e10, i, tick) for i in (1, 2, 3)], [0, -1, 0])
+        # 10/20: equal at 3:45, back above at 9:30 - never a signal
+        self.assertEqual([ema_cross(e10, e20, i, tick) for i in (1, 2, 3)], [0, 0, 0])
+
     def test_sub_dollar_uses_four_decimals(self):
         self.assertEqual(price_tick(0.85), 0.0001)
         self.assertEqual(ema_cross([0.8512, 0.8501], [0.8505, 0.8504], 1, 0.0001), -1)
