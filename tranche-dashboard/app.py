@@ -16,6 +16,9 @@ linked (keys in .env) and switched on in the dashboard; see broker.py / SETUP.md
 from __future__ import annotations
 
 import argparse
+import csv
+import html
+import io
 import json
 import os
 import re
@@ -364,6 +367,16 @@ def make_handler(books: dict, provider_name: str, demo):
             book, rest = self._route()
             if book and rest == "/state":
                 return self._send(200, build_state(book, ordered, provider_name, demo))
+            m = re.fullmatch(r"/bars/([A-Z][A-Z0-9.\-]{0,9})(\.csv)?", rest or "")
+            if book and m:
+                try:
+                    rows = book.engine.bar_table(m.group(1), book.sched.clock.now())
+                except Exception as e:
+                    return self._send(502, {"error": redact(e)[:300]})
+                if m.group(2):
+                    return self._send(200, rows_csv(rows).encode(), "text/csv; charset=utf-8")
+                return self._send(200, bars_page(book, m.group(1), rows).encode(),
+                                  "text/html; charset=utf-8")
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -413,6 +426,38 @@ def make_handler(books: dict, provider_name: str, demo):
                 self._send(400, {"error": str(e)})
 
     return Handler
+
+
+def rows_csv(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    if rows:
+        w = csv.DictWriter(buf, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return buf.getvalue()
+
+
+def bars_page(book: Book, symbol: str, rows: list[dict]) -> str:
+    """Plain table of the bars the engine used, newest first, for checking
+    against a chart. Signal rows are highlighted."""
+    esc = html.escape
+    cols = list(rows[0]) if rows else []
+    head = "".join(f"<th>{esc(c)}</th>" for c in cols)
+    body = "".join(
+        "<tr%s>%s</tr>" % (' class="sig"' if r["signals"] else "",
+                           "".join(f"<td>{esc('' if r[c] is None else str(r[c]))}</td>" for c in cols))
+        for r in reversed(rows))
+    return f"""<!doctype html><meta charset="utf-8"><title>{esc(symbol)} {esc(book.label)} bars</title>
+<style>body{{font:13px system-ui,sans-serif;margin:16px;color:#16181d;background:#fff}}
+table{{border-collapse:collapse;font-variant-numeric:tabular-nums}}th,td{{padding:4px 8px;
+border-bottom:1px solid #e3e6eb;text-align:right;white-space:nowrap}}th{{color:#7a808c;font-weight:500;
+position:sticky;top:0;background:#fff}}tr.sig{{background:#fff4d6}}td:nth-last-child(-n+2){{text-align:left}}
+@media (prefers-color-scheme:dark){{body{{background:#0f1115;color:#e8eaee}}th{{background:#0f1115}}
+th,td{{border-color:#2a2f38}}tr.sig{{background:#3a2f12}}}}</style>
+<h2>{esc(symbol)} - {esc(book.label)} bars the engine used (newest first)</h2>
+<p>Regular-hours bars built from 5-minute data; EMAs on bar closes; ATR (Wilder); session VWAP.
+Highlighted rows fired a signal. <a href="{esc(symbol)}.csv">Download CSV</a></p>
+<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"""
 
 
 def link_papers(demo: bool) -> dict[str, tuple]:

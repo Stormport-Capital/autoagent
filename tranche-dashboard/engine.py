@@ -80,6 +80,7 @@ class Fill:
     price: float
     when: datetime
     session: date
+    how: str = ""  # human-readable: which price this is and where it came from
 
 
 def vwap_fail(bars: list[Bar], five: list[Bar], i: int) -> bool:
@@ -216,8 +217,9 @@ class Engine:
                 return True
         return False
 
-    def _process_symbol(self, sym: dict, now: datetime, s: dict) -> None:
-        five = self.provider.five_min_bars(sym["symbol"], now)
+    def _load(self, symbol: str, now: datetime, s: dict):
+        """5-minute data -> completed bars of this book's size + indicators."""
+        five = self.provider.five_min_bars(symbol, now)
         delay = timedelta(minutes=s["bar_close_delay_min"])
         # an hour counts as complete once the feed has printed through its end
         # (delayed feeds lag), or 20 min later for names with no late prints
@@ -226,13 +228,52 @@ class Engine:
                 if b.end + delay <= now
                 and ((data_end and data_end >= b.end) or b.end + max(delay, STALE_WAIT) <= now)]
         if not bars:
-            raise RuntimeError("no completed hourly bars returned")
+            raise RuntimeError("no completed bars returned")
         closes = [b.close for b in bars]
         ind = {
             "e5": ema(closes, 5), "e10": ema(closes, 10), "e20": ema(closes, 20),
             "atr": atr(bars, int(s["atr_period"])),
             "daily": daily_closes(five),
         }
+        return five, bars, ind
+
+    def bar_table(self, symbol: str, now: datetime, n: int = 80) -> list[dict]:
+        """The last n completed bars exactly as the engine sees them, with the
+        indicators and which signals fired - for checking against a chart."""
+        s = self.store.settings()
+        five, bars, ind = self._load(symbol, now, s)
+        rows = []
+        for i in range(max(0, len(bars) - n), len(bars)):
+            b, j = bars[i], i - 1
+            e5, e10, e20 = ind["e5"], ind["e10"], ind["e20"]
+            sig = []
+            if i > 0:
+                if crossed_below(e5[j], e10[j], e5[i], e10[i]):
+                    sig.append("5/10 cross DOWN")
+                if crossed_above(e5[j], e10[j], e5[i], e10[i]):
+                    sig.append("5/10 cross UP")
+                if crossed_below(e10[j], e20[j], e10[i], e20[i]):
+                    sig.append("10/20 cross DOWN")
+                if crossed_above(e10[j], e20[j], e10[i], e20[i]):
+                    sig.append("10/20 cross UP")
+                if vwap_fail(bars, five, i) and not vwap_fail(bars, five, j):
+                    sig.append("VWAP fail")
+            vw = session_vwap(five, b.session, b.end)
+            r = lambda v: None if v is None else round(v, 4)
+            rows.append({
+                "bar_start_et": b.start.astimezone(ET).strftime("%Y-%m-%d %H:%M"),
+                "bar_end_et": b.end.astimezone(ET).strftime("%H:%M"),
+                "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+                "volume": int(b.volume), "ema5": r(e5[i]), "ema10": r(e10[i]),
+                "ema20": r(e20[i]), "atr": r(ind["atr"][i]), "vwap": r(vw),
+                "signals": "; ".join(sig),
+                "acts_at": ("next session 9:30 open" if is_final_bar(b) else
+                            b.end.astimezone(ET).strftime("%H:%M")) if sig else "",
+            })
+        return rows
+
+    def _process_symbol(self, sym: dict, now: datetime, s: dict) -> None:
+        five, bars, ind = self._load(sym["symbol"], now, s)
         added = _dt(sym["added_at"])
         last = _dt(sym["last_bar_end"])
         for i, b in enumerate(bars):
@@ -244,7 +285,7 @@ class Engine:
                 if fill is None:
                     break  # before the next open: wait for the 9:30 check
             else:
-                fill = Fill(b.close, b.end, b.session)
+                fill = Fill(b.close, b.end, b.session, f"at the bar close {b.close:.4g}")
             if fill.when > added:
                 self._process_bar(sym, bars, five, i, ind, s, fill)
             last = b.end
@@ -267,7 +308,8 @@ class Engine:
         """The opening print of the session after bar b, once it exists."""
         for x in five:
             if x.session > b.session and in_rth(x.start):
-                return Fill(x.open, x.start, x.session)
+                return Fill(x.open, x.start, x.session,
+                            f"at the {x.session:%b %d} 9:30 open {x.open:.4g} (first 5-min bar)")
         today = now.astimezone(ET)
         if today.date() <= b.session or today.weekday() >= 5 or today.time() < RTH_OPEN:
             return None
@@ -275,12 +317,15 @@ class Engine:
         price = getter(symbol, today.date(), now) if getter else None
         if price is None:
             return None
-        return Fill(price, datetime.combine(today.date(), RTH_OPEN, tzinfo=ET), today.date())
+        return Fill(price, datetime.combine(today.date(), RTH_OPEN, tzinfo=ET), today.date(),
+                    f"at the {today:%b %d} 9:30 open {price:.4g} ({self.provider.name} first minute)")
 
     def _process_bar(self, sym, bars: list[Bar], five: list[Bar], i: int, ind: dict, s: dict,
                      fill: Fill | None = None):
         b = bars[i]
-        fill = fill or Fill(b.close, b.end, b.session)
+        fill = fill or Fill(b.close, b.end, b.session, f"at the bar close {b.close:.4g}")
+        bar_txt = (f"{b.start.astimezone(ET):%b %d %H:%M}-{b.end.astimezone(ET):%H:%M} bar "
+                   f"O{b.open:.4g} H{b.high:.4g} L{b.low:.4g} C{b.close:.4g}")
         prev = bars[i - 1] if i > 0 else None
         name = sym["symbol"]
         open_tr = {t["sleeve"]: t for t in self._open(sym["id"])}
@@ -299,11 +344,12 @@ class Engine:
             if sleeve == "VWAP":  # Russo: new high of day stop, daily 10-MA target
                 stop = max(hod, t["entry_price"])
                 if b.high >= stop:
-                    self._close(t, stop, b.end, f"stop: new high of day {stop:.2f}", s)
+                    self._close(t, stop, b.end, f"stop: new high of day {stop:.4g} "
+                                f"({bar_txt}; high reached max(HOD, entry))", s)
                 elif target is not None and b.low <= target:
                     # a gap below the target covers at the open, not above the bar
                     self._close(t, min(target, b.open), b.end,
-                                f"target: daily 10-MA {target:.2f}", s)
+                                f"target: daily 10-MA {target:.4g} ({bar_txt} low touched it)", s)
                 else:
                     self.store.x("UPDATE tranches SET stop_price=?, target_price=? WHERE id=?",
                                  (stop, target, t["id"]))
@@ -312,9 +358,13 @@ class Engine:
                 continue
             stop = t["stop_price"]  # EMA tranches: fixed ATR stop, gap = fill at open
             if t["side"] == "short" and b.high >= stop:
-                self._close(t, max(b.open, stop), b.end, "stop hit", s)
+                self._close(t, max(b.open, stop), b.end,
+                            f"stop hit: {bar_txt} high >= stop {stop:.4g}"
+                            + (" (opened above it: filled at the open)" if b.open > stop else ""), s)
             elif t["side"] == "long" and b.low <= stop:
-                self._close(t, min(b.open, stop), b.end, "stop hit", s)
+                self._close(t, min(b.open, stop), b.end,
+                            f"stop hit: {bar_txt} low <= stop {stop:.4g}"
+                            + (" (opened below it: filled at the open)" if b.open < stop else ""), s)
             else:
                 continue
             del open_tr[sleeve]
@@ -331,12 +381,14 @@ class Engine:
         if not ema_ready:
             self.store.log(b.end, "warmup", "not enough bar history for EMA20/ATR yet", name)
         else:
+            ctx = (f"on the {bar_txt}; EMA5 {e5[j]:.4g}->{e5[i]:.4g}, EMA10 {e10[j]:.4g}->"
+                   f"{e10[i]:.4g}, EMA20 {e20[j]:.4g}->{e20[i]:.4g}; filled {fill.how}")
             self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, a, s,
                              crossed_below(e5[j], e10[j], e5[i], e10[i]),
-                             crossed_above(e5[j], e10[j], e5[i], e10[i]))
+                             crossed_above(e5[j], e10[j], e5[i], e10[i]), ctx)
             self._ema_sleeve(sym, "EMA10_20", open_tr.get("EMA10_20"), fill, a, s,
                              crossed_below(e10[j], e20[j], e10[i], e20[i]),
-                             crossed_above(e10[j], e20[j], e10[i], e20[i]))
+                             crossed_above(e10[j], e20[j], e10[i], e20[i]), ctx)
 
         vwap = session_vwap(five, b.session, b.end)
         if vwap is None:
@@ -347,23 +399,26 @@ class Engine:
             at_open = " (bar closed at 16:00: entered at the next open)" if fill.session != b.session else ""
             self._enter(sym, "VWAP", "short", fill, None, s,
                         f"VWAP fail: close {b.close:.2f} < VWAP {vwap:.2f}, "
-                        f"high {b.high:.2f} below HOD {hod:.2f}{at_open}",
+                        f"high {b.high:.2f} below HOD {hod:.2f}{at_open}; {bar_txt}; "
+                        f"filled {fill.how}",
                         stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10))
 
-    def _ema_sleeve(self, sym, sleeve, t, f: Fill, a: float, s, down: bool, up: bool):
-        label = "5/10" if sleeve == "EMA5_10" else "10/20"
+    def _ema_sleeve(self, sym, sleeve, t, f: Fill, a: float, s, down: bool, up: bool,
+                    ctx: str = ""):
+        label = ("5/10" if sleeve == "EMA5_10" else "10/20") + " EMA"
+        label_ctx = f"{label} crossed %s {ctx}"
         if down:
             if t is not None and t["side"] == "long":
-                self._close(t, f.price, f.when, f"{label} EMA crossed down", s)
+                self._close(t, f.price, f.when, (label_ctx % "down"), s)
                 t = None
             if t is None:
-                self._enter(sym, sleeve, "short", f, a, s, f"{label} EMA crossed down")
+                self._enter(sym, sleeve, "short", f, a, s, (label_ctx % "down"))
         elif up:
             if t is not None and t["side"] == "short":
-                self._close(t, f.price, f.when, f"{label} EMA crossed up", s)
+                self._close(t, f.price, f.when, (label_ctx % "up"), s)
                 t = None
             if t is None and sym["mode"] == "long_short":
-                self._enter(sym, sleeve, "long", f, a, s, f"{label} EMA crossed up")
+                self._enter(sym, sleeve, "long", f, a, s, (label_ctx % "up"))
 
     # ------------------------------------------------------------ fills
     def _enter(self, sym, sleeve, side, f: Fill, a: float | None, s, why: str,
@@ -377,9 +432,12 @@ class Engine:
         if stop_level is not None:  # structural stop (VWAP tranche: session HOD)
             stop = max(stop_level, fill) if side == "short" else min(stop_level, fill)
             dist = abs(stop - fill)
+            math_txt = f"stop = high of day {stop:.4g}"
         else:
             dist = s["stop_atr_mult"] * a
             stop = fill - dist if side == "long" else fill + dist
+            math_txt = (f"stop = {fill:.4g} {'-' if side == 'long' else '+'} "
+                        f"{s['stop_atr_mult']:g} x ATR {a:.4g}")
         if dist <= 0 or stop <= 0:
             self.store.log(f.when, "skip", f"{why}: invalid stop distance", name, sleeve)
             return
@@ -405,7 +463,8 @@ class Engine:
         tgt = f", target {target:.2f}" if target is not None else ""
         self.store.log(f.when, "entry",
                        f"{why} -> {side.upper()} {qty} @ {fill:.2f}, stop {stop:.2f}{tgt}, "
-                       f"risk ${qty * dist:,.0f}{note}", name, sleeve)
+                       f"risk ${qty * dist:,.0f}{note} [{math_txt}; size = "
+                       f"${budget:,.0f} budget / {dist:.4g} per share]", name, sleeve)
 
     def _close(self, t: dict, price: float, when: datetime, reason: str, s) -> None:
         slip = s["slippage_bps"] / 1e4

@@ -219,7 +219,7 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(first["stop_price"], first["entry_price"] + dist, places=6)
         self.assertEqual(first["qty"], math.floor(100_000 * 0.015 / 3 / dist))
         # the rip to p+6 blows through the stop: stopped at the gapped open or the stop
-        self.assertEqual(first["exit_reason"], "stop hit")
+        self.assertTrue(first["exit_reason"].startswith("stop hit"))
         self.assertGreaterEqual(first["exit_price"], first["stop_price"])
         self.assertLess(first["gross_pnl"], 0)
         # short_only: the bullish recross never opens a long
@@ -412,6 +412,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(t["side"], "short")
         self.assertEqual(t["entry_time"], datetime.combine(nxt, time(9, 30), tzinfo=ET).isoformat())
         self.assertAlmostEqual(t["entry_price"], 47.0)         # the opening print
+
+    def test_bar_table_shows_the_signal_and_when_it_acts(self):
+        bars, d, nxt = self.last_bar_cross()
+        eng = self.engine(bars)
+        rows = eng.bar_table("TBL", datetime.combine(nxt, time(9, 32), tzinfo=ET))
+        last = rows[-1]
+        self.assertTrue(last["bar_start_et"].endswith("15:00"))
+        self.assertIn("5/10 cross DOWN", last["signals"])
+        self.assertEqual(last["acts_at"], "next session 9:30 open")
+        self.assertIsNotNone(last["ema5"])
+
+    def test_entry_log_explains_the_numbers(self):
+        bars, d, nxt = self.last_bar_cross()
+        eng = self.engine(bars)
+        eng.add_symbols("LOG", "short_only", 1.0, datetime.combine(nxt, time(8), tzinfo=ET))
+        eng.tick(datetime.combine(nxt, time(9, 32), tzinfo=ET))
+        msg = self.store.q("SELECT message FROM events WHERE kind='entry' AND sleeve='EMA5_10'")[0]["message"]
+        for part in ("EMA5", "EMA10", "15:00-16:00 bar", "9:30 open 47", "x ATR", "budget"):
+            self.assertIn(part, msg)
 
     def test_premarket_add_catches_yesterdays_last_bar(self):
         bars, d, nxt = self.last_bar_cross()

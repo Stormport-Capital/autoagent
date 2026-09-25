@@ -304,7 +304,8 @@ function renderWatch(S) {
       <td class="l">${trancheCell(s.tranches.EMA10_20)}</td>
       <td class="l">${trancheCell(s.tranches.VWAP)}</td>
       <td class="${cls(s.unrealized)}">${signed(s.unrealized)}</td>
-      <td><button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
+      <td><button class="small" data-act="bars" data-sym="${esc(s.symbol)}" title="Every bar the engine used, with EMAs, ATR, VWAP and signals">Bars</button>
+        <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
   }
@@ -489,6 +490,7 @@ $("#runNow").onclick = async e => { e.target.disabled = true; try { await api(bk
 $("#demoPause").onclick = async () => { await api("/api/demo/pause", {}); refresh(); };
 $("#watch").onclick = async e => {
   const b = e.target.closest("button[data-act]"); if (!b) return;
+  if (b.dataset.act === "bars") { window.open(`/api/${BOOK}/bars/${encodeURIComponent(b.dataset.sym)}`, "_blank"); return; }
   if (b.dataset.v === "removed" && !confirm("Remove this symbol? Open tranches are closed at the last price.")) return;
   if (b.dataset.act === "flatten" && !confirm("Close all open tranches for this symbol at the last price?")) return;
   try { await api(bk(`/api/symbols/${b.dataset.id}/${b.dataset.act}`), b.dataset.act === "status" ? {status: b.dataset.v} : {}); }
