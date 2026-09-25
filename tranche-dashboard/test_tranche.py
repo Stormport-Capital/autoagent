@@ -270,6 +270,18 @@ class FmpTests(unittest.TestCase):
         self.assertNotIn("fmpsecret123", str(cm.exception))
 
 
+class AuthTests(unittest.TestCase):
+    def test_basic_auth(self):
+        import base64
+        hdr = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+        self.assertTrue(app.check_auth(None, None))                 # no password set: open
+        self.assertFalse(app.check_auth(None, "s3cret"))
+        self.assertFalse(app.check_auth(hdr("x", "wrong"), "s3cret"))
+        self.assertTrue(app.check_auth(hdr("anyone", "s3cret"), "s3cret"))
+        self.assertTrue(app.check_auth(hdr("me", "pa:ss"), "pa:ss"))  # colon in password
+        self.assertFalse(app.check_auth("Basic !!!notbase64", "s3cret"))
+
+
 class BackupTests(unittest.TestCase):
     class Clock:
         def __init__(self, now):

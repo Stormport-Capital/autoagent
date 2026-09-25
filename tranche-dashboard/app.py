@@ -16,7 +16,10 @@ linked (keys in .env) and switched on in the dashboard; see broker.py / SETUP.md
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import hmac
+import tempfile
 import html
 import io
 import json
@@ -352,7 +355,22 @@ def broker_state(book: Book) -> dict:
     return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
 
 
+def check_auth(header: str | None, password: str | None) -> bool:
+    """HTTP Basic auth: any user name, the password from TRANCHE_PASSWORD.
+    No password configured = open (local use)."""
+    if not password:
+        return True
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        supplied = base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[1]
+    except Exception:
+        return False
+    return hmac.compare_digest(supplied.encode(), password.encode())
+
+
 def make_handler(books: dict, provider_name: str, demo, backups=None):
+    password = os.environ.get("TRANCHE_PASSWORD") or None
     ordered = list(books.values())
 
     class Handler(BaseHTTPRequestHandler):
@@ -381,7 +399,18 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                 return books["1h"], self.path[4:]
             return None, self.path
 
+        def _authorized(self) -> bool:
+            if check_auth(self.headers.get("Authorization"), password):
+                return True
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Tranche dashboard"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+
         def do_GET(self):
+            if not self._authorized():
+                return
             if self.path in ("/", "/index.html"):
                 return self._send(200, (HERE / "static" / "index.html").read_bytes(),
                                   "text/html; charset=utf-8")
@@ -390,6 +419,20 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                 st = build_state(book, ordered, provider_name, demo)
                 st["backup"] = backups.status() if backups else None
                 return self._send(200, st)
+            if book and rest == "/download.db":
+                with tempfile.TemporaryDirectory() as d:
+                    path = os.path.join(d, "copy.db")
+                    book.engine.store.backup_to(path)
+                    data = open(path, "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="tranche_{book.key}_'
+                                 f'{book.sched.clock.now():%Y-%m-%d_%H%M}.db"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             m = re.fullmatch(r"/bars/([A-Z][A-Z0-9.\-]{0,9})(\.csv)?", rest or "")
             if book and m:
                 try:
@@ -403,6 +446,8 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._authorized():
+                return
             if self.path == "/api/demo/pause" and demo:
                 demo.paused = not demo.paused
                 return self._send(200, {"ok": True})

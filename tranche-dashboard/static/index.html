@@ -259,6 +259,7 @@ function render() {
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
     S.backup ? (S.backup.error ? `<span class="neg">${esc(S.backup.error)}</span>`
       : `<span title="${esc(S.backup.folder)}">Backed up ${fmtT(S.backup.last)}</span>`) : "",
+    `<a href="/api/${BOOK}/download.db" title="Download a copy of this book's database">Download backup</a>`,
     `<span>Next: ${fmtT(S.next_tick)}</span>`,
     S.scheduler_error ? `<span class="neg">${esc(S.scheduler_error)}</span>` : ""].join("");
   $("#demoPause").style.display = S.demo ? "" : "none";

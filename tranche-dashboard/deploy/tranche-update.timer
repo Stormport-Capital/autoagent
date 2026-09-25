@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekday pre-market restart of the tranche dashboard (pulls updates)
+
+[Timer]
+OnCalendar=Mon..Fri 08:45 America/New_York
+Persistent=false
+
+[Install]
+WantedBy=timers.target

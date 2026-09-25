@@ -14,7 +14,10 @@ position with market orders. It is paper only: the paper endpoint is hard-coded,
 and there is no live-trading setting. **Step-by-step keys and setup:
 [SETUP.md](SETUP.md).**
 
-**Easiest:** double-click `Start Dashboard.bat` (Windows) or
+**Always-on in the cloud:** see [CLOUD.md](CLOUD.md) (DigitalOcean +
+Tailscale, password-protected, auto-restart, daily backups).
+
+**Easiest on your own PC:** double-click `Start Dashboard.bat` (Windows) or
 `Start Dashboard.command` (Mac). It installs what's needed, asks for your keys
 on the first run, and opens the dashboard in your browser.
 
@@ -125,4 +128,6 @@ Each tranche gets one third of that budget.
 - `static/index.html` — the dashboard page
 - `test_tranche.py` — offline tests
 
-The server binds to `127.0.0.1` and has no authentication. Don't expose it to a network as-is.
+Locally the server binds to `127.0.0.1`. Set `TRANCHE_PASSWORD` in `.env` to
+require a password (HTTP Basic auth, any user name). The cloud setup does this
+and listens only on the private Tailscale address.
