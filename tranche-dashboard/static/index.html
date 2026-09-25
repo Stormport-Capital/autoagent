@@ -80,6 +80,7 @@ tbody tr:hover { background: var(--chip); }
 .checks { display: flex; gap: 14px; margin-top: 2px; }
 .checks label { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--ink); }
 .checks input { width: auto; }
+select.gradesel { width: auto; padding: 1px 4px; font-size: 12px; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); font-weight: 400; }
 .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; }
 .switch { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--ink); font-size: 13px; cursor: pointer; }
@@ -119,8 +120,16 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
             <label><input type="radio" name="mode" value="short_only" checked>Short only</label>
             <label><input type="radio" name="mode" value="long_short">Long &amp; short</label>
           </div>
-          <label for="risk">Risk per symbol: <b id="riskOut">1.0</b>% of equity</label>
-          <input id="risk" type="range" min="0.5" max="3" step="0.25" value="1">
+          <label for="grade">Trade grade (sets risk)</label>
+          <select id="grade">
+            <option value="A+">A+ · 3% of equity</option>
+            <option value="A">A · 2%</option>
+            <option value="B" selected>B · 1.5%</option>
+            <option value="C">C · 1%</option>
+            <option value="custom">Custom (use slider)</option>
+          </select>
+          <label for="risk">Risk per symbol: <b id="riskOut">1.5</b>% of equity</label>
+          <input id="risk" type="range" min="0.5" max="3" step="0.25" value="1.5">
           <div class="hint">Split evenly across the 3 tranches. The VWAP tranche is always short-only.</div>
           <label>Add to</label>
           <div class="checks">
@@ -143,7 +152,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
               <select id="borrow_day_count"><option value="360">360</option><option value="365">365</option></select></div>
           </div>
           <div class="row">
-            <div><label for="stop_atr_mult" title="EMA tranches have no stop. Shares = risk budget / (this × bar ATR)">EMA sizing (× bar ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
+            <div><label for="stop_atr_mult" title="EMA tranches have no stop. Sizing uses each stock's own past cross-to-cross drawdowns; this multiple of ATR is only the fallback when there are fewer than 5 past crosses">EMA fallback size (× ATR)</label><input id="stop_atr_mult" type="number" step="0.25" min="0.25"></div>
             <div><label for="atr_period">ATR period</label><input id="atr_period" type="number" step="1" min="2"></div>
           </div>
           <div class="row">
@@ -285,6 +294,8 @@ function trancheCell(t, sleeve, mode) {
 }
 
 function renderWatch(S) {
+  const f = document.activeElement;
+  if (f && f.classList && f.classList.contains("gradesel")) return;  // don't redraw mid-choice
   const rows = S.symbols;
   $("#watchNote").textContent = `${rows.length} symbols · ${STATE.book.label} bars · checked as each bar closes`;
   if (!rows.length) { $("#watch").innerHTML = `<tr><td class="empty">Add symbols to start monitoring.</td></tr>`; return; }
@@ -297,7 +308,11 @@ function renderWatch(S) {
     const below = n.vwap != null && s.last_price != null && s.last_price < n.vwap;
     h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}
         ${s.error ? `<div class="err-text">${esc(s.error)}</div>` : ""}</td>
-      <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} · ${s.risk_pct}%</td>
+      <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} ·
+        <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
+          ${["A+", "A", "B", "C"].map(g => `<option ${s.grade === g ? "selected" : ""}>${g}</option>`).join("")}
+          ${s.grade ? "" : `<option selected value="">custom</option>`}
+        </select> ${s.risk_pct}%</td>
       <td>${num(s.last_price)}</td><td>${stack}</td>
       <td>${n.vwap == null ? "—" : `<span class="${below ? "neg" : ""}">${num(n.vwap)}</span>`}</td>
       <td class="l">${trancheCell(s.tranches.EMA5_10)}</td>
@@ -455,14 +470,18 @@ function renderTab() {
 }
 
 // ---- interactions
-$("#risk").oninput = e => $("#riskOut").textContent = Number(e.target.value).toFixed(2).replace(/0$/, "");
+const GRADES = {"A+": 3, "A": 2, "B": 1.5, "C": 1};
+const showRisk = v => $("#riskOut").textContent = Number(v).toFixed(2).replace(/0$/, "");
+$("#risk").oninput = e => { showRisk(e.target.value); $("#grade").value = "custom"; };
+$("#grade").onchange = e => { const r = GRADES[e.target.value]; if (r) { $("#risk").value = r; showRisk(r); } };
 $("#addForm").onsubmit = async e => {
   e.preventDefault(); const msg = $("#addMsg");
   try {
     const targets = [["1h", "Hourly"], ["15m", "15-min"]].filter(([k]) => $(`#toBook${k}`).checked);
     if (!targets.length) throw new Error("Tick at least one book to add to.");
     const body = {symbols: $("#symbols").value,
-      mode: document.querySelector("input[name=mode]:checked").value, risk_pct: Number($("#risk").value)};
+      mode: document.querySelector("input[name=mode]:checked").value, risk_pct: Number($("#risk").value),
+      grade: $("#grade").value};
     const done = [];
     for (const [k, label] of targets) {
       try { const r = await api(`/api/${k}/symbols`, body); done.push(`${label}: ${r.added.join(", ")}`); }
@@ -498,6 +517,11 @@ $("#watch").onclick = async e => {
   refresh();
 };
 document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderTab(); });
+$("#watch").onchange = async e => {
+  const sel = e.target.closest("select.gradesel"); if (!sel || !sel.value) return;
+  try { await api(bk(`/api/symbols/${sel.dataset.id}/grade`), {grade: sel.value}); } catch (err) { alert(err.message); }
+  refresh();
+};
 $("#bookTabs").onclick = e => {
   const b = e.target.closest("button[data-book]"); if (!b || b.dataset.book === BOOK) return;
   BOOK = b.dataset.book; location.hash = BOOK; settingsDirty = false; STATE = null; refresh();

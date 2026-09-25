@@ -11,7 +11,7 @@ DEFAULT_SETTINGS = {
     "starting_capital": 100_000.0,
     "borrow_rate_pct": 10.0,       # annual hard-to-borrow fee on short notional
     "borrow_day_count": 360,       # broker convention: rate / 360 per calendar night
-    "stop_atr_mult": 1.5,          # EMA sizing unit: risk budget / (mult x bar ATR); NOT a stop
+    "stop_atr_mult": 2.0,          # EMA sizing fallback (x ATR) when < 5 past crosses; NOT a stop
     "atr_period": 14,
     "max_leverage": 2.0,           # gross exposure cap as a multiple of equity
     "slippage_bps": 5.0,           # adverse fill vs bar close / stop, each side
@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     last_bar_end TEXT,
     last_price REAL,
     snapshot TEXT,                          -- JSON: latest indicator readings
-    error TEXT
+    error TEXT,
+    grade TEXT                              -- A+ / A / B / C, or NULL = custom risk %
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
@@ -96,6 +97,9 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(tranches)")}
         if "target_price" not in cols:  # databases created before the Russo exits
             self.db.execute("ALTER TABLE tranches ADD COLUMN target_price REAL")
+        scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
+        if "grade" not in scols:  # databases created before trade grades
+            self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")
         self.db.commit()
 
     # -- generic helpers -------------------------------------------------

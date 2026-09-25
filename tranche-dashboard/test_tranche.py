@@ -11,7 +11,8 @@ from broker import AlpacaPaper, BrokerError, BrokerSync
 import app
 from app import bar_for_boundary, boundaries
 from engine import Engine, ValidationError, vwap_fail
-from indicators import (ET, Bar, atr, bar_bucket, crossed_below, ema, ema_cross,
+from indicators import (ET, Bar, atr, bar_bucket, cross_adverse_moves, crossed_below,
+                        ema, ema_cross, percentile,
                         price_tick, resample,
                         resample_hourly, session_bar_ends, session_hour_ends,
                         session_vwap)
@@ -167,6 +168,23 @@ class EmaCrossTests(unittest.TestCase):
         self.assertEqual(ema_cross([0.8512, 0.8501], [0.8505, 0.8504], 1, 0.0001), -1)
 
 
+class EmaSizingTests(unittest.TestCase):
+    def test_adverse_moves_per_cross_trade(self):
+        # fast/slow lines alternate sides; closes chosen so each trade's worst move is known
+        fast = [2, 1, 1, 3, 3, 1, 1, 3]
+        slow = [1, 2, 2, 2, 2, 2, 2, 2]
+        closes = [10, 10, 11, 10, 9, 10, 12, 12]
+        # k=1 cross down (short @10): closes 11 -> worst +10%, closes at k=3 cross up
+        # k=3 long @10: 9 -> worst 10%, closes at k=5 cross down
+        # k=5 short @10: 12 -> worst 20%, closes at k=7 cross up
+        moves = cross_adverse_moves(closes, fast, slow, 7)
+        self.assertEqual([round(m, 4) for m in moves], [0.1, 0.1, 0.2])
+
+    def test_percentile(self):
+        self.assertEqual(percentile([0.01, 0.02, 0.03, 0.04], 0.75), 0.03)
+        self.assertEqual(percentile([0.05], 0.75), 0.05)
+
+
 class VwapFailTests(unittest.TestCase):
     d = date(2026, 9, 21)
 
@@ -223,6 +241,38 @@ class EngineTests(unittest.TestCase):
         bars += day_from_closes(ds[-1], drop_day_closes(p))
         return bars, ds
 
+    def test_grade_sets_risk(self):
+        eng = self.engine([])
+        now = datetime(2026, 9, 21, 8, tzinfo=ET)
+        eng.add_symbols("GRA", "short_only", 0.5, now, grade="A+")
+        eng.add_symbols("GRC", "short_only", 0.5, now, grade="C")
+        eng.add_symbols("GRX", "short_only", 2.5, now, grade="custom")
+        got = {r["symbol"]: (r["grade"], r["risk_pct"]) for r in self.store.q("SELECT * FROM symbols")}
+        self.assertEqual(got, {"GRA": ("A+", 3.0), "GRC": ("C", 1.0), "GRX": (None, 2.5)})
+        eng.set_grade(1, "B", now)
+        self.assertEqual(self.store.q("SELECT risk_pct FROM symbols WHERE id=1")[0]["risk_pct"], 1.5)
+        with self.assertRaises(ValidationError):
+            eng.add_symbols("BAD", "short_only", 1, now, grade="Z")
+
+    def test_choppy_history_sizes_from_past_crosses(self):
+        # a sine-wave price gives plenty of past 5/10 crosses -> history-based sizing
+        ds = weekdays(date(2026, 8, 3), 12)
+        bars, k = [], 0
+        for d in ds:
+            bars += day_from_closes(d, [50 + 3 * math.sin(2 * math.pi * (k + j) / 10) for j in range(7)])
+            k += 7
+        eng = self.engine(bars)
+        eng.add_symbols("SIN", "long_short", 1.0, datetime.combine(ds[-1], time(9), tzinfo=ET))
+        eng.tick(datetime.combine(ds[-1], time(15, 5), tzinfo=ET))   # 5/10 crosses up at 14:00
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA5_10'")[0]
+        msg = self.store.q("SELECT message FROM events WHERE kind='entry' AND sleeve='EMA5_10'")[0]["message"]
+        self.assertIn("p75 adverse move of the last", msg)
+        hourly = [x for x in resample_hourly(bars) if x.end <= datetime.fromisoformat(t["entry_time"])]
+        c = [x.close for x in hourly]
+        moves = cross_adverse_moves(c, ema(c, 5), ema(c, 10), len(c) - 1)
+        per_share = max(percentile(moves, 0.75), atr(hourly, 14)[-1] / c[-1]) * t["entry_price"]
+        self.assertEqual(t["qty"], math.floor(100_000 * 0.01 / 3 / per_share))
+
     def test_rejects_bad_setup(self):
         eng = self.engine([])
         now = datetime(2026, 9, 21, 8, tzinfo=ET)
@@ -252,7 +302,11 @@ class EngineTests(unittest.TestCase):
         # independently recompute size at the entry bar
         hourly = [b for b in resample_hourly(bars) if b.end <= datetime.fromisoformat(first["entry_time"])]
         a = atr(hourly, 14)[-1]
-        dist = 1.5 * a
+        # a steady uptrend has almost no past crosses, so sizing uses the 2 x ATR fallback
+        closes = [b.close for b in hourly]
+        self.assertLess(len(cross_adverse_moves(closes, ema(closes, 5), ema(closes, 10),
+                                                len(closes) - 1)), 5)
+        dist = 2.0 * a
         self.assertEqual(first["qty"], math.floor(100_000 * 0.015 / 3 / dist))
         # no stop: the rip to p+6 does not stop it out; it covers only when the
         # 5 EMA crosses back above the 10, at that bar's close

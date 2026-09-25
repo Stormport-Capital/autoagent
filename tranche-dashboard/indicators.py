@@ -6,6 +6,7 @@ a database or a clock. All timestamps are timezone-aware America/New_York.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -199,3 +200,28 @@ def ema_cross(a: list, b: list, i: int, tick: float, lookback: int = 60) -> int:
         if prev:
             return now if prev != now else 0
     return 0
+
+
+def cross_adverse_moves(closes: list[float], a: list, b: list, upto: int) -> list[float]:
+    """For every completed cross-to-cross trade of line a vs line b in bars
+    [0, upto], the worst close-to-close move against the position before the
+    opposite cross, as a fraction of the entry close. A cross down is a short
+    (price rising is adverse); a cross up is a long. Point-in-time: only bars
+    up to `upto` are used."""
+    moves: list[float] = []
+    side, entry, worst = 0, 0.0, 0.0
+    for k in range(1, upto + 1):
+        if side:
+            move = (closes[k] - entry) / entry if side < 0 else (entry - closes[k]) / entry
+            worst = max(worst, move)
+        c = ema_cross(a, b, k, price_tick(closes[k]))
+        if c:
+            if side:
+                moves.append(worst)
+            side, entry, worst = c, closes[k], 0.0
+    return moves
+
+
+def percentile(values: list[float], q: float) -> float:
+    v = sorted(values)
+    return v[max(0, math.ceil(q * len(v)) - 1)]

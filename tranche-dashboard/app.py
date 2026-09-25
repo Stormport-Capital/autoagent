@@ -401,9 +401,12 @@ def make_handler(books: dict, provider_name: str, demo):
                         threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif rest == "/symbols":
                     added = engine.add_symbols(body.get("symbols", ""), body.get("mode"),
-                                               body.get("risk_pct"), now)
+                                               body.get("risk_pct"), now, body.get("grade"))
                     threading.Thread(target=sched.run_tick, daemon=True).start()
                     return self._send(200, {"added": added})
+                elif m := re.fullmatch(r"/symbols/(\d+)/grade", rest):
+                    engine.set_grade(int(m.group(1)), body.get("grade"), now)
+                    return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/(status|flatten)", rest):
                     if m.group(2) == "status":
                         engine.set_status(int(m.group(1)), body.get("status"), now)

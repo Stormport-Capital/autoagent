@@ -81,10 +81,18 @@ Each tranche gets one third of that budget.
   there is no target until there is.
 - **Sizing:** `shares = (equity × risk% ÷ 3) ÷ risk per share`. For the VWAP
   tranche, risk per share is the distance from entry up to the session high,
-  its real stop. The EMA tranches have no stop, so risk per share is a
-  volatility yardstick: `EMA sizing × bar ATR(14)` (default 1.5×). It only
-  sets the size, never an exit. A loss on an EMA trade can therefore be larger
-  than the risk %. Sizing uses the current
+  its real stop. The EMA tranches have no stop, so risk per share
+  is worked out from the stock's own history. Take every past cross-to-cross
+  trade of the same EMA pair in the loaded data (about 35 sessions). Measure
+  how far price moved against it, close to close, before the opposite cross,
+  and use the **75th percentile** of those moves. It's a % of price, floored at
+  1 ATR, and falls back to `2 × ATR` with fewer than 5 past crosses. So a
+  losing EMA trade typically costs about the risk %; about 1 in 4 historically
+  cost more. It only sets the size, never an exit.
+- **Grades:** pick a grade when adding a symbol, or change it later from the
+  watchlist row. A+ = 3%, A = 2%, B = 1.5%, C = 1% of equity for the symbol,
+  split across its three tranches. "Custom" uses the slider (0.5–3%). A grade
+  change applies to new entries only. Sizing uses the current
   mark-to-market equity. Gross exposure is capped at `Max gross leverage × equity`
   (default 2×). An entry that works out to less than one share is skipped and
   logged.

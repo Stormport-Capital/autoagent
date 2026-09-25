@@ -24,8 +24,10 @@ third of the symbol's risk budget:
 EMA tranches have NO stop: they enter and exit only on crossovers (the
 opposite cross closes the position, and reverses it in long_short mode).
 Crosses are judged at the chart's price tick, so equal EMAs never signal.
-Sizing still uses a volatility yardstick, stop_atr_mult x bar ATR, as the
-"risk per share" that the risk % budget is divided by - it is not an exit.
+Sizing ("how much a losing trade typically gives back"): risk per share =
+the 75th-percentile adverse close-to-close move of this stock's own past
+cross-to-cross trades for that EMA pair (floored at 1 ATR); with fewer than 5
+past crosses it falls back to stop_atr_mult x ATR. It is not an exit.
 Sizing: qty = (equity x risk_pct / 3) / stop distance, capped so gross exposure
 stays <= equity x max_leverage. Fills are simulated at the hourly close (entries,
 signal exits) or at the stop / gapped open (stops), with slippage_bps adverse.
@@ -41,7 +43,8 @@ from dataclasses import dataclass
 import re
 from datetime import date, datetime, time, timedelta
 
-from indicators import (ET, RTH_OPEN, Bar, atr, ema_cross, price_tick,
+from indicators import (ET, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, percentile,
+                        price_tick,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
                         resample, session_vwap)
 from data import redact
@@ -54,6 +57,11 @@ SLEEVE_LABELS = {
     "VWAP": "VWAP fail (Russo)",
 }
 RISK_MIN, RISK_MAX = 0.5, 3.0
+# trade grade -> risk % of equity for the symbol (split across its 3 tranches)
+GRADES = {"A+": 3.0, "A": 2.0, "B": 1.5, "C": 1.0}
+# EMA sizing: risk per share = this percentile of past cross-to-cross adverse moves
+EMA_RISK_PCTL = 0.75
+EMA_MIN_SAMPLES = 5
 STALE_WAIT = timedelta(minutes=20)
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
@@ -141,9 +149,14 @@ class Engine:
         self.store.save_settings(clean)
         return self.store.settings()
 
-    def add_symbols(self, raw: str, mode: str, risk_pct, now: datetime) -> list[str]:
+    def add_symbols(self, raw: str, mode: str, risk_pct, now: datetime,
+                    grade: str | None = None) -> list[str]:
         if mode not in ("short_only", "long_short"):
             raise ValidationError("mode must be short_only or long_short")
+        if grade in GRADES:
+            risk_pct = GRADES[grade]
+        elif grade not in (None, "", "custom"):
+            raise ValidationError(f"grade must be one of {', '.join(GRADES)} or custom")
         try:
             risk = float(risk_pct)
         except (TypeError, ValueError):
@@ -159,14 +172,25 @@ class Engine:
             if self.store.q("SELECT 1 FROM symbols WHERE symbol=? AND status!='removed'", (sym,)):
                 continue
             self.store.x(
-                "INSERT INTO symbols (symbol, mode, risk_pct, added_at) VALUES (?,?,?,?)",
-                (sym, mode, risk, now.isoformat()))
+                "INSERT INTO symbols (symbol, mode, risk_pct, added_at, grade) VALUES (?,?,?,?,?)",
+                (sym, mode, risk, now.isoformat(), grade if grade in GRADES else None))
+            g = f"grade {grade}, " if grade in GRADES else ""
             self.store.log(now, "added", f"watching {sym}: {mode.replace('_', ' ')}, "
-                           f"risk {risk:g}% of equity", sym)
+                           f"{g}risk {risk:g}% of equity", sym)
             added.append(sym)
         if not added:
             raise ValidationError("no new symbols to add")
         return added
+
+    def set_grade(self, symbol_id: int, grade: str, now: datetime) -> None:
+        """Change a symbol's grade (and so its risk %). Applies to new entries only."""
+        if grade not in GRADES:
+            raise ValidationError(f"grade must be one of {', '.join(GRADES)}")
+        sym = self._symbol(symbol_id)
+        self.store.x("UPDATE symbols SET grade=?, risk_pct=? WHERE id=?",
+                     (grade, GRADES[grade], symbol_id))
+        self.store.log(now, "grade", f"{sym['symbol']} grade {grade} -> risk "
+                       f"{GRADES[grade]:g}% (new entries)", sym["symbol"])
 
     def set_status(self, symbol_id: int, status: str, now: datetime) -> None:
         if status not in ("active", "paused", "removed"):
@@ -376,9 +400,11 @@ class Engine:
                    f"{e10[i]:.4g}, EMA20 {e20[j]:.4g}->{e20[i]:.4g}; filled {fill.how}")
             tick = price_tick(b.close)
             c1, c2 = ema_cross(e5, e10, i, tick), ema_cross(e10, e20, i, tick)
-            self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, a, s,
+            u1 = self._ema_unit(bars, e5, e10, i, a, s) if c1 else None
+            u2 = self._ema_unit(bars, e10, e20, i, a, s) if c2 else None
+            self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, u1, s,
                              c1 < 0, c1 > 0, ctx)
-            self._ema_sleeve(sym, "EMA10_20", open_tr.get("EMA10_20"), fill, a, s,
+            self._ema_sleeve(sym, "EMA10_20", open_tr.get("EMA10_20"), fill, u2, s,
                              c2 < 0, c2 > 0, ctx)
 
         vwap = session_vwap(five, b.session, b.end)
@@ -399,7 +425,24 @@ class Engine:
                         f"filled {fill.how}",
                         stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10))
 
-    def _ema_sleeve(self, sym, sleeve, t, f: Fill, a: float, s, down: bool, up: bool,
+    def _ema_unit(self, bars: list[Bar], fast: list, slow: list, i: int, a: float, s) -> tuple:
+        """Risk per share for a stop-less EMA trade, from this stock's own history:
+        the 75th-percentile adverse close-to-close move of past cross-to-cross
+        trades of the same EMA pair (as % of price, floored at 1 ATR). Returns
+        ("pct", fraction, text) or ("abs", dollars, text)."""
+        moves = cross_adverse_moves([b.close for b in bars], fast, slow, i)
+        if len(moves) >= EMA_MIN_SAMPLES:
+            p = percentile(moves, EMA_RISK_PCTL)
+            floor = a / bars[i].close
+            used = max(p, floor)
+            return ("pct", used, f"risk/share = p75 adverse move of the last {len(moves)} "
+                    f"cross-to-cross trades {p:.2%}" + (f" (floored at 1 ATR {floor:.2%})"
+                                                          if floor > p else ""))
+        d = s["stop_atr_mult"] * a
+        return ("abs", d, f"risk/share = {s['stop_atr_mult']:g} x ATR {a:.4g} "
+                          f"(only {len(moves)} past crosses)")
+
+    def _ema_sleeve(self, sym, sleeve, t, f: Fill, a, s, down: bool, up: bool,
                     ctx: str = ""):
         label = ("5/10" if sleeve == "EMA5_10" else "10/20") + " EMA"
         label_ctx = f"{label} crossed %s {ctx}"
@@ -417,7 +460,7 @@ class Engine:
                 self._enter(sym, sleeve, "long", f, a, s, (label_ctx % "up"))
 
     # ------------------------------------------------------------ fills
-    def _enter(self, sym, sleeve, side, f: Fill, a: float | None, s, why: str,
+    def _enter(self, sym, sleeve, side, f: Fill, unit: tuple | None, s, why: str,
                stop_level: float | None = None, target: float | None = None) -> None:
         name = sym["symbol"]
         if sym["status"] != "active":
@@ -430,10 +473,10 @@ class Engine:
             dist = abs(stop - fill)
             math_txt = f"stop = high of day {stop:.4g}"
         else:
-            dist = s["stop_atr_mult"] * a  # sizing yardstick only - EMA tranches have no stop
+            kind, val, unit_txt = unit  # sizing only - EMA tranches have no stop
+            dist = val * fill if kind == "pct" else val
             stop = fill - dist if side == "long" else fill + dist
-            math_txt = (f"no stop - exits only on the opposite cross; sizing unit = "
-                        f"{s['stop_atr_mult']:g} x ATR {a:.4g} = {dist:.4g}/share")
+            math_txt = f"no stop - exits only on the opposite cross; {unit_txt} = {dist:.4g}/share"
         if dist <= 0 or stop <= 0:
             self.store.log(f.when, "skip", f"{why}: invalid stop distance", name, sleeve)
             return
