@@ -193,11 +193,11 @@ couple of minutes so the data can arrive:
   can only trade at the current price. So the two can differ after downtime.
 - **Check now** re-runs the check immediately. It never duplicates a trade.
 
-## The 15-minute book
+## The 15-minute and 5-minute books
 
-The dashboard runs **two books side by side with identical rules**: the
-**Hourly** book and the **15-min** book. Switch between them with the tabs at the
-top. Each book has its own portfolio size, settings, positions, performance,
+The dashboard runs **three books side by side with identical rules**: the
+**Hourly**, **15-min** and **5-min** books. Switch between them with the tabs at
+the top. Each book has its own portfolio size, settings, positions, performance,
 equity curve and signal log, so you can compare the two timeframes directly.
 
 - **15-minute bars:** 9:30–9:45, 9:45–10:00 … 15:45–16:00. The EMAs (5/10/20),
@@ -205,15 +205,20 @@ equity curve and signal log, so you can compare the two timeframes directly.
   just on 15-minute bars. The daily 10-day-average target is the same.
 - **Checks:** at 9:30 (the open check, for yesterday's 15:45–16:00 bar), then
   9:45, 10:00, 10:15 … 15:45.
-- **Adding symbols:** the Add form has two boxes, **Hourly book** and
-  **15-min book**. Both are ticked by default, so a symbol goes into both. Untick
-  one to add to a single book. Each book's watchlist is managed separately after
+- **5-minute bars:** 9:30–9:35 … 15:55–16:00, the raw 5-minute data with no
+  resampling. Checks at 9:30 (for yesterday's 15:55–16:00 bar), then 9:35, 9:40
+  … 15:55. Same rules again: EMA crosses, VWAP fail, stop at a new high of day,
+  daily 10-day-average target, held overnight.
+- **Adding symbols:** the Add form has three boxes, **Hourly book**,
+  **15-min book** and **5-min book**. All are ticked by default, so a symbol goes
+  into every book. Untick any to leave a book out. Each book's watchlist is managed separately after
   that (pause, flatten, remove).
 - **Data delay matters more here:** with a 15-minute-delayed data plan, every
-  15-minute signal is acted on roughly one full bar late. The hourly book
-  tolerates delayed data; the 15-minute book really needs real-time data.
+  15-minute signal is acted on roughly one full bar late, and every 5-minute
+  signal about three bars late. The hourly book tolerates delayed data; the
+  15-minute and 5-minute books really need real-time data (FMP).
 
-### Linking the 15-min book to Alpaca paper (optional)
+### Linking the 15-min and 5-min books to Alpaca paper (optional)
 
 Alpaca holds **one net position per stock per account**. If both books traded
 the same stock in the same paper account, they would partly cancel each other
@@ -234,8 +239,12 @@ as the hourly book's.
 4. Restart the dashboard. The startup window shows one Alpaca line per book.
    On the 15-min tab, tick **Send the model's trades to Alpaca paper**.
 
-Without these keys the 15-min book still runs and tracks performance. It just
-doesn't send paper orders.
+The **5-min book** works the same way with a **third** paper account, under
+`APCA_5M_API_KEY_ID` and `APCA_5M_API_SECRET_KEY`. No two books may share an
+account; the app refuses to link a book whose keys match another book's.
+
+Without these keys a book still runs and tracks performance. It just doesn't
+send paper orders.
 
 ## Comparing data sources (Polygon vs FMP)
 
@@ -273,8 +282,8 @@ its time stamps mark the start or the end of a bar.
 
 ## Backups (Google Drive)
 
-All trades, signals, equity and paper orders live in `tranche.db` (Hourly) and
-`tranche_15m.db` (15-min) in the app folder. **Don't move those files or the
+All trades, signals, equity and paper orders live in `tranche.db` (Hourly),
+`tranche_15m.db` (15-min) and `tranche_5m.db` (5-min) in the app folder. **Don't move those files or the
 app folder into Google Drive.** Drive syncs files while they're being written,
 which can corrupt a live database. The folder also holds `.env` with your keys.
 

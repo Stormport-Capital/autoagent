@@ -133,6 +133,25 @@ class FifteenMinuteTests(unittest.TestCase):
         self.assertEqual(len(got), 26)
 
 
+class FiveMinuteTests(unittest.TestCase):
+    d = date(2026, 9, 21)
+
+    def test_five_minute_bars_are_the_raw_bars(self):
+        bars = day_from_closes(self.d, [10, 11, 12, 13, 14, 15, 16])
+        q = resample(bars, 5)
+        self.assertEqual(len(q), 78)
+        self.assertEqual([(b.start, b.end, b.close) for b in q],
+                         [(b.start, b.end, b.close) for b in bars])
+        at = lambda h, m: datetime.combine(self.d, time(h, m), tzinfo=ET)
+        self.assertEqual(bar_bucket(at(9, 37), 5), (at(9, 35), at(9, 40)))
+
+    def test_check_schedule_5(self):
+        got = [b.strftime("%H:%M") for b in boundaries(self.d, timedelta(minutes=2), 5)]
+        self.assertEqual(got[:3], ["09:32", "09:37", "09:42"])
+        self.assertEqual(got[-1], "15:57")          # the 15:55-16:00 bar acts at the next open
+        self.assertEqual(len(got), 78)
+
+
 class EmaCrossTests(unittest.TestCase):
     def test_equal_at_chart_precision_is_not_a_signal(self):
         # 10 EMA 1.537 vs 20 EMA 1.538: both show 1.54 on a chart -> no cross
@@ -741,6 +760,27 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(t15[0]["entry_time"], datetime.combine(d, time(10, 15), tzinfo=ET).isoformat())
         self.assertAlmostEqual(t15[0]["entry_price"], p - 1.7)
 
+    def test_5m_book_trades_on_5m_bars(self):
+        # steady uptrend, then a drop through the 10:00-10:05 bar: the 5-minute
+        # book shorts at 10:05, before the 15-minute book could act (10:15)
+        ds = weekdays(date(2026, 8, 3), 6)
+        bars, p = [], 50.0
+        for d in ds[:-1]:
+            closes = [p + 0.1 * (k + 1) for k in range(7)]
+            bars += day_from_closes(d, closes)
+            p = closes[-1]
+        d = ds[-1]
+        bars += hour_bars(d, 0, p, p + 0.3, p - 0.1, p + 0.2)
+        t = datetime.combine(d, time(10, 0), tzinfo=ET)
+        bars.append(Bar(t, t + FIVE, p, p + 0.1, p - 3.1, p - 3.0, 1000.0))
+        eng5 = Engine(self.store, ScriptedProvider(bars), minutes=5)
+        eng5.add_symbols("FIV", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng5.tick(datetime.combine(d, time(10, 7), tzinfo=ET))
+        t5 = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA5_10'")
+        self.assertEqual(len(t5), 1)
+        self.assertEqual(t5[0]["entry_time"], datetime.combine(d, time(10, 5), tzinfo=ET).isoformat())
+        self.assertAlmostEqual(t5[0]["entry_price"], p - 3.0)
+
     def test_behind_reports_unprocessed_hour(self):
         d = weekdays(date(2026, 8, 3), 1)[0]
         bars = day_from_closes(d, [50.0] * 7)
@@ -843,7 +883,9 @@ class BrokerSyncTests(unittest.TestCase):
     def test_books_never_share_a_paper_account(self):
         env = {"APCA_API_KEY_ID": "PKSAME", "APCA_API_SECRET_KEY": "s1",
                "APCA_15M_API_KEY_ID": "PKSAME", "APCA_15M_API_SECRET_KEY": "s2"}
-        old = {k: os.environ.get(k) for k in env}
+        old = {k: os.environ.get(k) for k in (*env, "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY")}
+        for k in ("APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY"):
+            os.environ.pop(k, None)
         os.environ.update(env)
         try:
             links = app.link_papers(demo=False)
@@ -852,6 +894,13 @@ class BrokerSyncTests(unittest.TestCase):
             self.assertIn("separate Alpaca paper account", links["15m"][1])
             os.environ["APCA_15M_API_KEY_ID"] = "PKOTHER"
             self.assertIsNotNone(app.link_papers(demo=False)["15m"][0])
+            os.environ.update({"APCA_5M_API_KEY_ID": "PKOTHER", "APCA_5M_API_SECRET_KEY": "s3"})
+            links = app.link_papers(demo=False)
+            self.assertIsNotNone(links["15m"][0])
+            self.assertIsNone(links["5m"][0])
+            self.assertIn("same as the 15-min book's", links["5m"][1])
+            os.environ["APCA_5M_API_KEY_ID"] = "PKTHIRD"
+            self.assertTrue(all(v[0] for v in app.link_papers(demo=False).values()))
         finally:
             for k, v in old.items():
                 if v is None:

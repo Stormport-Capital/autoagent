@@ -135,6 +135,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           <div class="checks">
             <label><input type="checkbox" id="toBook1h" checked>Hourly book</label>
             <label><input type="checkbox" id="toBook15m" checked>15-min book</label>
+            <label><input type="checkbox" id="toBook5m" checked>5-min book</label>
           </div>
           <div style="margin-top:10px"><button class="primary" type="submit">Add to watchlist</button></div>
           <div class="msg" id="addMsg"></div>
@@ -212,10 +213,10 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
 <script>
 const $ = s => document.querySelector(s);
 let STATE = null, TAB = "open";
-// which book is on screen: "1h" (hourly bars) or "15m"; kept in the URL hash
-let BOOK = location.hash === "#15m" ? "15m" : "1h";
+// which book is on screen: "1h" (hourly bars), "15m" or "5m"; kept in the URL hash
+let BOOK = ["#15m", "#5m"].includes(location.hash) ? location.hash.slice(1) : "1h";
 const bk = path => path.replace(/^\/api\//, `/api/${BOOK}/`);
-const TF = () => (STATE && STATE.book.minutes === 15) ? "15m" : "1h";
+const TF = () => (STATE && STATE.book.minutes < 60) ? `${STATE.book.minutes}m` : "1h";
 
 const usd = (v, d = 0) => v == null ? "—" :
   (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
@@ -480,7 +481,7 @@ $("#grade").onchange = e => { const r = GRADES[e.target.value]; if (r) { $("#ris
 $("#addForm").onsubmit = async e => {
   e.preventDefault(); const msg = $("#addMsg");
   try {
-    const targets = [["1h", "Hourly"], ["15m", "15-min"]].filter(([k]) => $(`#toBook${k}`).checked);
+    const targets = [["1h", "Hourly"], ["15m", "15-min"], ["5m", "5-min"]].filter(([k]) => $(`#toBook${k}`).checked);
     if (!targets.length) throw new Error("Tick at least one book to add to.");
     const body = {symbols: $("#symbols").value,
       mode: document.querySelector("input[name=mode]:checked").value, risk_pct: Number($("#risk").value),

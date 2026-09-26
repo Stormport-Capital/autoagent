@@ -34,7 +34,8 @@ class DataError(RuntimeError):
 
 
 SECRET_ENV = ("POLYGON_API_KEY", "FMP_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
-              "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")
+              "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",
+              "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY")
 
 
 def redact(msg: str) -> str:
@@ -348,8 +349,8 @@ class DemoProvider:
 
 
 class CachedProvider:
-    """Shares one fetch per symbol between the hourly and 15-minute books when
-    they check at the same moment (every hour both run within seconds)."""
+    """Shares one fetch per symbol between the books when they check at the
+    same moment (at every hour all three run within seconds)."""
 
     def __init__(self, inner, ttl_s: float = 60.0):
         self.inner, self.ttl_s = inner, ttl_s

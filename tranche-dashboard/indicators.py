@@ -38,7 +38,8 @@ def in_rth(ts: datetime) -> bool:
 
 def bar_bucket(ts: datetime, minutes: int = 60) -> tuple[datetime, datetime]:
     """Clock-aligned bucket, as on standard charts. Hourly: the first bar is the
-    half hour 9:30-10:00, then 10-11 ... 15-16. 15-minute: 9:30-9:45 ... 15:45-16:00."""
+    half hour 9:30-10:00, then 10-11 ... 15-16. 15-minute: 9:30-9:45 ... 15:45-16:00.
+    5-minute: 9:30-9:35 ... 15:55-16:00."""
     local = ts.astimezone(ET)
     day = local.date()
     midnight = datetime.combine(day, time(0, 0), tzinfo=ET)

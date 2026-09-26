@@ -1,8 +1,9 @@
-"""Tranche dashboard: local web server + schedulers for two books.
+"""Tranche dashboard: local web server + schedulers for three books.
 
-Two independent books run side by side with identical rules: "1h" on hourly
-bars and "15m" on 15-minute bars. Each has its own database, settings, capital,
-performance and (optionally) its own Alpaca paper account.
+Three independent books run side by side with identical rules: "1h" on hourly
+bars, "15m" on 15-minute bars and "5m" on 5-minute bars. Each has its own
+database, settings, capital, performance and (optionally) its own Alpaca paper
+account.
 
     python app.py                      # live prices from Yahoo, http://127.0.0.1:8050
     python app.py --provider polygon   # Polygon data (POLYGON_API_KEY), recommended
@@ -50,7 +51,9 @@ RETRY_WINDOW = timedelta(minutes=40)
 BOOKS = (
     ("1h", 60, "Hourly", "APCA", "tranche.db"),
     ("15m", 15, "15-min", "APCA_15M", "tranche_15m.db"),
+    ("5m", 5, "5-min", "APCA_5M", "tranche_5m.db"),
 )
+FASTEST = min(m for _k, m, *_ in BOOKS)
 
 
 class Server(ThreadingHTTPServer):
@@ -62,7 +65,8 @@ class Server(ThreadingHTTPServer):
 
 KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
 OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
-                 "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY")  # 15-min book's paper account
+                 "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",  # 15-min book's paper account
+                 "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY")  # 5-min book's paper account
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -116,11 +120,11 @@ class RealClock:
 
 
 class SimClock:
-    """Starts `days` weekdays ago and jumps one hourly bar per step."""
+    """Starts `days` weekdays ago and jumps one bar of the fastest book per step."""
 
     demo = True
 
-    def __init__(self, days: int, delay_min: int, minutes: int = 15):
+    def __init__(self, days: int, delay_min: int, minutes: int = FASTEST):
         d = datetime.now(ET).date()
         while days:
             d -= timedelta(days=1)
@@ -143,8 +147,9 @@ class SimClock:
 
 def boundaries(day: date, delay: timedelta, minutes: int = 60) -> list[datetime]:
     """Check times: the 9:30 open (acts on yesterday's last bar), then each
-    intraday bar close - hourly 10:00 ... 15:00, 15-min 9:45 ... 15:45. The
-    last bar of the day is not checked at 16:00; it executes at the next open."""
+    intraday bar close - hourly 10:00 ... 15:00, 15-min 9:45 ... 15:45,
+    5-min 9:35 ... 15:55. The last bar of the day is not checked at 16:00; it
+    executes at the next open."""
     if day.weekday() >= 5:
         return []
     ends = session_bar_ends(day, minutes)[:-1]
@@ -232,7 +237,7 @@ class Scheduler(threading.Thread):
 
 
 class DemoDriver(threading.Thread):
-    """Demo only: steps the simulated clock one 15-minute boundary at a time
+    """Demo only: steps the simulated clock one fastest-book boundary at a time
     and runs every book (a book with no new bar simply finds nothing to do)."""
 
     def __init__(self, clock, scheds: list, speed: float):
@@ -400,7 +405,7 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
 
         def _route(self) -> tuple[Book | None, str]:
             """/api/<book>/<rest>; the old /api/<rest> means the hourly book."""
-            m = re.fullmatch(r"/api/(1h|15m)(/.*)", self.path)
+            m = re.fullmatch(r"/api/(" + "|".join(books) + r")(/.*)", self.path)
             if m:
                 return books[m.group(1)], m.group(2)
             if self.path.startswith("/api/"):
@@ -545,10 +550,10 @@ Highlighted rows fired a signal. <a href="{esc(symbol)}.csv">Download CSV</a></p
 
 
 def link_papers(demo: bool) -> dict[str, tuple]:
-    """(AlpacaPaper | None, note) per book. The two books must never share a
-    paper account: Alpaca nets one position per symbol per account, so two
-    books trading the same symbol there would fight each other."""
-    out = {}
+    """(AlpacaPaper | None, note) per book. No two books may share a paper
+    account: Alpaca nets one position per symbol per account, so two books
+    trading the same symbol there would fight each other."""
+    out, labels, seen = {}, {k: label for k, _m, label, _p, _db in BOOKS}, {}
     for key, _minutes, _label, prefix, _db in BOOKS:
         if demo:
             out[key] = (None, "disabled in demo mode")
@@ -560,10 +565,15 @@ def link_papers(demo: bool) -> dict[str, tuple]:
         note = None if paper else (f"set {prefix}_API_KEY_ID and {prefix}_API_SECRET_KEY "
                                    f"(paper keys) in .env")
         out[key] = (paper, note)
-    k1, k15 = os.environ.get("APCA_API_KEY_ID"), os.environ.get("APCA_15M_API_KEY_ID")
-    if out.get("15m", (None,))[0] and k1 and k1 == k15:
-        out["15m"] = (None, "its keys are the same as the hourly book's; it needs a "
-                            "separate Alpaca paper account (see SETUP.md)")
+    for key, _minutes, _label, prefix, _db in BOOKS:
+        kid = os.environ.get(f"{prefix}_API_KEY_ID")
+        if not out[key][0] or not kid:
+            continue
+        if kid in seen:  # the earlier book keeps the account
+            out[key] = (None, f"its keys are the same as the {labels[seen[kid]]} book's; it "
+                              f"needs a separate Alpaca paper account (see SETUP.md)")
+        else:
+            seen[kid] = key
     return out
 
 
@@ -576,8 +586,8 @@ def main() -> None:
     ap.add_argument("--demo", action="store_true",
                     help="synthetic prices + simulated clock (fresh demo databases each run)")
     ap.add_argument("--demo-days", type=int, default=15, help="weekdays of history to replay")
-    ap.add_argument("--demo-speed", type=float, default=1.0,
-                    help="seconds per simulated 15 minutes")
+    ap.add_argument("--demo-speed", type=float, default=0.33,
+                    help="seconds per simulated 5 minutes")
     ap.add_argument("--open", action="store_true", help="open the dashboard in the browser")
     args = ap.parse_args()
     url = f"http://{args.host}:{args.port}"

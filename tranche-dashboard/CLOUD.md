@@ -101,7 +101,7 @@ Nothing to do. The server:
 - **Runs all the time** and restarts itself after a crash or a reboot.
 - **Updates itself** every weekday at 8:45 AM ET: it restarts, pulls the
   latest code, then catches up.
-- **Backs up both books.** Copies go into `/opt/tranche/backups` at startup,
+- **Backs up every book.** Copies go into `/opt/tranche/backups` at startup,
   every trading day after the close, and before any Reset. You can also click
   **Download backup** in the dashboard header at any time to save a copy to
   your PC.
