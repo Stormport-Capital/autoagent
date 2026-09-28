@@ -43,7 +43,7 @@ Each tranche gets one third of that budget.
 |---|---|---|
 | **5/10 EMA** | 5 EMA crosses **below** 10 EMA → short. In *long & short* mode, 5 crosses **above** 10 → long | **Only** the opposite cross (it reverses in long & short mode). No stop |
 | **10/20 EMA** | Same rule using the 10 and 20 EMA | Only the opposite cross. No stop |
-| **VWAP** (always short) | **Russo "VWAP fail"** (Trigger B): an earlier hourly bar this session closed above VWAP, **and** this bar closes below VWAP, **and** this bar's high is below the session high so far. It fires only on the first bar where all three are true. There is no red-candle test, so a green bar can trigger it | **Russo exits**, stop checked first. **Stop:** the first later bar whose high reaches `max(high of day including that bar, entry)`, meaning a new high of day. On a later session that also requires trading back above entry. It fills at that level, the worst price in the bar. **Target:** the daily 10-day simple moving average of prior sessions' closes, filled at the target when an hourly low touches it. **Held overnight**, with no flatten at the close |
+| **VWAP** (always short) | **Russo "VWAP fail"** (Trigger B): an earlier hourly bar this session closed above VWAP, **and** this bar closes below VWAP, **and** this bar's high is below the session high so far. It fires only on the first bar where all three are true. There is no red-candle test, so a green bar can trigger it | **Russo exits**, stop checked first. **Stop:** the first later bar whose high reaches `max(high of day including that bar, entry)`, meaning a new high of day. On a later session that also requires trading back above entry. It fills at that level, the worst price in the bar. **Targets:** half covers at the daily 10-day simple moving average of prior sessions' closes, the rest at the 20-day average, each filled when a bar's low touches it (setting: or all at the 10-day). **Time stop:** covers at the last check of the 10th session held, counting the entry day (setting; 0 = off). **Held overnight**, with no flatten at the close |
 
 - **Setup choices, made per symbol:** *short only* or *long & short* for the two
   EMA tranches, plus the risk %. The VWAP tranche is short-only regardless.
@@ -78,10 +78,12 @@ Each tranche gets one third of that budget.
   filter is not applied. So a VWAP fail that fires while price is already at or
   below the 10-day average is still shorted, and it covers at the next bar's
   open. That's roughly a scratch trade that costs slippage. A bar that gaps
-  below the target covers at its open. The 20-day average second target is
-  not modelled: it only matters with scale-ins, and those are off in the Russo
-  harness too. The target needs 10 prior sessions of data; with less history
-  there is no target until there is.
+  below the target covers at its open. The half exit at the 20-day average
+  only applies when the 20-day is below the 10-day and the position has at
+  least 2 shares; otherwise everything covers at the 10-day. The 10-day target
+  needs 10 prior sessions of data and the 20-day needs 20; with less history
+  that target doesn't exist yet. The time stop covers at the last check of the
+  Nth session (15:00 hourly, 15:45 15-min, 15:55 5-min), at that bar's close.
 - **Sizing:** `shares = (equity × risk% ÷ 3) ÷ risk per share`. For the VWAP
   tranche, risk per share is the distance from entry up to the session high,
   its real stop. The EMA tranches have no stop, so risk per share

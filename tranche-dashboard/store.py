@@ -18,6 +18,8 @@ DEFAULT_SETTINGS = {
     "slippage_bps": 5.0,           # adverse fill vs bar close / stop, each side
     "bar_close_delay_min": 2,      # wait this long after an hourly bar closes
     "broker_sync_enabled": False,  # mirror the model into the Alpaca PAPER account
+    "vwap_max_sessions": 10,       # VWAP short: cover at the last check of this session (0 = off)
+    "vwap_scale_out_20": 1,        # VWAP short: half at the 10-day MA, rest at the 20-day (0 = all at 10)
 }
 
 SCHEMA = """
@@ -45,7 +47,8 @@ CREATE TABLE IF NOT EXISTS tranches (
     entry_time TEXT NOT NULL,
     entry_price REAL NOT NULL,
     stop_price REAL NOT NULL,
-    target_price REAL,                      -- VWAP tranche: daily 10-MA
+    target_price REAL,                      -- VWAP tranche: daily 10-MA (20-MA once scaled)
+    scaled INTEGER NOT NULL DEFAULT 0,      -- VWAP tranche: half already covered at the 10-MA
     risk_dollars REAL NOT NULL,
     fee_through TEXT NOT NULL,              -- last date borrow fee was charged
     borrow_fees REAL NOT NULL DEFAULT 0,
@@ -98,6 +101,8 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(tranches)")}
         if "target_price" not in cols:  # databases created before the Russo exits
             self.db.execute("ALTER TABLE tranches ADD COLUMN target_price REAL")
+        if "scaled" not in cols:  # databases created before the 10/20-MA scale-out
+            self.db.execute("ALTER TABLE tranches ADD COLUMN scaled INTEGER NOT NULL DEFAULT 0")
         scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
         if "grade" not in scols:  # databases created before trade grades
             self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")

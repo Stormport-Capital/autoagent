@@ -46,7 +46,7 @@ from datetime import date, datetime, time, timedelta
 from indicators import (ET, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, percentile,
                         price_tick,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
-                        resample, session_vwap)
+                        resample, session_bar_ends, session_vwap)
 from data import redact
 from store import DEFAULT_SETTINGS, Store
 
@@ -74,6 +74,8 @@ SETTING_BOUNDS = {
     "max_leverage": (0.1, 10.0),
     "slippage_bps": (0.0, 200.0),
     "bar_close_delay_min": (0, 30),
+    "vwap_max_sessions": (0, 30),
+    "vwap_scale_out_20": (0, 1),
 }
 
 
@@ -363,24 +365,26 @@ class Engine:
 
         # 2. exits against this bar's range, stop before target
         hod = max(x.high for x in bars[:i + 1] if x.session == b.session)  # incl. this bar
-        target = daily_sma(ind["daily"], b.session, 10)
+        ma10 = daily_sma(ind["daily"], b.session, 10)
+        ma20 = daily_sma(ind["daily"], b.session, 20)
         for sleeve, t in list(open_tr.items()):
             if b.end <= _dt(t["entry_time"]):
                 continue
-            if sleeve == "VWAP":  # Russo: new high of day stop, daily 10-MA target
+            if sleeve == "VWAP":  # Russo: new high of day stop, daily 10-/20-MA targets
                 stop = max(hod, t["entry_price"])
                 if b.high >= stop:
                     self._close(t, stop, b.end, f"stop: new high of day {stop:.4g} "
                                 f"({bar_txt}; high reached max(HOD, entry))", s)
-                elif target is not None and b.low <= target:
-                    # a gap below the target covers at the open, not above the bar
-                    self._close(t, min(target, b.open), b.end,
-                                f"target: daily 10-MA {target:.4g} ({bar_txt} low touched it)", s)
-                else:
-                    self.store.x("UPDATE tranches SET stop_price=?, target_price=? WHERE id=?",
-                                 (stop, target, t["id"]))
+                    del open_tr[sleeve]
                     continue
-                del open_tr[sleeve]
+                t = self._vwap_targets(t, b, ma10, ma20, bar_txt, s)
+                if t is not None:
+                    t = self._vwap_time_stop(t, bars, i, fill, s)
+                if t is None:
+                    del open_tr[sleeve]
+                else:
+                    open_tr[sleeve] = t
+                    self.store.x("UPDATE tranches SET stop_price=? WHERE id=?", (stop, t["id"]))
                 continue
             # EMA tranches have no stop: they only exit on the opposite cross (step 3)
 
@@ -424,6 +428,64 @@ class Engine:
                         f"high {b.high:.2f} below HOD {hod:.2f}{at_open}; {bar_txt}; "
                         f"filled {fill.how}",
                         stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10))
+
+    def _vwap_targets(self, t: dict, b: Bar, ma10, ma20, bar_txt: str, s) -> dict | None:
+        """Cover into the daily 10-MA, or half there and the rest at the 20-MA
+        (Russo's scale-out; Qullamaggie covers it all at the 10-MA). A bar that
+        gaps below a target covers at its open. Returns the tranche if still open."""
+        scale = s["vwap_scale_out_20"] and ma10 is not None and ma20 is not None and ma20 < ma10
+        if not t["scaled"]:
+            if ma10 is None or b.low > ma10:
+                self.store.x("UPDATE tranches SET target_price=? WHERE id=?", (ma10, t["id"]))
+                return t
+            px = min(ma10, b.open)
+            why = f"target: daily 10-MA {ma10:.4g} ({bar_txt} low touched it)"
+            if not scale or t["qty"] < 2:
+                self._close(t, px, b.end, why, s)
+                return None
+            t = self._partial_close(t, t["qty"] // 2, px, b.end, why + " - half covered", s)
+        ma = ma20 if ma20 is not None else ma10
+        if b.low <= ma:
+            self._close(t, min(ma, b.open), b.end,
+                        f"target 2: daily 20-MA {ma:.4g} ({bar_txt} low touched it)", s)
+            return None
+        self.store.x("UPDATE tranches SET target_price=? WHERE id=?", (ma, t["id"]))
+        return t
+
+    def _vwap_time_stop(self, t: dict, bars: list[Bar], i: int, fill: Fill, s) -> dict | None:
+        """Cover at the last check of the Nth session held (entry day = 1), e.g.
+        the 15:00 check on the hourly book. Returns the tranche if still open."""
+        n = int(s["vwap_max_sessions"])
+        if n <= 0:
+            return t
+        b, start = bars[i], _dt(t["entry_time"]).astimezone(ET).date()
+        held = len({x.session for x in bars[:i + 1] if x.session >= start})
+        last_check = session_bar_ends(b.session, self.minutes)[-2]
+        if held > n or (held == n and b.end >= last_check):
+            self._close(t, fill.price, fill.when, f"time stop: held {held} sessions "
+                        f"(max {n}); covered {fill.how}", s)
+            return None
+        return t
+
+    def _partial_close(self, t: dict, qty: int, price: float, when: datetime, reason: str,
+                       s) -> dict:
+        """Split `qty` shares off an open tranche and close them; the rest stays
+        open (marked scaled). Risk and borrow already paid split pro rata."""
+        frac = qty / t["qty"]
+        fees = t["borrow_fees"] * frac
+        part_id = self.store.x(
+            """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+               entry_price, stop_price, target_price, risk_dollars, fee_through, borrow_fees,
+               scaled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+            (t["symbol_id"], t["symbol"], t["sleeve"], t["side"], qty, t["entry_time"],
+             t["entry_price"], t["stop_price"], t["target_price"], t["risk_dollars"] * frac,
+             t["fee_through"], fees))
+        self._close({**t, "id": part_id, "qty": qty}, price, when, reason, s)
+        rest = {**t, "qty": t["qty"] - qty, "risk_dollars": t["risk_dollars"] * (1 - frac),
+                "borrow_fees": t["borrow_fees"] - fees, "scaled": 1}
+        self.store.x("UPDATE tranches SET qty=?, risk_dollars=?, borrow_fees=?, scaled=1 "
+                     "WHERE id=?", (rest["qty"], rest["risk_dollars"], rest["borrow_fees"], t["id"]))
+        return rest
 
     def _ema_unit(self, bars: list[Bar], fast: list, slow: list, i: int, a: float, s) -> tuple:
         """Risk per share for a stop-less EMA trade, from this stock's own history:

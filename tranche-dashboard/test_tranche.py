@@ -651,6 +651,72 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(v[0]["exit_reason"].startswith("target"))
         self.assertAlmostEqual(v[0]["exit_price"], 44.0)
 
+    def vwap_multi(self, prefix, later_days, settings=None):
+        """`prefix` = daily closes of the flat sessions before the entry day;
+        then the VWAP-fail entry day (short 49.5, HOD 52, calm afterwards) and
+        `later_days` (lists of 7 hourly specs). Ticks after the last session."""
+        for table in ("tranches", "symbols", "events"):
+            self.store.x(f"DELETE FROM {table}")               # fresh book per call
+        n = len(prefix) + 1 + len(later_days)
+        ds = weekdays(date(2026, 6, 1), n)
+        bars = []
+        for d, c in zip(ds, prefix):
+            bars += day_from_closes(d, [c] * 7)
+        d = ds[len(prefix)]
+        bars += hour_bars(d, 0, 48.0, 52.0, 47.8, 51.5)
+        bars += hour_bars(d, 1, 51.5, 51.8, 49.4, 49.5)
+        for k in range(2, 7):
+            bars += hour_bars(d, k, 49.0, 49.2, 48.9, 49.0)
+        for day, specs in zip(ds[len(prefix) + 1:], later_days):
+            for k, spec in enumerate(specs):
+                bars += hour_bars(day, k, *spec)
+        eng = self.engine(bars)
+        if settings:
+            eng.update_settings(settings)
+        eng.add_symbols("VWM", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng.tick(datetime.combine(ds[-1], time(16, 5), tzinfo=ET))
+        return self.store.q("SELECT * FROM tranches WHERE sleeve='VWAP' ORDER BY id"), ds
+
+    STILL = (49.0, 49.2, 48.9, 49.0)
+
+    def test_vwap_half_at_10ma_rest_at_20ma(self):
+        # 10 sessions at 40 then 10 at 45: the 20-MA sits below the 10-MA
+        touch10 = [(48.0, 48.5, 47.0, 47.5), (47.5, 47.6, 45.2, 45.6)] + [(45.6, 45.8, 45.3, 45.6)] * 5
+        v, ds = self.vwap_multi([40.0] * 10 + [45.0] * 10, [touch10])
+        ma10 = (9 * 45.0 + 49.0) / 10
+        ma20 = (9 * 40.0 + 10 * 45.0 + 49.0) / 20
+        self.assertEqual(len(v), 2)
+        half, rest = v[1], v[0]                               # the split-off half is the new row
+        self.assertTrue(half["exit_reason"].startswith("target: daily 10-MA"))
+        self.assertAlmostEqual(half["exit_price"], ma10)
+        self.assertEqual(rest["status"], "open")
+        self.assertEqual(rest["scaled"], 1)
+        self.assertAlmostEqual(rest["target_price"], ma20)
+        self.assertIn(rest["qty"] - half["qty"], (0, 1))
+        total_risk = half["risk_dollars"] + rest["risk_dollars"]
+        self.assertAlmostEqual(total_risk, (half["qty"] + rest["qty"]) * 2.5)
+        # the next session reaches the 20-MA: the rest covers there
+        touch20 = [(45.5, 45.6, 42.0, 42.5)] + [(42.5, 42.8, 42.3, 42.5)] * 6
+        v, ds = self.vwap_multi([40.0] * 10 + [45.0] * 10, [touch10, touch20])
+        rest = v[0]
+        self.assertTrue(rest["exit_reason"].startswith("target 2: daily 20-MA"))
+        self.assertEqual(rest["exit_time"], session_hour_ends(ds[-1])[0].isoformat())
+
+    def test_vwap_scale_out_off_covers_all_at_10ma(self):
+        touch10 = [(48.0, 48.5, 47.0, 47.5), (47.5, 47.6, 45.2, 45.6)] + [(45.6, 45.8, 45.3, 45.6)] * 5
+        v, _ = self.vwap_multi([40.0] * 10 + [45.0] * 10, [touch10], {"vwap_scale_out_20": 0})
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]["exit_reason"].startswith("target: daily 10-MA"))
+
+    def test_vwap_time_stop_at_last_check_of_10th_session(self):
+        v, ds = self.vwap_multi([45.0] * 10, [[self.STILL] * 7] * 9)
+        t = v[0]
+        self.assertTrue(t["exit_reason"].startswith("time stop: held 10 sessions"))
+        self.assertEqual(t["exit_time"], datetime.combine(ds[-1], time(15), tzinfo=ET).isoformat())
+        self.assertAlmostEqual(t["exit_price"], 49.0)
+        v, _ = self.vwap_multi([45.0] * 10, [[self.STILL] * 7] * 9, {"vwap_max_sessions": 0})
+        self.assertEqual(v[0]["status"], "open")               # off: still held
+
     def last_bar_cross(self):
         """Uptrend, then the 15:00-16:00 bar drops hard enough to cross the
         5 EMA below the 10 EMA. The next session opens at 47.0."""

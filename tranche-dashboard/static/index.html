@@ -162,6 +162,11 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           </div>
           <div class="row">
             <div><label for="bar_close_delay_min">Check delay (min)</label><input id="bar_close_delay_min" type="number" step="1" min="0"></div>
+          </div>
+          <div class="row">
+            <div><label for="vwap_max_sessions" title="VWAP short: cover at the last check of this session held, counting the entry day as 1. 0 = no time limit">VWAP max hold (sessions)</label><input id="vwap_max_sessions" type="number" step="1" min="0" max="30"></div>
+            <div><label for="vwap_scale_out_20" title="VWAP short: cover half at the daily 10-day MA and the rest at the 20-day MA (Russo), or all at the 10-day MA (Qullamaggie)">VWAP targets</label>
+              <select id="vwap_scale_out_20"><option value="1">Half at 10-MA, rest at 20-MA</option><option value="0">All at 10-MA</option></select></div>
 
           </div>
           <div style="margin-top:10px" class="row">
@@ -506,7 +511,7 @@ $("#setForm").onsubmit = async e => {
   refresh();
 };
 $("#resetBtn").onclick = async () => {
-  if (!confirm(`Reset the ${STATE.book.label} book? Its trades, history and equity curve are deleted. Its symbols stay and restart from now. The other book is not affected.`)) return;
+  if (!confirm(`Reset the ${STATE.book.label} book? Its trades, history and equity curve are deleted. Its symbols stay and restart from now. The other books are not affected.`)) return;
   await api(bk("/api/reset"), {}); refresh();
 };
 $("#runNow").onclick = async e => { e.target.disabled = true; try { await api(bk("/api/tick"), {}); } finally { e.target.disabled = false; refresh(); } };
