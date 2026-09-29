@@ -721,6 +721,7 @@ class EngineTests(unittest.TestCase):
     def test_vwap_scale_out_off_covers_all_at_10ma(self):
         touch10 = [(48.0, 48.5, 47.0, 47.5), (47.5, 47.6, 45.2, 45.6)] + [(45.6, 45.8, 45.3, 45.6)] * 5
         v, _ = self.vwap_multi([40.0] * 10 + [45.0] * 10, [touch10], {"vwap_scale_out_20": 0})
+        v = [t for t in v if t["trigger"] == "fail"]      # the day also re-enters on an opening fade
         self.assertEqual(len(v), 1)
         self.assertTrue(v[0]["exit_reason"].startswith("target: daily 10-MA"))
 
@@ -734,6 +735,56 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(t["exit_price"], 49 - 0.02 * 9)
         v, _ = self.vwap_multi([45.0] * 10, drift, {"vwap_max_sessions": 0})
         self.assertEqual(v[0]["status"], "open")               # off: still held
+
+    def fade_day(self, bar1, bar2, rest=((48.8, 49.0, 48.6, 48.8),) * 5, above_bar1=False):
+        """10 flat sessions at 50, then a day whose first two (hourly) bars are
+        `bar1` and `bar2`. Ticks after the close; returns the VWAP tranches."""
+        for table in ("tranches", "symbols", "events"):
+            self.store.x(f"DELETE FROM {table}")
+        ds = weekdays(date(2026, 6, 1), 11)
+        bars = []
+        for d in ds[:10]:
+            bars += day_from_closes(d, [50.0] * 7)
+        d = ds[10]
+        if above_bar1:  # red (50.0 -> 49.8) but most volume traded near 48: closes above VWAP
+            t0 = datetime.combine(d, time(9, 30), tzinfo=ET)
+            bars.append(Bar(t0, t0 + FIVE, 50.0, 50.5, 48.0, 48.2, 5000.0))
+            bars += [Bar(t0 + k * FIVE, t0 + (k + 1) * FIVE, 48.2 if k == 1 else 49.8, 49.9,
+                         48.2, 49.8, 100.0) for k in range(1, 6)]
+        else:
+            bars += hour_bars(d, 0, *bar1)
+        bars += hour_bars(d, 1, *bar2)
+        for k, spec in enumerate(rest, start=2):
+            bars += hour_bars(d, k, *spec)
+        eng = self.engine(bars)
+        eng.add_symbols("FAD", "short_only", 1.0, datetime.combine(d, time(9), tzinfo=ET))
+        eng.tick(datetime.combine(d, time(16, 5), tzinfo=ET))
+        return self.store.q("SELECT * FROM tranches WHERE sleeve='VWAP' ORDER BY id"), d
+
+    RED1 = (50.0, 50.5, 49.0, 49.2)       # red, closes under its VWAP (~49.3)
+    RED2 = (49.2, 49.8, 48.5, 48.8)       # red, under VWAP, lower high than 50.5
+
+    def test_opening_fade_fires_on_second_bar(self):
+        v, d = self.fade_day(self.RED1, self.RED2)
+        self.assertEqual(len(v), 1)
+        t = v[0]
+        self.assertEqual(t["trigger"], "open_fade")
+        self.assertEqual(t["entry_time"], session_hour_ends(d)[1].isoformat())   # 11:00 close
+        self.assertAlmostEqual(t["entry_price"], 48.8)
+        self.assertAlmostEqual(t["stop_price"], 50.5)                           # HOD at entry
+        ev = self.store.q("SELECT message FROM events WHERE kind='entry'")[0]["message"]
+        self.assertIn("opening fade", ev)
+
+    def test_opening_fade_needs_both_bars_red_below_vwap_and_lower_high(self):
+        green1 = (48.8, 50.5, 48.7, 49.2)                 # bar 1 green
+        self.assertFalse(self.fade_day(green1, self.RED2)[0])
+        green2 = (48.5, 49.8, 48.4, 48.8)                 # bar 2 green
+        self.assertFalse(self.fade_day(self.RED1, green2)[0])
+        new_high = (49.2, 50.7, 48.5, 48.8)               # bar 2 makes a new high of day
+        self.assertFalse(self.fade_day(self.RED1, new_high)[0])
+        # bar 1 closed above VWAP: not an opening fade - the standard Trigger B takes it
+        v, _ = self.fade_day(self.RED1, self.RED2, above_bar1=True)
+        self.assertEqual([t["trigger"] for t in v], ["fail"])
 
     def last_bar_cross(self):
         """Uptrend, then the 15:00-16:00 bar drops hard enough to cross the

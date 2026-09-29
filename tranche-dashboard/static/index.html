@@ -432,7 +432,10 @@ const statHead = extra => `<thead><tr><th class="l"></th>${extra}<th>Trades</th>
 
 function renderPerf(m) {
   let h = statHead("<th>Open</th>") + "<tbody>";
-  for (const [k, st] of Object.entries(m.by_sleeve)) h += statRow(st.label, st, `<td>${st.open}</td>`);
+  for (const [k, st] of Object.entries(m.by_sleeve)) {
+    h += statRow(st.label, st, `<td>${st.open}</td>`);
+    if (k === "VWAP" && m.vwap_open_fade) h += statRow(m.vwap_open_fade.label, m.vwap_open_fade, `<td>${m.vwap_open_fade.open}</td>`);
+  }
   h += statRow("Longs", m.by_side.long, "<td></td>") + statRow("Shorts", m.by_side.short, "<td></td>");
   h += statRow("<b>All</b>", m.overall, `<td>${m.open.length}</td>`);
   $("#perf").innerHTML = h + "</tbody>";

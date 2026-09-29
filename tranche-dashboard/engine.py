@@ -97,6 +97,24 @@ class Fill:
     how: str = ""  # human-readable: which price this is and where it came from
 
 
+def opening_fade(bars: list[Bar], five: list[Bar], i: int) -> bool:
+    """Opening fade, the VWAP fail for a stock that never trades above VWAP:
+    bar i is the session's 2nd bar; bar 1 was red and closed below VWAP, and
+    bar 2 is red, closes below VWAP and prints a lower high than bar 1.
+    Only the first two bars of a session can trigger it."""
+    b = bars[i]
+    earlier = [x for x in bars[:i] if x.session == b.session]
+    if len(earlier) != 1:
+        return False
+    b1 = earlier[0]
+    v1 = session_vwap(five, b.session, b1.end)
+    v2 = session_vwap(five, b.session, b.end)
+    if v1 is None or v2 is None:
+        return False
+    return (b1.close < b1.open and b1.close < v1
+            and b.close < b.open and b.close < v2 and b.high < b1.high)
+
+
 def vwap_fail(bars: list[Bar], five: list[Bar], i: int) -> bool:
     """Russo Trigger B ("VWAP fail") evaluated on hourly bar i:
 
@@ -417,8 +435,10 @@ class Engine:
         vwap = session_vwap(five, b.session, b.end)
         if vwap is None:
             return
-        # Russo Trigger B, rising edge only: fires on the bar where it turns true
-        lost = vwap_fail(bars, five, i) and not (i > 0 and vwap_fail(bars, five, i - 1))
+        # Russo Trigger B, rising edge only: fires on the bar where it turns true;
+        # or the opening fade (bars 1-2 red below VWAP, never above it yet)
+        fade = opening_fade(bars, five, i)
+        lost = fade or (vwap_fail(bars, five, i) and not (i > 0 and vwap_fail(bars, five, i - 1)))
         if lost and fill.session != b.session:
             # VWAP resets every session: a fail on the last bar is not carried to the open
             self.store.log(b.end, "skip", f"VWAP fail on the last bar of the day ({bar_txt}) - "
@@ -426,11 +446,14 @@ class Engine:
                            name, "VWAP")
         elif lost and "VWAP" not in open_tr:
             at_open = " (bar closed at 16:00: entered at the next open)" if fill.session != b.session else ""
+            kind = ("VWAP fail (opening fade): bars 1 and 2 red, both closed below VWAP"
+                    if fade else "VWAP fail")
             self._enter(sym, "VWAP", "short", fill, None, s,
-                        f"VWAP fail: close {b.close:.2f} < VWAP {vwap:.2f}, "
+                        f"{kind}: close {b.close:.2f} < VWAP {vwap:.2f}, "
                         f"high {b.high:.2f} below HOD {hod:.2f}{at_open}; {bar_txt}; "
                         f"filled {fill.how}",
-                        stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10))
+                        stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10),
+                        trigger="open_fade" if fade else "fail")
 
     def _vwap_stop(self, t: dict, bars: list[Bar], i: int) -> float:
         """High-of-day stop, never widened: the session high at entry (or the
@@ -496,10 +519,10 @@ class Engine:
         part_id = self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
                entry_price, stop_price, target_price, risk_dollars, fee_through, borrow_fees,
-               scaled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+               scaled, trigger) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
             (t["symbol_id"], t["symbol"], t["sleeve"], t["side"], qty, t["entry_time"],
              t["entry_price"], t["stop_price"], t["target_price"], t["risk_dollars"] * frac,
-             t["fee_through"], fees))
+             t["fee_through"], fees, t.get("trigger")))
         self._close({**t, "id": part_id, "qty": qty}, price, when, reason, s)
         rest = {**t, "qty": t["qty"] - qty, "risk_dollars": t["risk_dollars"] * (1 - frac),
                 "borrow_fees": t["borrow_fees"] - fees, "scaled": 1}
@@ -543,7 +566,8 @@ class Engine:
 
     # ------------------------------------------------------------ fills
     def _enter(self, sym, sleeve, side, f: Fill, unit: tuple | None, s, why: str,
-               stop_level: float | None = None, target: float | None = None) -> None:
+               stop_level: float | None = None, target: float | None = None,
+               trigger: str | None = None) -> None:
         name = sym["symbol"]
         if sym["status"] != "active":
             self.store.log(f.when, "skip", f"{why}: symbol paused, no entry", name, sleeve)
@@ -576,10 +600,10 @@ class Engine:
             return
         self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
-               entry_price, stop_price, target_price, risk_dollars, fee_through)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               entry_price, stop_price, target_price, risk_dollars, fee_through, trigger)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sym["id"], name, sleeve, side, qty, f.when.isoformat(), fill, stop, target,
-             qty * dist, f.session.isoformat()))
+             qty * dist, f.session.isoformat(), trigger))
         note = " (capped by max leverage)" if capped else ""
         tgt = f", target {target:.2f}" if target is not None else ""
         self.store.log(f.when, "entry",
@@ -701,6 +725,9 @@ class Engine:
             "by_sleeve": {k: {**stats([t for t in closed if t["sleeve"] == k]),
                               "open": sum(1 for p in opens if p["sleeve"] == k),
                               "label": SLEEVE_LABELS[k]} for k in SLEEVES},
+            "vwap_open_fade": {**stats([t for t in closed if t.get("trigger") == "open_fade"]),
+                               "open": sum(1 for p in opens if p.get("trigger") == "open_fade"),
+                               "label": "  of which: opening fade"},
             "by_side": {k: stats([t for t in closed if t["side"] == k]) for k in ("long", "short")},
             "by_symbol": {sym: stats([t for t in closed if t["symbol"] == sym])
                           for sym in sorted({t["symbol"] for t in closed})},

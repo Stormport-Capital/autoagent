@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS tranches (
     stop_price REAL NOT NULL,
     target_price REAL,                      -- VWAP tranche: daily 10-MA (20-MA once scaled)
     scaled INTEGER NOT NULL DEFAULT 0,      -- VWAP tranche: half already covered at the 10-MA
+    trigger TEXT,                           -- VWAP tranche: 'fail' (Trigger B) or 'open_fade' 
     risk_dollars REAL NOT NULL,
     fee_through TEXT NOT NULL,              -- last date borrow fee was charged
     borrow_fees REAL NOT NULL DEFAULT 0,
@@ -101,6 +102,8 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(tranches)")}
         if "target_price" not in cols:  # databases created before the Russo exits
             self.db.execute("ALTER TABLE tranches ADD COLUMN target_price REAL")
+        if "trigger" not in cols:  # databases created before the opening-fade trigger
+            self.db.execute("ALTER TABLE tranches ADD COLUMN trigger TEXT")
         if "scaled" not in cols:  # databases created before the 10/20-MA scale-out
             self.db.execute("ALTER TABLE tranches ADD COLUMN scaled INTEGER NOT NULL DEFAULT 0")
         scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
