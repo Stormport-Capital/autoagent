@@ -75,6 +75,7 @@ tbody tr:hover { background: var(--chip); }
 .chart .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12); display: none; white-space: nowrap; }
 .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.guide-btn { display: inline-flex; align-items: center; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; text-decoration: none; color: inherit; font-size: 13px; }
 .export { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 12.5px; margin: 0 0 10px; color: var(--muted); }
 .export input[type=date] { width: auto; }
 .booktabs button { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
@@ -105,6 +106,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
   <div class="row" style="flex:0">
     <button id="demoPause" style="display:none">Pause demo</button>
     <button id="runNow">Check now</button>
+    <a class="guide-btn" href="/guide" target="_blank" rel="noopener">Guide</a>
   </div>
 </header>
 <main>

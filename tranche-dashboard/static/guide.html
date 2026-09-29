@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard Guide</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#16181d; --ink-2:#3b414c; --muted:#6b7280; --line:#e3e6eb;
+        --accent:#2f6fde; --warn-bg:#fff6e0; --warn:#8a5a00; --good:#137a3a; --bad:#b42318; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#0f1115; --card:#171a21; --ink:#e8eaee; --ink-2:#c2c7d0; --muted:#8b93a1; --line:#2a2f38;
+          --accent:#6ea0ff; --warn-bg:#2a2213; --warn:#e7b85a; --good:#4cc47b; --bad:#ff6b5e; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 18px; margin: 28px 0 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+h3 { font-size: 15px; margin: 18px 0 6px; }
+p, li { color: var(--ink-2); }
+a { color: var(--accent); }
+.sub { color: var(--muted); margin: 0 0 16px; }
+nav { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+nav a { display: inline-block; margin: 2px 12px 2px 0; }
+table { border-collapse: collapse; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; vertical-align: top; padding: 7px 10px; border-bottom: 1px solid var(--line); font-size: 14px; }
+th { background: var(--bg); color: var(--muted); font-weight: 600; }
+td:first-child { white-space: nowrap; font-weight: 600; color: var(--ink); }
+.wrap { overflow-x: auto; }
+ol.steps { padding-left: 22px; }
+ol.steps li { margin: 6px 0; }
+.btn { display: inline-block; padding: 1px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); font-size: 13px; color: var(--ink); white-space: nowrap; }
+.warn { background: var(--warn-bg); color: var(--warn); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.warn b { color: inherit; }
+code { background: var(--card); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-size: 13px; }
+.good { color: var(--good); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; }
+.back { display: inline-block; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<main>
+<a class="back" href="/">← Back to the dashboard</a>
+<h1>Dashboard guide</h1>
+<p class="sub">What every button does, what to press in what order, and the daily routine. Paper trading only.</p>
+
+<nav>
+  <a href="#routine">Daily routine</a>
+  <a href="#map">The screen</a>
+  <a href="#buttons">Every button</a>
+  <a href="#howto">How to…</a>
+  <a href="#rules">What the bot does</a>
+  <a href="#read">Reading the numbers</a>
+  <a href="#donts">Don'ts</a>
+  <a href="#server">If something's wrong</a>
+</nav>
+
+<h2 id="routine">Daily routine (in this order)</h2>
+<h3>Pre-market (before 9:30 ET)</h3>
+<ol class="steps">
+  <li>Open the dashboard (Tailscale on) and check the top line: <b>Data: fmp</b>, a recent <b>Last check</b>, and <b>Backed up</b> with today's or yesterday's date.</li>
+  <li>For each new idea: type the symbol in <b>Add symbols</b>, pick <b>Short only</b> or <b>Long &amp; short</b>, pick the <b>Trade grade</b>, tick the books you want under <b>Add to</b>, press <span class="btn">Add to watchlist</span>.</li>
+  <li>Names you're done with: <span class="btn">Remove</span> (closes anything open first). Names to keep but not re-enter: <span class="btn">Pause</span>.</li>
+  <li>Click each book tab once and check the Alpaca card says <b>sync on</b> and "paper matches the model".</li>
+</ol>
+<h3>At the open and during the day</h3>
+<ol class="steps">
+  <li>Nothing to press: the bot checks on its own (see <a href="#rules">when</a>).</li>
+  <li>Glance at the <b>Watchlist</b> for open positions and the Alpaca card for a red "N symbol(s) differ" line.</li>
+  <li>A name that's chopping you up: <span class="btn">Pause</span> it (and <span class="btn">Flatten</span> if you want out now).</li>
+</ol>
+<h3>Before the close (3:45–3:55 PM ET)</h3>
+<ol class="steps">
+  <li>Review <b>Open positions</b> on each tab. Anything you don't want to hold overnight: <span class="btn">Flatten</span>, then <span class="btn">Pause</span>. Do this <b>before 4:00</b> (see <a href="#donts">why</a>).</li>
+</ol>
+<h3>After the close</h3>
+<ol class="steps">
+  <li>Review <b>Closed trades</b> and <b>Performance by tranche</b> on each tab.</li>
+  <li>Optional: export to TradesViz (<a href="#tradesviz">how</a>).</li>
+  <li>The backup runs by itself after 4:10 PM.</li>
+</ol>
+<h3>Weekly</h3>
+<ol class="steps">
+  <li>Clean the watchlist: remove names that no longer fit.</li>
+  <li>Compare the three books' <b>Performance by tranche</b> tables to see which timeframe/tranche is paying.</li>
+  <li>Optional: <span class="btn">Download backup</span> on each tab to keep a copy on your PC.</li>
+</ol>
+
+<h2 id="map">The screen, top to bottom</h2>
+<div class="wrap"><table>
+<tr><th>Area</th><th>What it is</th></tr>
+<tr><td>Book tabs</td><td>Hourly / 15-min / 5-min. Three separate portfolios with the same rules. <b>Everything below the tabs belongs to the tab you're on</b>, including settings and buttons. The small text shows that book's equity, return, and "paper on" if orders go to Alpaca.</td></tr>
+<tr><td>Status line</td><td>Model + Alpaca PAPER orders (or "Model only"), data source, time and market open/closed, Last check, Backed up, <b>Download backup</b>, Next check. A red message here means something failed.</td></tr>
+<tr><td>Tiles</td><td>Equity, Total return, Realized P&amp;L (closed trades), Open P&amp;L, Borrow fees, Win rate (PF = profit factor, avg R), Max drawdown, Exposure (long / short).</td></tr>
+<tr><td>Add symbols</td><td>Where new names go in (left column).</td></tr>
+<tr><td>Portfolio settings</td><td>This book's size and rules (left column).</td></tr>
+<tr><td>Alpaca paper account</td><td>This book's paper account: on/off switch, equity, and a model-vs-paper position check.</td></tr>
+<tr><td>Watchlist</td><td>Every symbol in this book with live readings, what each tranche holds, and the per-symbol buttons.</td></tr>
+<tr><td>Equity</td><td>Model equity curve (and the Alpaca paper equity line). Hover for values.</td></tr>
+<tr><td>Performance by tranche</td><td>Results split by 5/10 EMA, 10/20 EMA, VWAP fail (with the opening-fade trades as their own row), longs, shorts, all.</td></tr>
+<tr><td>Bottom tabs</td><td>Open positions · Closed trades (with the TradesViz export) · By symbol · Paper orders · Signal log.</td></tr>
+</table></div>
+
+<h2 id="buttons">Every button</h2>
+<div class="wrap"><table>
+<tr><th>Button</th><th>Where</th><th>What it does</th></tr>
+<tr><td>Book tab</td><td>top</td><td>Switches which book you're looking at and editing. Doesn't change any trade.</td></tr>
+<tr><td><span class="btn">Check now</span></td><td>top right</td><td>Runs this book's check immediately (fetches bars, acts on any completed bar). Safe: it never doubles a trade. You never need it in normal use.</td></tr>
+<tr><td><span class="btn">Guide</span></td><td>top right</td><td>This page.</td></tr>
+<tr><td>Download backup</td><td>status line</td><td>Saves a copy of this book's database to your computer.</td></tr>
+<tr><td>Short only / Long &amp; short</td><td>Add symbols</td><td>For the two EMA tranches only. Short only: shorts on a down-cross, goes flat on an up-cross. Long &amp; short: flips between long and short on each cross. The VWAP tranche is always short.</td></tr>
+<tr><td>Trade grade</td><td>Add symbols</td><td>Risk for the whole symbol: A+ 3%, A 2%, B 1.5%, C 1% of equity, split across the 3 tranches. "Custom" uses the slider (0.5–3%).</td></tr>
+<tr><td>Add to boxes</td><td>Add symbols</td><td>Which books get the symbol. All three are ticked by default; untick to leave a book out.</td></tr>
+<tr><td><span class="btn">Add to watchlist</span></td><td>Add symbols</td><td>Adds the symbols to the ticked books and runs a check. A name already in a book is skipped there.</td></tr>
+<tr><td><span class="btn">Save settings</span></td><td>Portfolio settings</td><td>Saves this book's settings. Other books are unchanged.</td></tr>
+<tr><td><span class="btn">Reset portfolio</span></td><td>Portfolio settings</td><td>Wipes <b>this book's</b> trades, history and equity curve (after saving a backup). Symbols stay and start fresh from now. Paper orders history is kept. Use sparingly.</td></tr>
+<tr><td>Send the model's trades to Alpaca paper</td><td>Alpaca card</td><td>The on/off switch for paper orders in this book. On: the paper account is kept equal to the model's positions after every check. Off: the model still trades, nothing is sent. This is the book's kill switch.</td></tr>
+<tr><td><span class="btn">Sync now</span></td><td>Alpaca card</td><td>Sends any orders needed right now to make the paper account match the model.</td></tr>
+<tr><td>Grade dropdown</td><td>Watchlist row</td><td>Changes the symbol's grade (risk) for future entries only.</td></tr>
+<tr><td><span class="btn">Bars</span></td><td>Watchlist row</td><td>Opens every bar the engine used for that symbol (open, high, low, close, EMAs, VWAP, signals) to compare with your chart. Has a CSV download.</td></tr>
+<tr><td><span class="btn">Pause</span> / <span class="btn">Resume</span></td><td>Watchlist row</td><td>Pause: no new entries, but open positions are still managed and exited by the rules. Resume undoes it.</td></tr>
+<tr><td><span class="btn">Flatten</span></td><td>Watchlist row</td><td>Closes all of this symbol's open tranches in this book now, at the latest price. Paper follows within seconds. The symbol stays active, so <b>Pause</b> it too if you don't want re-entries.</td></tr>
+<tr><td><span class="btn">Remove</span></td><td>Watchlist row</td><td>Flattens, then drops the symbol from this book.</td></tr>
+<tr><td>Download CSV</td><td>Closed trades tab</td><td>TradesViz export for this book and date range (<a href="#tradesviz">details</a>).</td></tr>
+</table></div>
+
+<h2 id="howto">How to…</h2>
+<h3>Add a symbol to only one book</h3>
+<ol class="steps"><li>Type it, set direction and grade.</li><li>Untick the two books you don't want under <b>Add to</b>.</li><li><span class="btn">Add to watchlist</span>.</li></ol>
+<h3>Get out of a position now</h3>
+<ol class="steps"><li>Go to the book tab that holds it.</li><li><span class="btn">Flatten</span> on the symbol's row, confirm.</li><li><span class="btn">Pause</span> (or <span class="btn">Remove</span>) so it doesn't re-enter.</li><li>Repeat on every book tab that holds the stock.</li></ol>
+<h3>Stop a choppy name from trading</h3>
+<p><span class="btn">Pause</span> it in the books where it chops (often 5-min and 15-min) and leave it active in the hourly book. Paused names still exit by the rules.</p>
+<h3>Turn paper orders on or off for a book</h3>
+<p>Book tab → Alpaca card → tick or untick <b>Send the model's trades to Alpaca paper</b>. Turning it on opens any positions the model already holds.</p>
+<h3>Check a signal against your chart</h3>
+<p><span class="btn">Bars</span> on the row. Highlighted rows fired a signal; the VWAP column is the value the engine used.</p>
+<h3 id="tradesviz">Export to TradesViz</h3>
+<ol class="steps"><li>Book tab → bottom tabs → <b>Closed trades</b>.</li><li>Pick <b>from</b> / <b>to</b> dates (trades are picked by the day they were opened). Tick "include open positions" only if you want entries that haven't closed.</li><li><b>Download CSV</b>. Two rows per trade: Open and Close.</li><li>In TradesViz, use the custom CSV import: map Date, Time, Symbol, Action, Quantity, Price, Fees; timezone US/Eastern. Export date ranges that don't overlap to avoid duplicates.</li></ol>
+<h3>Change the portfolio size or a rule</h3>
+<p>Book tab → Portfolio settings → change → <span class="btn">Save settings</span>. Only that book changes.</p>
+<h3>See why a trade happened</h3>
+<p>Bottom tab <b>Signal log</b>: every entry, exit and skip with the bar and the numbers. <b>Closed trades</b> shows each exit's reason.</p>
+
+<h2 id="rules">What the bot does by itself</h2>
+<div class="wrap"><table>
+<tr><th>Tranche</th><th>Entry</th><th>Exit</th></tr>
+<tr><td>5/10 EMA</td><td>5 EMA crosses the 10 EMA (down = short; up = long in Long &amp; short mode).</td><td>Only the opposite cross. No stop.</td></tr>
+<tr><td>10/20 EMA</td><td>Same with the 10 and 20 EMA.</td><td>Only the opposite cross. No stop.</td></tr>
+<tr><td>VWAP fail (short)</td><td>(a) An earlier bar today closed above VWAP, this bar closes below VWAP with a lower high; or (b) opening fade: bars 1 and 2 both red and below VWAP, bar 2 with a lower high.</td><td>Stop: the day's high at entry, trailed down each day to the lowest session high since. Half covers at the daily 10-day average, the rest at the 20-day. Time stop after 10 sessions. Held overnight.</td></tr>
+</table></div>
+<p><b>When it checks</b> (about 2 minutes after each bar closes, ET): Hourly at 10:00 … 15:00; 15-min at 9:45 … 15:45; 5-min at 9:35 … 15:55. Each book also checks at the <b>9:30 open</b> for the previous day's last bar. A symbol only trades on signals after you add it.</p>
+<p><b>Size</b>: equity × grade % ÷ 3 per tranche, divided by the risk per share; total exposure capped at 2× equity.</p>
+
+<h2 id="read">Reading the numbers</h2>
+<ul>
+  <li><b>S 522 −$387</b> in a tranche column: short 522 shares, open P&amp;L −$387. <b>L</b> = long. <b>flat</b> = no position.</li>
+  <li><span class="good">Green</span> = profit, <span class="bad">red</span> = loss. A red VWAP value on the watchlist means price is below VWAP.</li>
+  <li><b>R</b> = profit or loss measured in units of the risk taken. −1R = lost the planned risk.</li>
+  <li>Alpaca card "N symbol(s) differ from the model": the paper account doesn't hold what the model holds, usually a short Alpaca rejected (hard to borrow) or an order still working. Check <b>Paper orders</b>.</li>
+  <li>Model prices are the bot's simulated fills. Alpaca paper fills can differ, especially on fast stops.</li>
+</ul>
+
+<h2 id="donts">Don'ts</h2>
+<div class="warn"><b>Don't close positions in the Alpaca app.</b> The model still holds them and the next check reopens them. Always exit with Flatten.</div>
+<div class="warn"><b>Don't Flatten after 4:00 PM ET.</b> The model exits at the last price, but the paper order waits for the next morning's open, so the two disagree.</div>
+<div class="warn"><b>Don't run the PC copy</b> (Start Dashboard.bat) while the server runs. Both would trade the same paper accounts.</div>
+<div class="warn"><b>Lower timeframes chop.</b> A single sideways name can rack up many small losses on the 5- and 15-min books (TJGC was 90% of the 15-min losses). Pause choppy names there, or add them to the hourly book only.</div>
+
+<h2 id="server">If something's wrong</h2>
+<p>Connect from PowerShell on your PC: <code>ssh root@159.89.182.160</code>, then:</p>
+<div class="wrap"><table>
+<tr><th>Command</th><th>Use it when</th></tr>
+<tr><td><code>systemctl status tranche</code></td><td>Is it running? Should say <b>active (running)</b>.</td></tr>
+<tr><td><code>journalctl -u tranche -n 50 --no-pager -l</code></td><td>Recent log, including the startup connection check (data, all three Alpaca accounts, backup).</td></tr>
+<tr><td><code>systemctl restart tranche</code></td><td>Restart now; also pulls the latest code. It restarts itself every weekday at 8:45 AM ET anyway.</td></tr>
+</table></div>
+<p>Page won't load: check Tailscale is on, then try <code>http://100.95.22.112:8050</code>.</p>
+</main>
+</body>
+</html>

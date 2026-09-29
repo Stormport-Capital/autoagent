@@ -428,6 +428,9 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
             if self.path in ("/", "/index.html"):
                 return self._send(200, (HERE / "static" / "index.html").read_bytes(),
                                   "text/html; charset=utf-8")
+            if self.path == "/guide":
+                return self._send(200, (HERE / "static" / "guide.html").read_bytes(),
+                                  "text/html; charset=utf-8")
             book, rest = self._route()
             if book and rest == "/state":
                 st = build_state(book, ordered, provider_name, demo)

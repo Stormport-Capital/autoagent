@@ -14,6 +14,9 @@ position with market orders. It is paper only: the paper endpoint is hard-coded,
 and there is no live-trading setting. **Step-by-step keys and setup:
 [SETUP.md](SETUP.md).**
 
+**How to use the dashboard:** click **Guide** in the dashboard header
+(`static/guide.html`): every button, the daily routine, and how-tos.
+
 **Always-on in the cloud:** see [CLOUD.md](CLOUD.md) (DigitalOcean +
 Tailscale, password-protected, auto-restart, daily backups).
 
