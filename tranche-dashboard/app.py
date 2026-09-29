@@ -34,6 +34,7 @@ import requests
 from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync
@@ -445,6 +446,24 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                return
+            if book and (rest or "").split("?")[0] == "/export/tradesviz.csv":
+                qs = parse_qs(urlparse(rest).query)
+                try:
+                    start, end = (date.fromisoformat(qs[k][0]) if qs.get(k, [""])[0] else None
+                                  for k in ("from", "to"))
+                except ValueError:
+                    return self._send(400, {"error": "dates must be YYYY-MM-DD"})
+                rows = book.engine.executions(start, end, qs.get("open", ["0"])[0] == "1")
+                body = rows_csv(rows) or ("Date,Time,Symbol,Action,Direction,Type,Quantity,"
+                                          "Price,Fees,Tranche,TradeID\n")
+                name = f"tradesviz_{book.key}_{start or 'all'}_{end or 'now'}.csv"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("Content-Length", str(len(body.encode())))
+                self.end_headers()
+                self.wfile.write(body.encode())
                 return
             m = re.fullmatch(r"/bars/([A-Z][A-Z0-9.\-]{0,9})(\.csv)?", rest or "")
             if book and m:

@@ -681,6 +681,38 @@ class Engine:
         unreal = sum(p["unrealized"] for p in self.open_positions())
         return s["starting_capital"] + realized - fees + unreal
 
+    def executions(self, start: date | None = None, end: date | None = None,
+                   include_open: bool = False) -> list[dict]:
+        """Trades as separate opening and closing executions (e.g. for a
+        TradesViz import). A trade is included when it was opened between
+        `start` and `end` (ET dates, inclusive); both of its legs come along,
+        so no position is ever cut in half. Open trades only if asked: then
+        just their opening leg. Prices are the model's fills (slippage
+        included); borrow fees ride on the closing leg."""
+        q = "SELECT * FROM tranches" + ("" if include_open else " WHERE status='closed'")
+        out = []
+        for t in self.store.q(q + " ORDER BY entry_time, id"):
+            opened = _dt(t["entry_time"]).astimezone(ET)
+            if (start and opened.date() < start) or (end and opened.date() > end):
+                continue
+            short = t["side"] == "short"
+            legs = [(opened, "SELL" if short else "BUY", "Open", t["entry_price"], 0.0)]
+            if t["status"] == "closed":
+                legs.append((_dt(t["exit_time"]).astimezone(ET), "BUY" if short else "SELL",
+                             "Close", t["exit_price"], t["borrow_fees"]))
+            for when, action, kind, price, fees in legs:
+                out.append({
+                    "Date": when.strftime("%Y-%m-%d"), "Time": when.strftime("%H:%M:%S"),
+                    "Symbol": t["symbol"], "Action": action,
+                    "Direction": "Short" if short else "Long", "Type": kind,
+                    "Quantity": t["qty"], "Price": round(price, 4), "Fees": round(fees, 2),
+                    "Tranche": SLEEVE_LABELS[t["sleeve"]]
+                    + (" - opening fade" if t.get("trigger") == "open_fade" else ""),
+                    "TradeID": t["id"],
+                })
+        out.sort(key=lambda r: (r["Date"], r["Time"], r["TradeID"], r["Type"] != "Open"))
+        return out
+
     def summary(self) -> dict:
         s = self.store.settings()
         closed = self.store.q("SELECT * FROM tranches WHERE status='closed' ORDER BY exit_time")

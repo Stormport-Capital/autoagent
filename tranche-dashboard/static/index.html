@@ -75,6 +75,8 @@ tbody tr:hover { background: var(--chip); }
 .chart .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12); display: none; white-space: nowrap; }
 .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.export { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 12.5px; margin: 0 0 10px; color: var(--muted); }
+.export input[type=date] { width: auto; }
 .booktabs button { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
 .booktabs small { font-size: 11px; opacity: .85; font-variant-numeric: tabular-nums; }
 .checks { display: flex; gap: 14px; margin-top: 2px; }
@@ -211,6 +213,13 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
         <button data-tab="log">Signal log</button>
       </div>
     </h2>
+    <div class="export" id="exportBar" hidden>
+      <span>Export for TradesViz (this book, trades opened</span>
+      <label>from <input type="date" id="exFrom"></label>
+      <label>to <input type="date" id="exTo"></label>)
+      <label><input type="checkbox" id="exOpen"> include open positions (entry only)</label>
+      <a id="exLink" class="small" href="#">Download CSV</a>
+    </div>
     <div class="tablewrap" id="tabBody"></div>
   </section>
 </main>
@@ -441,7 +450,17 @@ function renderPerf(m) {
   $("#perf").innerHTML = h + "</tbody>";
 }
 
+function exportLink() {
+  const q = new URLSearchParams();
+  if ($("#exFrom").value) q.set("from", $("#exFrom").value);
+  if ($("#exTo").value) q.set("to", $("#exTo").value);
+  if ($("#exOpen").checked) q.set("open", "1");
+  $("#exLink").href = `/api/${BOOK}/export/tradesviz.csv` + (q.toString() ? "?" + q : "");
+}
+["#exFrom", "#exTo", "#exOpen"].forEach(id => $(id).onchange = exportLink);
+
 function renderTab() {
+  $("#exportBar").hidden = TAB !== "closed";
   const m = STATE.summary, L = STATE.sleeves;
   document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB));
   let h = "";
@@ -453,6 +472,7 @@ function renderTab() {
       <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${t.sleeve === "VWAP" ? num(t.stop_price) : "on cross"}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
       <td>${usd(t.risk_dollars)}</td><td>${usd(t.borrow_fees, 2)}</td><td class="${cls(t.unrealized - t.borrow_fees)}">${signed(t.unrealized - t.borrow_fees)}</td><td class="l">${fmtT(t.entry_time)}</td></tr>`;
   } else if (TAB === "closed") {
+    exportLink();
     if (!m.closed.length) return $("#tabBody").innerHTML = `<div class="empty">No closed trades yet.</div>`;
     h = `<table><thead><tr><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
       <th>Gross</th><th>Borrow</th><th>Net</th><th>R</th><th class="l">Exit reason</th><th class="l">Opened</th><th class="l">Closed</th></tr></thead><tbody>`;

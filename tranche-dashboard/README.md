@@ -110,6 +110,18 @@ Each tranche gets one third of that budget.
   entries), flatten a symbol, remove it (flattens first), or reset the whole
   portfolio.
 
+## Exporting trades (TradesViz)
+
+On the **Closed trades** tab, pick a date range and click **Download CSV**. The
+file is for the book you're viewing, with two rows per trade: the opening and
+the closing execution. Columns: `Date, Time` (ET), `Symbol`, `Action`
+(BUY/SELL; a short opens with SELL and closes with BUY), `Direction`
+(Long/Short), `Type` (Open/Close), `Quantity`, `Price` (the model's fill,
+slippage included), `Fees` (borrow, on the closing row), `Tranche`, `TradeID`.
+A trade is included when it was *opened* in the range, so both legs always
+come together. Tick "include open positions" to add entries that haven't
+closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&to=YYYY-MM-DD`.
+
 ## Data providers
 
 | Provider | Key | Caveat |

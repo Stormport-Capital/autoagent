@@ -786,6 +786,25 @@ class EngineTests(unittest.TestCase):
         v, _ = self.fade_day(self.RED1, self.RED2, above_bar1=True)
         self.assertEqual([t["trigger"] for t in v], ["fail"])
 
+    def test_executions_export_open_and_close_legs(self):
+        v, d = self.fade_day(self.RED1, self.RED2)          # one short, opened and closed
+        eng = Engine(self.store, ScriptedProvider([]))
+        rows = eng.executions()
+        self.assertEqual([r["Type"] for r in rows], ["Open", "Close"])
+        o, c = rows
+        self.assertEqual((o["Symbol"], o["Action"], o["Direction"], o["Quantity"]),
+                         ("FAD", "SELL", "Short", v[0]["qty"]))
+        self.assertEqual((c["Action"], c["Direction"], c["Quantity"]), ("BUY", "Short", v[0]["qty"]))
+        self.assertEqual((o["Date"], o["Time"]), (d.isoformat(), "11:00:00"))
+        self.assertAlmostEqual(o["Price"], v[0]["entry_price"])
+        self.assertAlmostEqual(c["Price"], v[0]["exit_price"])
+        self.assertIn("opening fade", o["Tranche"])
+        # date filter is on the opening date; open trades only when asked
+        self.assertEqual(eng.executions(start=d + timedelta(days=1)), [])
+        self.store.x("UPDATE tranches SET status='open', exit_time=NULL, exit_price=NULL")
+        self.assertEqual(eng.executions(), [])
+        self.assertEqual([r["Type"] for r in eng.executions(include_open=True)], ["Open"])
+
     def last_bar_cross(self):
         """Uptrend, then the 15:00-16:00 bar drops hard enough to cross the
         5 EMA below the 10 EMA. The next session opens at 47.0."""
