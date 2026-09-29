@@ -597,11 +597,11 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(t["risk_dollars"], t["qty"] * 2.5)
         self.assertEqual(t["status"], "open")                  # held overnight
 
-    def test_vwap_stop_on_new_high_of_day_fills_at_that_high(self):
+    def test_vwap_stop_on_new_high_of_day_fills_at_the_stop(self):
         v, d, _ = self.russo_vwap([self.CALM, (49.0, 52.6, 48.9, 50.0)] + [self.CALM] * 3)
         t = v[0]
-        self.assertTrue(t["exit_reason"].startswith("stop: new high of day"))
-        self.assertAlmostEqual(t["exit_price"], 52.6)
+        self.assertTrue(t["exit_reason"].startswith("stop 52"))
+        self.assertAlmostEqual(t["exit_price"], 52.0)          # a stop order at the HOD
         self.assertEqual(t["exit_time"], session_hour_ends(d)[3].isoformat())
 
     def test_vwap_stop_checked_before_target(self):
@@ -618,15 +618,31 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(t["exit_time"], session_hour_ends(ds[11])[1].isoformat())
         self.assertGreater(t["borrow_fees"], 0)            # one night held
 
-    def test_vwap_stop_next_session_needs_price_above_entry(self):
-        # next day: first bar is its own HOD but below entry -> no stop;
-        # second bar makes a new HOD above entry -> stopped at that high
+    def test_vwap_stop_is_not_reset_to_entry_overnight(self):
+        # next day trades above the 49.5 entry (50.2) but stays under the
+        # entry-day high of 52: still short (the old breakeven reset is gone)
         nxt = [(48.0, 48.5, 47.0, 47.5), (47.5, 50.2, 47.4, 50.0)] + [self.CALM] * 5
         v, _, ds = self.russo_vwap([self.CALM] * 5, next_day=nxt)
+        self.assertEqual(v[0]["status"], "open")
+        self.assertAlmostEqual(v[0]["stop_price"], 52.0)
+
+    def test_vwap_stop_gap_through_fills_at_open(self):
+        nxt = [(53.0, 53.5, 52.8, 53.2)] + [self.CALM] * 6
+        v, _, ds = self.russo_vwap([self.CALM] * 5, next_day=nxt)
         t = v[0]
-        self.assertTrue(t["exit_reason"].startswith("stop"))
+        self.assertIn("gapped through", t["exit_reason"])
+        self.assertAlmostEqual(t["exit_price"], 53.0)
+        self.assertEqual(t["exit_time"], session_hour_ends(ds[11])[0].isoformat())
+
+    def test_vwap_stop_trails_to_lowest_session_high(self):
+        # day 2 highs top out at 50.2; on day 3 the stop is 50.2, not 52
+        day2 = [(48.0, 48.5, 47.0, 47.5), (47.5, 50.2, 47.4, 50.0)] + [self.CALM] * 5
+        day3 = [(49.8, 50.4, 49.6, 50.1)] + [self.CALM] * 6
+        v, ds = self.vwap_multi([45.0] * 10, [day2, day3])
+        t = v[0]
+        self.assertTrue(t["exit_reason"].startswith("stop 50.2"))
         self.assertAlmostEqual(t["exit_price"], 50.2)
-        self.assertEqual(t["exit_time"], session_hour_ends(ds[11])[1].isoformat())
+        self.assertEqual(t["exit_time"], session_hour_ends(ds[-1])[0].isoformat())
 
     def test_vwap_below_target_still_enters_and_covers_next_open(self):
         ds = weekdays(date(2026, 8, 3), 11)
@@ -709,12 +725,14 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(v[0]["exit_reason"].startswith("target: daily 10-MA"))
 
     def test_vwap_time_stop_at_last_check_of_10th_session(self):
-        v, ds = self.vwap_multi([45.0] * 10, [[self.STILL] * 7] * 9)
+        drift = [[(49 - 0.02 * k, 49.2 - 0.02 * k, 48.9 - 0.02 * k, 49 - 0.02 * k)] * 7
+                 for k in range(1, 10)]                 # each day's high below the last
+        v, ds = self.vwap_multi([45.0] * 10, drift)
         t = v[0]
         self.assertTrue(t["exit_reason"].startswith("time stop: held 10 sessions"))
         self.assertEqual(t["exit_time"], datetime.combine(ds[-1], time(15), tzinfo=ET).isoformat())
-        self.assertAlmostEqual(t["exit_price"], 49.0)
-        v, _ = self.vwap_multi([45.0] * 10, [[self.STILL] * 7] * 9, {"vwap_max_sessions": 0})
+        self.assertAlmostEqual(t["exit_price"], 49 - 0.02 * 9)
+        v, _ = self.vwap_multi([45.0] * 10, drift, {"vwap_max_sessions": 0})
         self.assertEqual(v[0]["status"], "open")               # off: still held
 
     def last_bar_cross(self):

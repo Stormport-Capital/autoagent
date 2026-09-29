@@ -370,11 +370,14 @@ class Engine:
         for sleeve, t in list(open_tr.items()):
             if b.end <= _dt(t["entry_time"]):
                 continue
-            if sleeve == "VWAP":  # Russo: new high of day stop, daily 10-/20-MA targets
-                stop = max(hod, t["entry_price"])
+            if sleeve == "VWAP":  # Russo: high-of-day stop trailed daily, 10-/20-MA targets
+                stop = self._vwap_stop(t, bars, i)
                 if b.high >= stop:
-                    self._close(t, stop, b.end, f"stop: new high of day {stop:.4g} "
-                                f"({bar_txt}; high reached max(HOD, entry))", s)
+                    gap = b.open > stop  # a stop order fills at the open when it gaps through
+                    px = b.open if gap else stop
+                    self._close(t, px, b.end, f"stop {stop:.4g} (entry-day high, trailed to the "
+                                f"lowest session high since) {'gapped through: filled at the open' if gap else 'hit'}; "
+                                f"{bar_txt}", s)
                     del open_tr[sleeve]
                     continue
                 t = self._vwap_targets(t, b, ma10, ma20, bar_txt, s)
@@ -428,6 +431,23 @@ class Engine:
                         f"high {b.high:.2f} below HOD {hod:.2f}{at_open}; {bar_txt}; "
                         f"filled {fill.how}",
                         stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10))
+
+    def _vwap_stop(self, t: dict, bars: list[Bar], i: int) -> float:
+        """High-of-day stop, never widened: the session high at entry (or the
+        entry price if higher), then lowered each new session to the lowest
+        full-session high since entry - Russo's "trail it down as it rolls
+        over". Rebuilt from the bars every time, so a restart can't lose it."""
+        b, when = bars[i], _dt(t["entry_time"])
+        start = when.astimezone(ET).date()
+        at_entry = [x.high for x in bars[:i] if x.session == start and x.end <= when]
+        if not at_entry:  # entry older than the loaded history
+            return t["stop_price"]
+        stop = max(max(at_entry), t["entry_price"])
+        highs: dict = {}
+        for x in bars[:i]:
+            if start <= x.session < b.session:
+                highs[x.session] = max(highs.get(x.session, x.high), x.high)
+        return min([stop, *highs.values()])
 
     def _vwap_targets(self, t: dict, b: Bar, ma10, ma20, bar_txt: str, s) -> dict | None:
         """Cover into the daily 10-MA, or half there and the rest at the 20-MA
