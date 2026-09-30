@@ -342,6 +342,7 @@ function renderWatch(S) {
       <td><button class="small" data-act="bars" data-sym="${esc(s.symbol)}" title="Every bar the engine used, with EMAs, ATR, VWAP and signals">Bars</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
+        <button class="small" data-act="rename" data-id="${s.id}" data-sym="${esc(s.symbol)}" title="Ticker changed? Move this symbol and its open positions to the new ticker">Rename</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
   }
   $("#watch").innerHTML = h + "</tbody>";
@@ -546,6 +547,16 @@ $("#watch").onclick = async e => {
   if (b.dataset.act === "bars") { window.open(`/api/${BOOK}/bars/${encodeURIComponent(b.dataset.sym)}`, "_blank"); return; }
   if (b.dataset.v === "removed" && !confirm("Remove this symbol? Open tranches are closed at the last price.")) return;
   if (b.dataset.act === "flatten" && !confirm("Close all open tranches for this symbol at the last price?")) return;
+  if (b.dataset.act === "rename") {
+    const sym = prompt(`New ticker for ${b.dataset.sym} (this book only):`);
+    if (!sym) return;
+    const ratio = prompt("Reverse split with the change? Enter N for an N-for-1 reverse split (e.g. 10), or leave 1 for none:", "1");
+    if (ratio === null) return;
+    try { const r = await api(bk(`/api/symbols/${b.dataset.id}/rename`), {symbol: sym, ratio: Number(ratio)});
+          alert(`${r.old} is now ${r.new} in the ${STATE.book.label} book (${r.moved} open tranche(s) moved). Rename it on the other book tabs too.`); }
+    catch (err) { alert(err.message); }
+    return refresh();
+  }
   try { await api(bk(`/api/symbols/${b.dataset.id}/${b.dataset.act}`), b.dataset.act === "status" ? {status: b.dataset.v} : {}); }
   catch (err) { alert(err.message); }
   refresh();

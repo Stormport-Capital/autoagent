@@ -122,8 +122,19 @@ class BrokerSync:
                 pos = {s: int(float(p["qty"])) for s, p in self.broker.positions().items()}
                 busy = {o["symbol"] for o in self.broker.open_orders()}
                 self.needs_followup = False
+                # a renamed ticker waits until the paper account has converted the old one
+                waiting = {r["symbol"]: r["renamed_from"] for r in self.store.q(
+                    "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL")
+                    if pos.get(r["renamed_from"])}
                 for sym in sorted(self.managed() | set(want)):
                     target, cur = want.get(sym, 0), pos.get(sym, 0)
+                    if sym in waiting:
+                        if target != cur:
+                            self.store.log(now, "broker-wait", f"paper still holds "
+                                           f"{waiting[sym]} {pos[waiting[sym]]:+d}; no {sym} order "
+                                           f"until Alpaca converts it (or close {waiting[sym]} "
+                                           f"in the Alpaca app)", sym)
+                        continue
                     if target == cur:
                         continue
                     if sym in busy:

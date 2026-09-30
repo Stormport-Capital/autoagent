@@ -212,6 +212,45 @@ class Engine:
         self.store.log(now, "grade", f"{sym['symbol']} grade {grade} -> risk "
                        f"{GRADES[grade]:g}% (new entries)", sym["symbol"])
 
+    def rename_symbol(self, symbol_id: int, new: str, now: datetime, ratio=1.0) -> dict:
+        """Ticker change (e.g. AIXC -> FFR): the watchlist entry and its OPEN
+        tranches move to the new ticker; closed trades keep the old one.
+        `ratio` > 1 is a reverse split N-for-1: shares / N, prices x N."""
+        new = (new or "").strip().upper()
+        if not SYMBOL_RE.match(new):
+            raise ValidationError(f"invalid symbol {new!r}")
+        try:
+            ratio = float(ratio or 1)
+        except (TypeError, ValueError):
+            raise ValidationError("split ratio must be a number")
+        if not 0.001 <= ratio <= 10000:
+            raise ValidationError("split ratio must be between 0.001 and 10000")
+        sym = self._symbol(symbol_id)
+        old = sym["symbol"]
+        if sym["status"] == "removed":
+            raise ValidationError(f"{old} was removed")
+        if new == old:
+            raise ValidationError("that's already its ticker")
+        if self.store.q("SELECT 1 FROM symbols WHERE symbol=? AND status!='removed'", (new,)):
+            raise ValidationError(f"{new} is already on this book's watchlist - remove it first")
+        with self.store.lock:
+            moved = []
+            for t in self._open(symbol_id):
+                qty = max(1, round(t["qty"] / ratio))
+                scale = lambda v: None if v is None else v * ratio
+                self.store.x("""UPDATE tranches SET symbol=?, qty=?, entry_price=?, stop_price=?,
+                                target_price=? WHERE id=?""",
+                             (new, qty, scale(t["entry_price"]), scale(t["stop_price"]),
+                              scale(t["target_price"]), t["id"]))
+                moved.append(f"{SLEEVE_LABELS[t['sleeve']]} {t['side']} {t['qty']}->{qty}")
+            self.store.x("""UPDATE symbols SET symbol=?, renamed_from=?, snapshot=NULL, error=NULL,
+                            last_price=CASE WHEN last_price IS NULL THEN NULL ELSE last_price*? END
+                            WHERE id=?""", (new, old, ratio, symbol_id))
+            split = f", reverse split {ratio:g}-for-1" if ratio != 1 else ""
+            self.store.log(now, "renamed", f"{old} is now {new}{split}; open tranches moved: "
+                           f"{'; '.join(moved) or 'none'}", new)
+        return {"old": old, "new": new, "moved": len(moved)}
+
     def set_status(self, symbol_id: int, status: str, now: datetime) -> None:
         if status not in ("active", "paused", "removed"):
             raise ValidationError("bad status")

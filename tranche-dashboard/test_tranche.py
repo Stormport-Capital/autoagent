@@ -1118,6 +1118,56 @@ class BrokerSyncTests(unittest.TestCase):
         BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
         self.assertEqual(fb.sent, [("BYE", "buy", 60)])
 
+    def test_rename_moves_open_tranches_and_keeps_history(self):
+        sid = self.add("AIXC")
+        self.tranche("AIXC", "EMA5_10", "short", 100)
+        self.tranche("AIXC", "VWAP", "short", 30)
+        self.store.x("UPDATE tranches SET status='closed', exit_time=? WHERE sleeve='VWAP'",
+                     (self.NOW.isoformat(),))
+        r = self.eng.rename_symbol(sid, "ffr", self.NOW)
+        self.assertEqual(r, {"old": "AIXC", "new": "FFR", "moved": 1})
+        rows = {t["status"]: t for t in self.store.q("SELECT * FROM tranches")}
+        self.assertEqual((rows["open"]["symbol"], rows["open"]["qty"]), ("FFR", 100))
+        self.assertEqual(rows["closed"]["symbol"], "AIXC")   # history keeps the old ticker
+        sym = self.store.q("SELECT * FROM symbols WHERE id=?", (sid,))[0]
+        self.assertEqual((sym["symbol"], sym["renamed_from"]), ("FFR", "AIXC"))
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE kind='renamed'"))
+
+    def test_rename_with_reverse_split_scales_shares_and_prices(self):
+        sid = self.add("RSP")
+        self.tranche("RSP", "EMA10_20", "long", 105)
+        self.eng.rename_symbol(sid, "RSPN", self.NOW, ratio=10)
+        t = self.store.q("SELECT * FROM tranches")[0]
+        self.assertEqual(t["qty"], 10)                        # 105 / 10 rounds to 10
+        self.assertAlmostEqual(t["entry_price"], 100)
+        self.assertAlmostEqual(t["stop_price"], 110)
+
+    def test_rename_validation(self):
+        sid = self.add("OLD")
+        self.add("TAKEN")
+        for new, ratio in (("", 1), ("bad ticker!", 1), ("OLD", 1), ("TAKEN", 1), ("NEW", 0)):
+            with self.assertRaises(ValidationError, msg=(new, ratio)):
+                self.eng.rename_symbol(sid, new, self.NOW, ratio=ratio if ratio else -5)
+        self.store.x("UPDATE symbols SET status='removed' WHERE id=?", (sid,))
+        with self.assertRaises(ValidationError):
+            self.eng.rename_symbol(sid, "NEW", self.NOW)
+
+    def test_renamed_symbol_waits_while_paper_holds_old_ticker(self):
+        sid = self.add("AIXC")
+        self.tranche("AIXC", "EMA5_10", "short", 100)
+        self.eng.rename_symbol(sid, "FFR", self.NOW)
+        fb = FakeBroker(positions={"AIXC": -100})
+        sync = BrokerSync(self.store, fb, fill_wait_s=0)
+        sync.sync(self.NOW)
+        self.assertEqual(fb.sent, [])                         # no FFR short, no AIXC cover
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE kind='broker-wait'"))
+        fb.pos = {"FFR": -100}                                # Alpaca converted it
+        sync.sync(self.NOW)
+        self.assertEqual(fb.sent, [])
+        fb.pos = {}                                           # or: old ticker closed by hand
+        sync.sync(self.NOW)
+        self.assertEqual(fb.sent, [("FFR", "sell", 100)])
+
     def test_status_reports_mismatch(self):
         self.add("MIS")
         self.tranche("MIS", "EMA5_10", "long", 10)

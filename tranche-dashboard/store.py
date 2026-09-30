@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     last_price REAL,
     snapshot TEXT,                          -- JSON: latest indicator readings
     error TEXT,
-    grade TEXT                              -- A+ / A / B / C, or NULL = custom risk %
+    grade TEXT,                             -- A+ / A / B / C, or NULL = custom risk %
+    renamed_from TEXT                       -- previous ticker after a symbol change
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
@@ -109,6 +110,8 @@ class Store:
         scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
         if "grade" not in scols:  # databases created before trade grades
             self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")
+        if "renamed_from" not in scols:  # databases created before ticker renames
+            self.db.execute("ALTER TABLE symbols ADD COLUMN renamed_from TEXT")
         self.db.commit()
 
     # -- generic helpers -------------------------------------------------
