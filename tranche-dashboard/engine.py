@@ -558,10 +558,11 @@ class Engine:
         part_id = self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
                entry_price, stop_price, target_price, risk_dollars, fee_through, borrow_fees,
-               scaled, trigger) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+               scaled, trigger, grade, note, tags) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)""",
             (t["symbol_id"], t["symbol"], t["sleeve"], t["side"], qty, t["entry_time"],
              t["entry_price"], t["stop_price"], t["target_price"], t["risk_dollars"] * frac,
-             t["fee_through"], fees, t.get("trigger")))
+             t["fee_through"], fees, t.get("trigger"), t.get("grade"), t.get("note"),
+             t.get("tags")))
         self._close({**t, "id": part_id, "qty": qty}, price, when, reason, s)
         rest = {**t, "qty": t["qty"] - qty, "risk_dollars": t["risk_dollars"] * (1 - frac),
                 "borrow_fees": t["borrow_fees"] - fees, "scaled": 1}
@@ -639,10 +640,10 @@ class Engine:
             return
         self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
-               entry_price, stop_price, target_price, risk_dollars, fee_through, trigger)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               entry_price, stop_price, target_price, risk_dollars, fee_through, trigger, grade)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sym["id"], name, sleeve, side, qty, f.when.isoformat(), fill, stop, target,
-             qty * dist, f.session.isoformat(), trigger))
+             qty * dist, f.session.isoformat(), trigger, sym.get("grade")))
         note = " (capped by max leverage)" if capped else ""
         tgt = f", target {target:.2f}" if target is not None else ""
         self.store.log(f.when, "entry",

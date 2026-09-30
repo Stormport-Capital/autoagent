@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS tranches (
     target_price REAL,                      -- VWAP tranche: daily 10-MA (20-MA once scaled)
     scaled INTEGER NOT NULL DEFAULT 0,      -- VWAP tranche: half already covered at the 10-MA
     trigger TEXT,                           -- VWAP tranche: 'fail' (Trigger B) or 'open_fade' 
+    grade TEXT,                             -- the symbol's grade when this tranche opened
+    note TEXT,                              -- Trade Review journal: free-text note
+    tags TEXT,                              -- Trade Review journal: comma-separated tags
     risk_dollars REAL NOT NULL,
     fee_through TEXT NOT NULL,              -- last date borrow fee was charged
     borrow_fees REAL NOT NULL DEFAULT 0,
@@ -87,6 +90,19 @@ CREATE TABLE IF NOT EXISTS broker_equity (
     ts TEXT PRIMARY KEY,
     equity REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS day_notes (   -- Trade Review: one note per trading day
+    day TEXT PRIMARY KEY,
+    note TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS profiles (    -- Trade Review: cached company profile per ticker
+    symbol TEXT PRIMARY KEY,
+    sector TEXT,
+    industry TEXT,
+    market_cap REAL,
+    float_shares REAL,
+    fetched_at TEXT NOT NULL,
+    error TEXT
+);
 CREATE TABLE IF NOT EXISTS equity (
     ts TEXT PRIMARY KEY,
     equity REAL NOT NULL
@@ -107,6 +123,9 @@ class Store:
             self.db.execute("ALTER TABLE tranches ADD COLUMN trigger TEXT")
         if "scaled" not in cols:  # databases created before the 10/20-MA scale-out
             self.db.execute("ALTER TABLE tranches ADD COLUMN scaled INTEGER NOT NULL DEFAULT 0")
+        for col in ("grade", "note", "tags"):  # databases created before the Trade Review page
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE tranches ADD COLUMN {col} TEXT")
         scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
         if "grade" not in scols:  # databases created before trade grades
             self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")

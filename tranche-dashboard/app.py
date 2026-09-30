@@ -42,6 +42,7 @@ from data import make_provider, redact
 from engine import SLEEVE_LABELS, Engine, ValidationError
 from data import CachedProvider
 from indicators import ET, RTH_OPEN, session_bar_ends
+from review import ProfileCache, review_payload, save_day_note, save_journal
 from store import Store
 
 HERE = Path(__file__).parent
@@ -386,6 +387,8 @@ def check_auth(header: str | None, password: str | None) -> bool:
 def make_handler(books: dict, provider_name: str, demo, backups=None):
     password = os.environ.get("TRANCHE_PASSWORD") or None
     ordered = list(books.values())
+    profiles = ProfileCache(ordered[0].engine.store)
+    review_books = lambda: [(b.key, b.label, b.engine.store) for b in ordered]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep the console quiet
@@ -431,6 +434,11 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
             if self.path == "/guide":
                 return self._send(200, (HERE / "static" / "guide.html").read_bytes(),
                                   "text/html; charset=utf-8")
+            if self.path == "/review":
+                return self._send(200, (HERE / "static" / "review.html").read_bytes(),
+                                  "text/html; charset=utf-8")
+            if self.path == "/api/review/trades":
+                return self._send(200, review_payload(review_books(), profiles))
             book, rest = self._route()
             if book and rest == "/state":
                 st = build_state(book, ordered, provider_name, demo)
@@ -486,6 +494,19 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
             if self.path == "/api/demo/pause" and demo:
                 demo.paused = not demo.paused
                 return self._send(200, {"ok": True})
+            if self.path in ("/api/review/journal", "/api/review/day"):
+                try:
+                    body = self._body()
+                    if self.path.endswith("/day"):
+                        save_day_note(ordered[0].engine.store, body.get("day"), body.get("note"))
+                        return self._send(200, {"ok": True})
+                    if body.get("book") not in books:
+                        raise ValidationError("unknown book")
+                    return self._send(200, save_journal(books[body["book"]].engine.store,
+                                                        int(body.get("id") or 0),
+                                                        body.get("note"), body.get("tags")))
+                except (ValidationError, ValueError) as e:
+                    return self._send(400, {"error": str(e)})
             book, rest = self._route()
             if book is None:
                 return self._send(404, {"error": "not found"})

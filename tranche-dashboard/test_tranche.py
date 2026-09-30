@@ -10,6 +10,7 @@ from datetime import date, datetime, time, timedelta
 
 from broker import AlpacaPaper, BrokerError, BrokerSync
 import app
+import review
 from app import bar_for_boundary, boundaries
 from engine import Engine, ValidationError, vwap_fail
 from indicators import (ET, Bar, atr, bar_bucket, cross_adverse_moves, crossed_below,
@@ -1178,6 +1179,207 @@ class BrokerSyncTests(unittest.TestCase):
     def test_sync_setting_is_boolean(self):
         self.assertFalse(self.store.settings()["broker_sync_enabled"])
         self.assertTrue(self.eng.update_settings({"broker_sync_enabled": True})["broker_sync_enabled"])
+
+
+class ReviewTests(unittest.TestCase):
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(os.path.join(self.dir.name, f"{k}.db")) for k in ("1h", "15m")}
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    def books(self):
+        return [("1h", "Hourly", self.stores["1h"]), ("15m", "15-min", self.stores["15m"])]
+
+    def trade(self, book, sym, side="short", sleeve="VWAP", entry=10.0, exit_=9.0, qty=100,
+              opened=None, closed=None, reason="target: daily 10-MA 9", grade="A", fees=5.0,
+              trigger=None):
+        st = self.stores[book]
+        sid = (st.q("SELECT id FROM symbols WHERE symbol=?", (sym,)) or [{}])[0].get("id")
+        if sid is None:
+            sid = st.x("INSERT INTO symbols (symbol, mode, risk_pct, added_at, grade) "
+                       "VALUES (?, 'long_short', 1, ?, 'C')", (sym, self.NOW.isoformat()))
+        opened = opened or self.NOW
+        closed = closed or self.NOW + timedelta(hours=2)
+        gross = (entry - exit_) * qty * (1 if side == "short" else -1)
+        return st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                       entry_price, stop_price, risk_dollars, fee_through, borrow_fees, exit_time,
+                       exit_price, exit_reason, gross_pnl, status, grade, trigger)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'closed',?,?)""",
+                    (sid, sym, sleeve, side, qty, opened.isoformat(), entry, entry + 1, 100.0,
+                     "2026-09-21", fees, closed.isoformat(), exit_, reason, gross, grade, trigger))
+
+    def test_exit_types_and_tiers(self):
+        self.assertEqual(review.exit_type("manual flatten"), "Manual (flatten/remove)")
+        self.assertEqual(review.exit_type("symbol removed"), "Manual (flatten/remove)")
+        self.assertEqual(review.exit_type("stop 5.2 (entry-day high, trailed"), "Stop")
+        self.assertEqual(review.exit_type("target 2: daily 20-MA 4"), "Target 2 (20-MA)")
+        self.assertEqual(review.exit_type("target: daily 10-MA 4 - half covered"), "Target (10-MA)")
+        self.assertEqual(review.exit_type("time stop: held 10 sessions"), "Time stop")
+        self.assertEqual(review.exit_type("5/10 EMA crossed up (bar 10:30)"), "Opposite cross")
+        self.assertEqual(review.cap_tier(40e6), "Nano (<$50M)")
+        self.assertEqual(review.cap_tier(None), "Unknown")
+        self.assertEqual(review.float_tier(9e6), "Low (<10M)")
+        self.assertEqual(review.price_tier(0.8), "under $1")
+        self.assertEqual(review.time_bucket(datetime(2026, 9, 21, 10, 32, tzinfo=ET)), "10:30-11:00")
+        self.assertEqual(review.sessions_held(date(2026, 9, 18), date(2026, 9, 21)), 2)  # Fri->Mon
+        self.assertEqual(review.hold_bucket(30, 1), "Under 1 hour")
+        self.assertEqual(review.hold_bucket(300, 1), "Same day")
+
+    def test_trades_from_all_books_with_derived_fields(self):
+        self.trade("1h", "AAA", trigger="open_fade")
+        self.trade("15m", "BBB", side="long", sleeve="EMA5_10", entry=10, exit_=9, grade=None,
+                   reason="5/10 EMA crossed down", closed=self.NOW + timedelta(days=3))
+        rows = review.closed_trades(self.books(), {"AAA": {"sector": "Technology", "market_cap": 30e6,
+                                                           "float_shares": 4e6}})
+        self.assertEqual([r["symbol"] for r in rows], ["AAA", "BBB"])
+        a, b = rows
+        self.assertEqual((a["book"], a["strategy"]), ("1h", "VWAP fail (Russo) - opening fade"))
+        self.assertAlmostEqual(a["net"], 95.0)                  # 100 gross - 5 borrow
+        self.assertAlmostEqual(a["r"], 0.95)
+        self.assertEqual((a["sector"], a["cap_tier"], a["float_tier"]),
+                         ("Technology", "Nano (<$50M)", "Low (<10M)"))
+        self.assertEqual((a["grade"], a["grade_at_entry"]), ("A", True))
+        self.assertEqual((b["grade"], b["grade_at_entry"]), ("C", False))   # symbol's current grade
+        self.assertEqual((b["exit_type"], b["sessions"], b["sector"]), ("Opposite cross", 4, "Unknown"))
+        self.assertAlmostEqual(b["net"], -105.0)
+
+    def test_journal_and_day_notes(self):
+        tid = self.trade("15m", "TJGC")
+        st = self.stores["15m"]
+        r = review.save_journal(st, tid, "  chased the open ", "Offering, chased, offering")
+        self.assertEqual(r, {"note": "chased the open", "tags": ["offering", "chased"]})
+        row = review.closed_trades(self.books(), {})[0]
+        self.assertEqual((row["note"], row["tags"]), ("chased the open", ["offering", "chased"]))
+        with self.assertRaises(ValidationError):
+            review.save_journal(st, tid, "", "bad<tag>")
+        with self.assertRaises(ValidationError):
+            review.save_journal(st, 9999, "x", "")
+        review.save_journal(st, tid, "", "")
+        self.assertEqual(st.q("SELECT note, tags FROM tranches")[0], {"note": None, "tags": None})
+        hub = self.stores["1h"]
+        review.save_day_note(hub, "2026-09-21", "chop day")
+        self.assertEqual(review.day_notes(hub), {"2026-09-21": "chop day"})
+        review.save_day_note(hub, "2026-09-21", "  ")
+        self.assertEqual(review.day_notes(hub), {})
+        with self.assertRaises(ValidationError):
+            review.save_day_note(hub, "21/09/2026", "x")
+
+    def test_partial_close_keeps_grade_and_journal(self):
+        eng = Engine(self.stores["1h"], ScriptedProvider([]))
+        tid = self.trade("1h", "PRT")
+        st = self.stores["1h"]
+        st.x("UPDATE tranches SET status='open', exit_time=NULL, note='n', tags='x' WHERE id=?", (tid,))
+        t = st.q("SELECT * FROM tranches WHERE id=?", (tid,))[0]
+        eng._partial_close(t, 50, 9.0, self.NOW, "target: half", st.settings())
+        part = st.q("SELECT * FROM tranches WHERE id!=?", (tid,))[0]
+        self.assertEqual((part["grade"], part["note"], part["tags"]), ("A", "n", "x"))
+
+    def test_entry_records_grade(self):
+        st = self.stores["1h"]
+        st.save_settings({"slippage_bps": 0.0})
+        eng = Engine(st, ScriptedProvider([]))
+        eng.add_symbols("GRD", "short_only", 1, self.NOW, grade="A+")
+        sym = st.q("SELECT * FROM symbols")[0]
+        from engine import Fill
+        eng._enter(sym, "VWAP", "short", Fill(10.0, self.NOW, self.NOW.date(), "close"), None,
+                   st.settings(), "test", stop_level=11.0)
+        self.assertEqual(st.q("SELECT grade FROM tranches")[0]["grade"], "A+")
+
+    def test_profile_cache_fetches_once_and_retries_errors(self):
+        calls = []
+
+        class Fetch:
+            def fetch(self, s):
+                calls.append(s)
+                if s == "GONE":
+                    raise RuntimeError("FMP has no profile")
+                return {"sector": "Healthcare", "industry": "Biotech", "market_cap": 2e8,
+                        "float_shares": 3e7}
+        cache = review.ProfileCache(self.stores["1h"], Fetch())
+        t0 = datetime(2026, 9, 21, tzinfo=ET)
+        self.assertEqual(cache.refresh(["AAA", "GONE"], t0), 2)
+        self.assertEqual(cache.refresh(["AAA", "GONE"], t0 + timedelta(hours=2)), 0)
+        self.assertEqual(cache.refresh(["AAA", "GONE"], t0 + timedelta(days=2)), 1)  # error retried daily
+        self.assertEqual(calls, ["AAA", "GONE", "GONE"])
+        self.assertEqual(cache.all()["AAA"]["sector"], "Healthcare")
+        self.assertIn("no FMP profile", cache.status())
+
+    def test_fmp_profile_parsing(self):
+        class Resp:
+            def __init__(self, body):
+                self.status_code, self.body = 200, body
+
+            def json(self):
+                return self.body
+
+        class Http:
+            def get(self, url, params=None, timeout=None):
+                if "float" in url:
+                    return Resp([{"symbol": "AAA", "floatShares": 1234567}])
+                return Resp([{"symbol": "AAA", "sector": "Technology", "industry": "Software",
+                              "marketCap": 45600000}])
+        p = review.FmpProfiles("k", Http()).fetch("AAA")
+        self.assertEqual(p, {"sector": "Technology", "industry": "Software",
+                             "market_cap": 45600000.0, "float_shares": 1234567.0})
+
+    def test_http_routes(self):
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        tid = self.trade("15m", "AAA")
+
+        class B:
+            def __init__(s, key, label, store):
+                s.key, s.label = key, label
+                s.engine = Engine(store, ScriptedProvider([]))
+        books = {k: B(k, l, st) for k, l, st in self.books()}
+        old = os.environ.pop("TRANCHE_PASSWORD", None)
+        oldkey = os.environ.pop("FMP_API_KEY", None)
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(books, "demo", None))
+        finally:
+            if old is not None:
+                os.environ["TRANCHE_PASSWORD"] = old
+            if oldkey is not None:
+                os.environ["FMP_API_KEY"] = oldkey
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def call(path, body=None):
+            req = urllib.request.Request(base + path, method="GET" if body is None else "POST",
+                                         data=None if body is None else _json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+        try:
+            code, page = call("/review")
+            self.assertEqual(code, 200)
+            self.assertIn(b"Trade Review", page)
+            code, body = call("/api/review/trades")
+            data = _json.loads(body)
+            self.assertEqual([t["symbol"] for t in data["trades"]], ["AAA"])
+            self.assertIn("FMP_API_KEY", data["profiles_note"])
+            code, body = call("/api/review/journal", {"book": "15m", "id": tid, "note": "x", "tags": "a, b"})
+            self.assertEqual((code, _json.loads(body)["tags"]), (200, ["a", "b"]))
+            code, _ = call("/api/review/journal", {"book": "nope", "id": tid})
+            self.assertEqual(code, 400)
+            code, _ = call("/api/review/day", {"day": "2026-09-21", "note": "ok"})
+            self.assertEqual(code, 200)
+            self.assertEqual(_json.loads(call("/api/review/trades")[1])["day_notes"],
+                             {"2026-09-21": "ok"})
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class DotenvTest(unittest.TestCase):

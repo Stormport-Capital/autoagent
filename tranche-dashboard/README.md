@@ -115,6 +115,24 @@ Each tranche gets one third of that budget.
   ticker, closed trades keep the old one, optional reverse-split ratio), or reset
   the whole portfolio (the only action that deletes history, after a backup).
 
+## Trade Review page
+
+The **Trade Review** button (next to the book tabs) opens `/review`: every closed
+trade from all three books, with filters (book, dates, strategy, side, symbol,
+grade, exit type, sector, tag), KPI tiles (net P&L, win rate, profit factor,
+expectancy in $ and R, payoff, best/worst, drawdown, hold), a cumulative P&L
+curve, a P&L calendar with per-day review notes, an R-multiple histogram,
+breakdowns by strategy / book / symbol / side / grade / exit type / time of day /
+weekday / hold time / price / sector / market cap / float / tag, rule-based
+findings, and a sortable trade list where each trade takes a note and tags. CSV
+download of the filtered trades.
+
+It is read-only over the model: notes and tags live in each book's `tranches`
+table, day notes and the FMP company-profile cache in the hourly book's
+database (`day_notes`, `profiles`). Grade is recorded on each trade at entry.
+Sector, market cap and float are FMP's current values (not point-in-time) and
+need `FMP_API_KEY`. Code: `review.py`, `static/review.html`.
+
 ## Exporting trades (TradesViz)
 
 On the **Closed trades** tab, pick a date range and click **Download CSV**. The
@@ -145,6 +163,8 @@ closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&
 - `store.py` — SQLite state (`tranche.db`), including settings defaults
 - `app.py` — web server and the hourly scheduler
 - `static/index.html` — the dashboard page
+- `review.py`, `static/review.html` — the Trade Review page (stats, calendar, journal)
+- `static/guide.html` — the in-app Guide
 - `test_tranche.py` — offline tests
 
 Locally the server binds to `127.0.0.1`. Set `TRANCHE_PASSWORD` in `.env` to

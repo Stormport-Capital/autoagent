@@ -48,6 +48,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
   <a href="#map">The screen</a>
   <a href="#buttons">Every button</a>
   <a href="#howto">How to…</a>
+  <a href="#review">Trade Review</a>
   <a href="#rules">What the bot does</a>
   <a href="#read">Reading the numbers</a>
   <a href="#donts">Don'ts</a>
@@ -74,14 +75,14 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 </ol>
 <h3>After the close</h3>
 <ol class="steps">
-  <li>Review <b>Closed trades</b> and <b>Performance by tranche</b> on each tab.</li>
+  <li>Open <span class="btn">Trade Review</span>, click today on the calendar, skim the trades, tag anything notable and write a one-line day note (<a href="#review">how</a>).</li>
   <li>Optional: export to TradesViz (<a href="#tradesviz">how</a>).</li>
   <li>The backup runs by itself after 4:10 PM.</li>
 </ol>
 <h3>Weekly</h3>
 <ol class="steps">
   <li>Clean the watchlist: remove names that no longer fit.</li>
-  <li>Compare the three books' <b>Performance by tranche</b> tables to see which timeframe/tranche is paying.</li>
+  <li>Trade Review → <b>7D</b> or <b>30D</b>: read <i>What the numbers say</i>, then the Breakdown tabs <b>Strategy</b>, <b>Book</b>, <b>Symbol</b>, <b>Time of day</b> and <b>Exit type</b> (<a href="#review">the 30-minute review</a>).</li>
   <li>Optional: <span class="btn">Download backup</span> on each tab to keep a copy on your PC.</li>
 </ol>
 
@@ -106,6 +107,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 <tr><td>Book tab</td><td>top</td><td>Switches which book you're looking at and editing. Doesn't change any trade.</td></tr>
 <tr><td><span class="btn">Check now</span></td><td>top right</td><td>Runs this book's check immediately (fetches bars, acts on any completed bar). Safe: it never doubles a trade. You never need it in normal use.</td></tr>
 <tr><td><span class="btn">Guide</span></td><td>top right</td><td>This page.</td></tr>
+<tr><td><span class="btn">Trade Review</span></td><td>top, next to the book tabs</td><td>Opens the review page: every closed trade from all three books, with stats, a P&amp;L calendar, breakdowns and your notes/tags. Read-only except your notes; it never changes a trade.</td></tr>
 <tr><td>Download backup</td><td>status line</td><td>Saves a copy of this book's database to your computer.</td></tr>
 <tr><td>Short only / Long &amp; short</td><td>Add symbols</td><td>For the two EMA tranches only. Short only: shorts on a down-cross, goes flat on an up-cross. Long &amp; short: flips between long and short on each cross. The VWAP tranche is always short.</td></tr>
 <tr><td>Trade grade</td><td>Add symbols</td><td>Risk for the whole symbol: A+ 3%, A 2%, B 1.5%, C 1% of equity, split across the 3 tranches. "Custom" uses the slider (0.5–3%).</td></tr>
@@ -143,6 +145,37 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 <p>Book tab → Portfolio settings → change → <span class="btn">Save settings</span>. Only that book changes.</p>
 <h3>See why a trade happened</h3>
 <p>Bottom tab <b>Signal log</b>: every entry, exit and skip with the bar and the numbers. <b>Closed trades</b> shows each exit's reason.</p>
+
+<h2 id="review">Trade Review page</h2>
+<p>Everything on it follows the filter bar at the top. <b>Dates are the day a trade closed</b> (when its P&amp;L became real). Open positions aren't included; they're on each book tab.</p>
+<table>
+<tr><th>Part</th><th>What it shows / does</th></tr>
+<tr><td>Filters</td><td>Book (All / Hourly / 15-min / 5-min), date presets or From/To, Strategy, Side, Symbol, Grade, Exit, Sector, Tag. <span class="btn">Clear filters</span> resets. Filters added by clicking a Breakdown row show as chips under the bar; × removes one.</td></tr>
+<tr><td>Tiles</td><td>Net P&amp;L (after borrow fees), trades W/L, win rate, profit factor (gross wins ÷ gross losses), expectancy ($ and R per trade), average win/loss and payoff, best/worst trade, max drawdown of the closed-trade P&amp;L, average hold.</td></tr>
+<tr><td>Cumulative P&amp;L</td><td>Running total, trade by trade. Hover for each trade.</td></tr>
+<tr><td>What the numbers say</td><td>Plain-language findings computed from the filtered trades: sample-size warning, the symbol causing most losing dollars, best/worst strategy, timeframe and entry window, grade comparison, your manual exits vs rule exits, long vs short, worst/best day. Rules, not AI.</td></tr>
+<tr><td>P&amp;L calendar</td><td>Each weekday's net P&amp;L and trade count, weekly totals on the right. Click a day to filter to it and write that day's review note (✎ marks days with a note). Click it again, or <span class="btn">Show all days</span>, to go back.</td></tr>
+<tr><td>R-multiple distribution</td><td>How big wins and losses were relative to the risk planned at entry. Losses past −1R mean a trade lost more than planned (gaps, or EMA trades, which have no stop).</td></tr>
+<tr><td>Breakdown</td><td>Pick a dimension: Strategy, Book, Symbol, Side, Grade, Exit type, Time of day (entry, 30-min), Weekday, Hold time, Price, Sector, Market cap, Float, Tag. Click a row to filter everything to it. <span class="pill">small sample</span> = under 30 trades.</td></tr>
+<tr><td>Trades</td><td>Click a column to sort. Click a trade to see why it closed, its risk and fees, the company profile, and to add a <b>note</b> and <b>tags</b> → <span class="btn">Save</span>.</td></tr>
+<tr><td><span class="btn">Download CSV</span></td><td>The filtered trades with every field, one row per trade.</td></tr>
+</table>
+<h3>Things to know</h3>
+<ul>
+<li><b>Tags are yours.</b> Use them for what the bot can't know: catalyst (offering, earnings, PR), your view (chased, would have held, bad fill). Then filter by Tag or use the Tag breakdown.</li>
+<li><b>Grade</b> is the grade the symbol had when the trade opened. Trades opened before this page existed show the symbol's current grade, marked with *.</li>
+<li><b>Sector, market cap and float</b> come from FMP (needs <code>FMP_API_KEY</code>) and are <b>today's</b> values, not the trade date's; diluting small caps change fast. The first visit looks them up in the background; refresh after a minute. "Unknown" means FMP had nothing (often a renamed or delisted ticker).</li>
+<li>A VWAP scale-out is two rows: the half covered at the 10-day MA and the rest.</li>
+<li>Remove keeps a symbol's trades here; only <b>Reset portfolio</b> deletes them.</li>
+</ul>
+<h3>A 30-minute weekly review</h3>
+<ol class="steps">
+<li>Set <b>7D</b>. Read the tiles and <i>What the numbers say</i>.</li>
+<li>Breakdown → <b>Symbol</b>: is one name doing most of the damage? Pause it in the books where it chops.</li>
+<li>Breakdown → <b>Strategy</b> and <b>Book</b>: which tranche and timeframe are paying?</li>
+<li>Breakdown → <b>Time of day</b> and <b>Exit type</b>: when do entries work, and do your manual exits help or hurt?</li>
+<li>Filter by your tags (e.g. <i>chased</i>) and note what they cost. Write the week's takeaway as a day note.</li>
+</ol>
 
 <h2 id="rules">What the bot does by itself</h2>
 <div class="wrap"><table>
