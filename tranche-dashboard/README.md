@@ -110,7 +110,9 @@ Each tranche gets one third of that budget.
   same day pays no borrow.
 - **Costs:** 5 bps slippage on each side by default. No commissions.
 - **Controls:** pause a symbol (open tranches are still managed, but no new
-  entries), flatten a symbol, remove it (flattens first; its closed trades stay
+  entries), close by end of day (per symbol: trades all session, no new entries
+  from 15:55 ET, flat at the 15:55 5-minute close, nothing overnight; every book
+  gets an extra 15:55 check for it), flatten a symbol, remove it (flattens first; its closed trades stay
   in the history), rename it after a ticker change (open tranches move to the new
   ticker, closed trades keep the old one, optional reverse-split ratio), or reset
   the whole portfolio (the only action that deletes history, after a backup).

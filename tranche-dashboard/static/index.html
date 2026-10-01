@@ -148,6 +148,9 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
             <label><input type="checkbox" id="toBook15m" checked>15-min book</label>
             <label><input type="checkbox" id="toBook5m" checked>5-min book</label>
           </div>
+          <div class="checks" style="margin-top:8px">
+            <label title="Trades long and short all day, takes no new entries from 3:55 PM ET and is flat at the 3:55 close. Nothing held overnight."><input type="checkbox" id="eodNew">Close by end of day (no overnight)</label>
+          </div>
           <div style="margin-top:10px"><button class="primary" type="submit">Add to watchlist</button></div>
           <div class="msg" id="addMsg"></div>
         </form>
@@ -341,7 +344,7 @@ function renderWatch(S) {
     const stack = n.ema5 == null ? "warming up" :
       `<span title="${n.ema5 < n.ema10 ? "5 below 10" : "5 above 10"}; ${n.ema10 < n.ema20 ? "10 below 20" : "10 above 20"}">${num(n.ema5)} / ${num(n.ema10)} / ${num(n.ema20)}</span>`;
     const below = n.vwap != null && s.last_price != null && s.last_price < n.vwap;
-    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}
+    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}
         ${s.error ? `<div class="err-text">${esc(s.error)}</div>` : ""}</td>
       <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} ·
         <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
@@ -356,6 +359,7 @@ function renderWatch(S) {
       <td class="${cls(s.unrealized)}">${signed(s.unrealized)}</td>
       <td><button class="small" data-act="bars" data-sym="${esc(s.symbol)}" title="Every bar the engine used, with EMAs, ATR, VWAP and signals">Bars</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
+        <button class="small" data-act="eod" data-id="${s.id}" data-on="${s.eod_close ? 0 : 1}" title="${s.eod_close ? "Stop closing at end of day (positions may be held overnight again)" : "Trade all day, then be flat at the 3:55 PM close every session"}">${s.eod_close ? "EOD close: on" : "EOD close: off"}</button>
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
         <button class="small" data-act="rename" data-id="${s.id}" data-sym="${esc(s.symbol)}" title="Ticker changed? Move this symbol and its open positions to the new ticker">Rename</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
@@ -597,7 +601,7 @@ $("#addForm").onsubmit = async e => {
     if (!targets.length) throw new Error("Tick at least one book to add to.");
     const body = {symbols: $("#symbols").value,
       mode: document.querySelector("input[name=mode]:checked").value, risk_pct: Number($("#risk").value),
-      grade: $("#grade").value};
+      grade: $("#grade").value, eod_close: $("#eodNew").checked};
     const done = [];
     for (const [k, label] of targets) {
       try { const r = await api(`/api/${k}/symbols`, body); done.push(`${label}: ${r.added.join(", ")}`); }
@@ -636,6 +640,10 @@ $("#watch").onclick = async e => {
     try { const r = await api(bk(`/api/symbols/${b.dataset.id}/rename`), {symbol: sym, ratio: Number(ratio)});
           alert(`${r.old} is now ${r.new} in the ${STATE.book.label} book (${r.moved} open tranche(s) moved). Rename it on the other book tabs too.`); }
     catch (err) { alert(err.message); }
+    return refresh();
+  }
+  if (b.dataset.act === "eod") {
+    try { await api(bk(`/api/symbols/${b.dataset.id}/eod`), {on: b.dataset.on === "1"}); } catch (err) { alert(err.message); }
     return refresh();
   }
   try { await api(bk(`/api/symbols/${b.dataset.id}/${b.dataset.act}`), b.dataset.act === "status" ? {status: b.dataset.v} : {}); }

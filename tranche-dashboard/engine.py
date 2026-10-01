@@ -63,6 +63,13 @@ GRADES = {"A+": 3.0, "A": 2.0, "B": 1.5, "C": 1.0}
 EMA_RISK_PCTL = 0.75
 EMA_MIN_SAMPLES = 5
 STALE_WAIT = timedelta(minutes=20)
+# "Close by end of day" symbols: no new entries from this time, and every open
+# tranche is covered/sold at the close of the 5-minute bar ending here.
+EOD_CUTOFF = time(15, 55)
+
+
+def eod_cutoff(day: date) -> datetime:
+    return datetime.combine(day, EOD_CUTOFF, tzinfo=ET)
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
 SETTING_BOUNDS = {
@@ -170,7 +177,7 @@ class Engine:
         return self.store.settings()
 
     def add_symbols(self, raw: str, mode: str, risk_pct, now: datetime,
-                    grade: str | None = None) -> list[str]:
+                    grade: str | None = None, eod_close: bool = False) -> list[str]:
         if mode not in ("short_only", "long_short"):
             raise ValidationError("mode must be short_only or long_short")
         if grade in GRADES:
@@ -192,11 +199,14 @@ class Engine:
             if self.store.q("SELECT 1 FROM symbols WHERE symbol=? AND status!='removed'", (sym,)):
                 continue
             self.store.x(
-                "INSERT INTO symbols (symbol, mode, risk_pct, added_at, grade) VALUES (?,?,?,?,?)",
-                (sym, mode, risk, now.isoformat(), grade if grade in GRADES else None))
+                "INSERT INTO symbols (symbol, mode, risk_pct, added_at, grade, eod_close) "
+                "VALUES (?,?,?,?,?,?)",
+                (sym, mode, risk, now.isoformat(), grade if grade in GRADES else None,
+                 1 if eod_close else 0))
             g = f"grade {grade}, " if grade in GRADES else ""
+            e = ", close by end of day" if eod_close else ""
             self.store.log(now, "added", f"watching {sym}: {mode.replace('_', ' ')}, "
-                           f"{g}risk {risk:g}% of equity", sym)
+                           f"{g}risk {risk:g}% of equity{e}", sym)
             added.append(sym)
         if not added:
             raise ValidationError("no new symbols to add")
@@ -211,6 +221,17 @@ class Engine:
                      (grade, GRADES[grade], symbol_id))
         self.store.log(now, "grade", f"{sym['symbol']} grade {grade} -> risk "
                        f"{GRADES[grade]:g}% (new entries)", sym["symbol"])
+
+    def set_eod_close(self, symbol_id: int, on: bool, now: datetime) -> None:
+        """Day-trade mode: the symbol still trades all session, but takes no new
+        entries from 15:55 ET and is flat at the 15:55 5-minute close."""
+        sym = self._symbol(symbol_id)
+        if sym["status"] == "removed":
+            raise ValidationError(f"{sym['symbol']} was removed")
+        self.store.x("UPDATE symbols SET eod_close=? WHERE id=?", (1 if on else 0, symbol_id))
+        self.store.log(now, "eod", f"{sym['symbol']}: close by end of day "
+                       f"{'ON - flat by the 15:55 close every session' if on else 'OFF - positions may be held overnight'}",
+                       sym["symbol"])
 
     def rename_symbol(self, symbol_id: int, new: str, now: datetime, ratio=1.0) -> dict:
         """Ticker change (e.g. AIXC -> FFR): the watchlist entry and its OPEN
@@ -371,11 +392,15 @@ class Engine:
                     break  # before the next open: wait for the 9:30 check
             else:
                 fill = Fill(b.close, b.end, b.session, f"at the bar close {b.close:.4g}")
+            if sym.get("eod_close"):
+                self._eod_sweep(sym, five, s, before=b.end)  # an outage spanned a 15:55
             if fill.when > added:
                 self._process_bar(sym, bars, five, i, ind, s, fill)
             last = b.end
             self.store.x("UPDATE symbols SET last_bar_end=?, last_price=? WHERE id=?",
                          (last.isoformat(), fill.price, sym["id"]))
+        if sym.get("eod_close"):
+            self._eod_sweep(sym, five, s, now=now)
         # live readings for the dashboard (latest 5-minute print, today's VWAP)
         latest = five[-1] if five else bars[-1]
         vwap_now = session_vwap(five, latest.session, latest.end)
@@ -388,6 +413,34 @@ class Engine:
         }
         self.store.x("UPDATE symbols SET last_price=?, snapshot=?, error=NULL WHERE id=?",
                      (latest.close, json.dumps(snap), sym["id"]))
+
+    def _eod_sweep(self, sym: dict, five: list[Bar], s: dict, *, before: datetime | None = None,
+                   now: datetime | None = None) -> None:
+        """Close-by-end-of-day: cover/sell every open tranche at the close of the
+        5-minute bar ending 15:55 on the day it was opened. Runs before a bar
+        that ends after that cutoff (`before`), or once the cutoff has passed
+        on the clock (`now`, after the bar-close delay; a late feed gets the
+        usual grace period, then the latest print up to 15:55 is used)."""
+        delay = timedelta(minutes=s["bar_close_delay_min"])
+        for t in self._open(sym["id"]):
+            opened = _dt(t["entry_time"])
+            day = opened.astimezone(ET).date()
+            cut = eod_cutoff(day)
+            if before is not None and not cut < before:
+                continue
+            day_bars = [x for x in five if x.session == day and x.end <= cut]
+            if now is not None:
+                if now < cut + delay:
+                    continue
+                if not any(x.end >= cut for x in day_bars) and now < cut + max(delay, STALE_WAIT):
+                    continue  # the 15:50-15:55 bar hasn't printed yet: look again shortly
+            x = next((x for x in reversed(day_bars) if x.end > opened), None) or (
+                day_bars[-1] if day_bars else None)
+            if x is None:
+                continue
+            self._close(t, x.close, max(x.end, opened),
+                        f"close by end of day: flat at the {x.end.astimezone(ET):%b %d %H:%M} "
+                        f"5-min close {x.close:.4g}", s)
 
     def _next_open(self, symbol: str, b: Bar, five: list[Bar], now: datetime) -> Fill | None:
         """The opening print of the session after bar b, once it exists."""
@@ -611,6 +664,10 @@ class Engine:
         name = sym["symbol"]
         if sym["status"] != "active":
             self.store.log(f.when, "skip", f"{why}: symbol paused, no entry", name, sleeve)
+            return
+        if sym.get("eod_close") and f.when >= eod_cutoff(f.session):
+            self.store.log(f.when, "skip", f"{why}: close by end of day - no new entries "
+                           f"from {EOD_CUTOFF:%H:%M}", name, sleeve)
             return
         slip = s["slippage_bps"] / 1e4
         fill = f.price * (1 + slip) if side == "long" else f.price * (1 - slip)

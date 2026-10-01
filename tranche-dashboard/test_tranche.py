@@ -12,7 +12,7 @@ from broker import AlpacaPaper, BrokerError, BrokerSync
 import app
 import review
 from app import bar_for_boundary, boundaries
-from engine import Engine, ValidationError, vwap_fail
+from engine import Engine, ValidationError, _dt, vwap_fail
 from indicators import (ET, Bar, atr, bar_bucket, cross_adverse_moves, crossed_below,
                         ema, ema_cross, percentile,
                         price_tick, resample,
@@ -130,8 +130,8 @@ class FifteenMinuteTests(unittest.TestCase):
     def test_check_schedule_15(self):
         got = [b.strftime("%H:%M") for b in boundaries(self.d, timedelta(minutes=2), 15)]
         self.assertEqual(got[:4], ["09:32", "09:47", "10:02", "10:17"])
-        self.assertEqual(got[-1], "15:47")          # the 15:45-16:00 bar acts at the next open
-        self.assertEqual(len(got), 26)
+        self.assertEqual(got[-2:], ["15:47", "15:57"])  # 15:57 = close-by-end-of-day check
+        self.assertEqual(len(got), 27)                  # the 15:45-16:00 bar acts at the next open
 
 
 class FiveMinuteTests(unittest.TestCase):
@@ -887,7 +887,7 @@ class EngineTests(unittest.TestCase):
     def test_check_schedule(self):
         d = date(2026, 9, 21)  # Monday
         got = [b.strftime("%H:%M") for b in boundaries(d, timedelta(minutes=2))]
-        self.assertEqual(got, ["09:32", "10:02", "11:02", "12:02", "13:02", "14:02", "15:02"])
+        self.assertEqual(got, ["09:32", "10:02", "11:02", "12:02", "13:02", "14:02", "15:02", "15:57"])
         self.assertEqual(boundaries(date(2026, 9, 19), timedelta(0)), [])   # Saturday
         end, acts = bar_for_boundary(datetime.combine(d, time(9, 32), tzinfo=ET), timedelta(minutes=2))
         self.assertEqual(end, datetime.combine(date(2026, 9, 18), time(16), tzinfo=ET))  # Friday close
@@ -959,6 +959,77 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             eng._process_symbol(self.store.q("SELECT * FROM symbols")[0],
                                 datetime.combine(d, time(10, 2), tzinfo=ET), self.store.settings())
+
+    def eod_setup(self, eod: bool):
+        """Uptrend, then a day that falls all session: both EMA tranches go short early."""
+        bars, ds = self.uptrend_then_drop(8, lambda p: [p - 1.0, p - 2.5, p - 4, p - 5, p - 6, p - 7, p - 8])
+        eng = self.engine(bars)
+        eng.add_symbols("DAY", "long_short", 1.0, datetime.combine(ds[-1], time(9), tzinfo=ET),
+                        eod_close=eod)
+        return eng, ds[-1]
+
+    def test_eod_close_flattens_at_1555(self):
+        eng, d = self.eod_setup(False)
+        eng.tick(datetime.combine(d, time(15, 58), tzinfo=ET))
+        held = self.store.q("SELECT * FROM tranches WHERE status='open'")
+        self.assertTrue(held)                                  # without the setting: held
+        self.store.x("DELETE FROM tranches"); self.store.x("DELETE FROM symbols")
+        eng, d = self.eod_setup(True)
+        eng.tick(datetime.combine(d, time(15, 54), tzinfo=ET))  # before 15:55 (delay is 0 here)
+        self.assertTrue(self.store.q("SELECT 1 FROM tranches WHERE status='open'"))
+        eng.tick(datetime.combine(d, time(15, 58), tzinfo=ET))
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE status='open'"))
+        closed = self.store.q("SELECT * FROM tranches")
+        self.assertEqual(len(closed), len(held))               # it traded the same trades
+        five = eng.provider.five_min_bars("DAY", datetime.combine(d, time(16), tzinfo=ET))
+        px = next(b.close for b in five if b.end == datetime.combine(d, time(15, 55), tzinfo=ET))
+        for t in closed:
+            self.assertIn("close by end of day", t["exit_reason"])
+            self.assertEqual(_dt(t["exit_time"]), datetime.combine(d, time(15, 55), tzinfo=ET))
+            self.assertAlmostEqual(t["exit_price"], px)
+            self.assertEqual(t["borrow_fees"], 0)              # never held overnight
+
+    def test_eod_close_catches_up_after_an_outage(self):
+        eng, d = self.eod_setup(True)
+        eng.tick(datetime.combine(d, time(13, 5), tzinfo=ET))
+        self.assertTrue(self.store.q("SELECT 1 FROM tranches WHERE status='open'"))
+        eng.tick(datetime.combine(d + timedelta(days=3), time(10, 5), tzinfo=ET))  # down until Mon
+        for t in self.store.q("SELECT * FROM tranches"):
+            self.assertEqual(t["status"], "closed")
+            self.assertEqual(_dt(t["exit_time"]), datetime.combine(d, time(15, 55), tzinfo=ET))
+            self.assertEqual(t["borrow_fees"], 0)
+
+    def test_eod_close_blocks_entries_from_1555(self):
+        from engine import Fill
+        eng = self.engine([])
+        now = datetime(2026, 9, 21, 15, 55, tzinfo=ET)
+        eng.add_symbols("LATE", "long_short", 1.0, now - timedelta(hours=6), eod_close=True)
+        sym = self.store.q("SELECT * FROM symbols")[0]
+        eng._enter(sym, "VWAP", "short", Fill(10.0, now, now.date(), "close"), None,
+                   self.store.settings(), "test", stop_level=11.0)
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE kind='skip' AND message LIKE '%end of day%'"))
+        eng._enter(sym, "VWAP", "short", Fill(10.0, now - timedelta(minutes=5), now.date(), "close"),
+                   None, self.store.settings(), "test", stop_level=11.0)
+        self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)  # 15:50 is fine
+
+    def test_eod_check_never_triggers_hourly_retries(self):
+        eng = self.engine([])
+        eng.add_symbols("RTR", "short_only", 1.0, datetime(2026, 9, 18, 9, tzinfo=ET))
+        clock = type("C", (), {"now": lambda self: datetime(2026, 9, 21, 16, 2, tzinfo=ET)})()
+        sched = app.Scheduler(eng, clock)
+        sched.last_tick = datetime(2026, 9, 21, 15, 57, tzinfo=ET)
+        b = datetime(2026, 9, 21, 15, 55, tzinfo=ET)  # delay 0 in these tests
+        self.assertFalse(sched.retry_due(datetime(2026, 9, 21, 16, 2, tzinfo=ET), b))
+
+    def test_eod_toggle(self):
+        eng = self.engine([])
+        now = datetime(2026, 9, 21, 9, tzinfo=ET)
+        eng.add_symbols("TOG", "short_only", 1.0, now)
+        eng.set_eod_close(1, True, now)
+        self.assertEqual(self.store.q("SELECT eod_close FROM symbols")[0]["eod_close"], 1)
+        eng.set_eod_close(1, False, now)
+        self.assertEqual(self.store.q("SELECT eod_close FROM symbols")[0]["eod_close"], 0)
 
     def test_equity_accounting(self):
         bars, ds = self.uptrend_then_drop(8, lambda p: [p - 1.0, p - 2.5, p - 4, p - 3, p + 6, p + 7, p + 8])

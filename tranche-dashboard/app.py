@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, urlparse
 from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync
 from data import make_provider, redact
-from engine import SLEEVE_LABELS, Engine, ValidationError
+from engine import SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
 from indicators import ET, RTH_OPEN, session_bar_ends
 from review import ProfileCache, review_payload, save_day_note, save_journal
@@ -150,11 +150,15 @@ class SimClock:
 def boundaries(day: date, delay: timedelta, minutes: int = 60) -> list[datetime]:
     """Check times: the 9:30 open (acts on yesterday's last bar), then each
     intraday bar close - hourly 10:00 ... 15:00, 15-min 9:45 ... 15:45,
-    5-min 9:35 ... 15:55. The last bar of the day is not checked at 16:00; it
+    5-min 9:35 ... 15:55, plus a 15:55 check in every book for symbols set to
+    close by end of day. The last bar of the day is not checked at 16:00; it
     executes at the next open."""
     if day.weekday() >= 5:
         return []
     ends = session_bar_ends(day, minutes)[:-1]
+    eod = eod_cutoff(day)  # every book also checks at 15:55 for close-by-end-of-day symbols
+    if eod not in ends:
+        ends = sorted(ends + [eod])
     return [datetime.combine(day, RTH_OPEN, tzinfo=ET) + delay] + [e + delay for e in ends]
 
 
@@ -215,6 +219,9 @@ class Scheduler(threading.Thread):
     def retry_due(self, now: datetime, boundary: datetime) -> bool:
         """Re-check every 3 min for up to 40 min after a boundary while some
         symbol is still missing that hour (15-minute-delayed data plans)."""
+        t = boundary - self.delay()
+        if t.time() != RTH_OPEN and t not in session_bar_ends(t.date(), self.minutes):
+            return False  # the extra 15:55 check closes no bar of this book
         window = min(RETRY_WINDOW, timedelta(minutes=self.minutes))
         return (now - boundary <= window
                 and self.last_tick is not None and now - self.last_tick >= RETRY_EVERY
@@ -525,7 +532,8 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                         threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif rest == "/symbols":
                     added = engine.add_symbols(body.get("symbols", ""), body.get("mode"),
-                                               body.get("risk_pct"), now, body.get("grade"))
+                                               body.get("risk_pct"), now, body.get("grade"),
+                                               bool(body.get("eod_close")))
                     threading.Thread(target=sched.run_tick, daemon=True).start()
                     return self._send(200, {"added": added})
                 elif m := re.fullmatch(r"/symbols/(\d+)/rename", rest):
@@ -533,6 +541,10 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                                              body.get("ratio", 1))
                     threading.Thread(target=sched.run_tick, daemon=True).start()
                     return self._send(200, r)
+                elif m := re.fullmatch(r"/symbols/(\d+)/eod", rest):
+                    engine.set_eod_close(int(m.group(1)), bool(body.get("on")), now)
+                    threading.Thread(target=sched.run_tick, daemon=True).start()
+                    return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/grade", rest):
                     engine.set_grade(int(m.group(1)), body.get("grade"), now)
                     return self._send(200, {"ok": True})
