@@ -94,6 +94,12 @@ select.gradesel { width: auto; padding: 1px 4px; font-size: 12px; }
 .log td { white-space: normal; text-align: left; }
 .log td.ts { white-space: nowrap; color: var(--muted); }
 .empty { color: var(--muted); padding: 10px 0; }
+.tfilter { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; margin: 0 0 10px; font-size: 12.5px; color: var(--muted); }
+.tfilter label { display: flex; align-items: center; gap: 6px; margin: 0; }
+.tfilter select { width: auto; padding: 3px 6px; font-size: 12.5px; }
+.tfilter .hint { margin: 0; }
+th.sort { cursor: pointer; user-select: none; }
+th.sort:hover { color: var(--ink); }
 details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
 </style>
 </head>
@@ -222,6 +228,14 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
       <label>to <input type="date" id="exTo"></label>)
       <label><input type="checkbox" id="exOpen"> include open positions (entry only)</label>
       <a id="exLink" class="small" href="#">Download CSV</a>
+    </div>
+    <div class="tfilter" id="tabFilter">
+      <label data-f="sym">Symbol <select id="fSym"></select></label>
+      <label data-f="sleeve">Strategy <select id="fSleeve"></select></label>
+      <label data-f="side">Side <select id="fSide"></select></label>
+      <label data-f="pnl">P&amp;L <select id="fPnl"><option value="">All</option><option value="win">Winners</option><option value="loss">Losers</option></select></label>
+      <button class="small" id="fClear" type="button">Clear</button>
+      <span class="hint" id="fSummary"></span>
     </div>
     <div class="tablewrap" id="tabBody"></div>
   </section>
@@ -463,47 +477,113 @@ function exportLink() {
 }
 ["#exFrom", "#exTo", "#exOpen"].forEach(id => $(id).onchange = exportLink);
 
+// Table filters (symbol / strategy / side / P&L) and click-to-sort; kept across refreshes and tabs.
+const FLT = {sym: "", sleeve: "", side: "", pnl: ""};
+let TSORT = {k: null, dir: -1};
+const TAB_FILTERS = {open: ["sym", "sleeve", "side", "pnl"], closed: ["sym", "sleeve", "side", "pnl"],
+  symbols: ["sym", "pnl"], orders: ["sym", "side"], log: ["sym", "sleeve"]};
+const pnlOf = r => TAB === "open" ? r.unrealized - r.borrow_fees : TAB === "closed" ? r.net_pnl : TAB === "symbols" ? r.net_pnl : null;
+
+const sidesFor = () => TAB === "orders" ? ["buy", "sell"] : ["long", "short"];
+// a filter only applies on tabs that have that column (e.g. no Strategy on Paper orders)
+const on = k => (TAB_FILTERS[TAB] || []).includes(k) && FLT[k] && (k !== "side" || sidesFor().includes(FLT.side));
+
+function applyFilters(rows) {
+  const out = rows.filter(r =>
+    (!on("sym") || r.symbol === FLT.sym) && (!on("sleeve") || r.sleeve === FLT.sleeve) &&
+    (!on("side") || r.side === FLT.side) &&
+    (!on("pnl") || (FLT.pnl === "win" ? pnlOf(r) > 0 : pnlOf(r) < 0)));
+  if (TSORT.k) {
+    const k = TSORT.k, val = r => k === "pnl" ? pnlOf(r) : r[k];
+    out.sort((a, b) => { const x = val(a), y = val(b);
+      return (x == null) - (y == null) || (x < y ? -1 : x > y ? 1 : 0) * TSORT.dir; });
+  }
+  return out;
+}
+
+function renderFilterBar(rows) {
+  const bar = $("#tabFilter"), allowed = TAB_FILTERS[TAB] || [];
+  bar.querySelectorAll("label[data-f]").forEach(l => l.hidden = !allowed.includes(l.dataset.f));
+  if (bar.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;  // don't redraw mid-choice
+  const opts = (vals, label) => `<option value="">All</option>` + vals.map(v => `<option value="${esc(v)}">${esc(label ? label(v) : v)}</option>`).join("");
+  const syms = [...new Set(rows.map(r => r.symbol).filter(Boolean))].sort();
+  if (FLT.sym && !syms.includes(FLT.sym)) syms.unshift(FLT.sym);
+  $("#fSym").innerHTML = opts(syms);
+  $("#fSleeve").innerHTML = opts(Object.keys(STATE.sleeves), k => STATE.sleeves[k]);
+  $("#fSide").innerHTML = opts(sidesFor());
+  $("#fSym").value = FLT.sym; $("#fSleeve").value = FLT.sleeve; $("#fPnl").value = FLT.pnl;
+  $("#fSide").value = sidesFor().includes(FLT.side) ? FLT.side : "";
+}
+
+function filterSummary(all, shown) {
+  const parts = [];
+  if (shown.length !== all.length) parts.push(`${shown.length} of ${all.length} shown`);
+  else parts.push(`${all.length} rows`);
+  if (["open", "closed", "symbols"].includes(TAB) && shown.length) {
+    const tot = shown.reduce((a, r) => a + (pnlOf(r) || 0), 0);
+    parts.push(`P&L of these: <b class="${cls(tot)}">${signed(tot)}</b>`);
+  }
+  if (TAB === "closed" && STATE.summary.overall.trades > all.length) parts.push(`latest ${all.length} trades only; Trade Review has all`);
+  $("#fSummary").innerHTML = parts.join(" · ");
+}
+
+const sh = (k, label, cl = "") => `<th class="sort ${cl}" data-sort="${k}" title="Sort">${label}${TSORT.k === k ? (TSORT.dir > 0 ? " ▲" : " ▼") : ""}</th>`;
+
 function renderTab() {
   $("#exportBar").hidden = TAB !== "closed";
   const m = STATE.summary, L = STATE.sleeves;
   document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB));
+  const all = TAB === "open" ? m.open : TAB === "closed" ? m.closed
+    : TAB === "symbols" ? Object.entries(m.by_symbol).map(([k, st]) => ({...st, symbol: k}))
+    : TAB === "orders" ? ((STATE.broker && STATE.broker.orders) || []).map(o => ({...o, side: o.side}))
+    : STATE.events;
+  renderFilterBar(all);
+  const rows = applyFilters(all);
+  filterSummary(all, rows);
+  if (TAB === "closed") exportLink();
+  const none = {open: "No open positions.", closed: "No closed trades yet.", symbols: "No closed trades yet.",
+    orders: "No paper orders yet.", log: "No events yet."}[TAB];
+  if (!all.length) return $("#tabBody").innerHTML = `<div class="empty">${none}</div>`;
+  if (!rows.length) return $("#tabBody").innerHTML = `<div class="empty">Nothing matches these filters.</div>`;
   let h = "";
   if (TAB === "open") {
-    if (!m.open.length) return $("#tabBody").innerHTML = `<div class="empty">No open positions.</div>`;
-    h = `<table><thead><tr><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Side</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Target</th><th>Mark</th>
-      <th>Notional</th><th>Risk</th><th>Borrow so far</th><th>Open P&amp;L (net)</th><th class="l">Opened</th></tr></thead><tbody>`;
-    for (const t of m.open) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
+    h = `<table><thead><tr>${sh("symbol", "Symbol", "l")}${sh("sleeve", "Tranche", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}<th>Entry</th><th>Stop</th><th>Target</th><th>Mark</th>
+      ${sh("notional", "Notional")}${sh("risk_dollars", "Risk")}<th>Borrow so far</th>${sh("pnl", "Open P&amp;L (net)")}${sh("entry_time", "Opened", "l")}</tr></thead><tbody>`;
+    for (const t of rows) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
       <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${t.sleeve === "VWAP" ? num(t.stop_price) : "on cross"}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
       <td>${usd(t.risk_dollars)}</td><td>${usd(t.borrow_fees, 2)}</td><td class="${cls(t.unrealized - t.borrow_fees)}">${signed(t.unrealized - t.borrow_fees)}</td><td class="l">${fmtT(t.entry_time)}</td></tr>`;
   } else if (TAB === "closed") {
-    exportLink();
-    if (!m.closed.length) return $("#tabBody").innerHTML = `<div class="empty">No closed trades yet.</div>`;
-    h = `<table><thead><tr><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
-      <th>Gross</th><th>Borrow</th><th>Net</th><th>R</th><th class="l">Exit reason</th><th class="l">Opened</th><th class="l">Closed</th></tr></thead><tbody>`;
-    for (const t of m.closed) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
+    h = `<table><thead><tr>${sh("symbol", "Symbol", "l")}${sh("sleeve", "Tranche", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}<th>Entry</th><th>Exit</th>
+      ${sh("gross_pnl", "Gross")}<th>Borrow</th>${sh("pnl", "Net")}${sh("r_multiple", "R")}<th class="l">Exit reason</th>${sh("entry_time", "Opened", "l")}${sh("exit_time", "Closed", "l")}</tr></thead><tbody>`;
+    for (const t of rows) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
       <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${num(t.exit_price)}</td><td class="${cls(t.gross_pnl)}">${signed(t.gross_pnl, 2)}</td>
       <td>${usd(t.borrow_fees, 2)}</td><td class="${cls(t.net_pnl)}">${signed(t.net_pnl, 2)}</td><td>${t.r_multiple == null ? "—" : num(t.r_multiple)}</td>
       <td class="l">${esc(t.exit_reason)}</td><td class="l">${fmtT(t.entry_time)}</td><td class="l">${fmtT(t.exit_time)}</td></tr>`;
   } else if (TAB === "symbols") {
-    const e = Object.entries(m.by_symbol);
-    if (!e.length) return $("#tabBody").innerHTML = `<div class="empty">No closed trades yet.</div>`;
-    h = `<table>${statHead("")}<tbody>` + e.map(([k, st]) => statRow(`<span class="sym">${esc(k)}</span>`, st)).join("");
+    h = `<table><thead><tr>${sh("symbol", "Symbol", "l")}${sh("trades", "Trades")}${sh("win_rate", "Win %")}${sh("pnl", "Net P&amp;L")}<th>Avg win</th><th>Avg loss</th>${sh("profit_factor", "PF")}${sh("avg_r", "Avg R")}<th>Borrow</th></tr></thead><tbody>`
+      + rows.map(st => statRow(`<span class="sym">${esc(st.symbol)}</span>`, st)).join("");
   } else if (TAB === "orders") {
-    const os = (STATE.broker && STATE.broker.orders) || [];
-    if (!os.length) return $("#tabBody").innerHTML = `<div class="empty">No paper orders yet.</div>`;
-    h = `<table><thead><tr><th class="l">Sent</th><th class="l">Symbol</th><th class="l">Side</th><th>Qty</th><th class="l">Status</th><th>Filled</th><th>Avg price</th><th class="l">Why</th></tr></thead><tbody>`;
-    for (const o of os) h += `<tr><td class="l">${fmtT(o.ts)}</td><td class="sym">${esc(o.symbol)}</td><td class="l">${o.side}</td><td>${o.qty}</td>
+    h = `<table><thead><tr>${sh("ts", "Sent", "l")}${sh("symbol", "Symbol", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}${sh("status", "Status", "l")}<th>Filled</th><th>Avg price</th><th class="l">Why</th></tr></thead><tbody>`;
+    for (const o of rows) h += `<tr><td class="l">${fmtT(o.ts)}</td><td class="sym">${esc(o.symbol)}</td><td class="l">${o.side}</td><td>${o.qty}</td>
       <td class="l"><span class="pill ${o.status === "filled" ? "long" : o.status === "rejected" ? "short" : "warn"}">${esc(o.status)}</span></td>
       <td>${o.filled_qty ?? "—"}</td><td>${num(o.filled_avg_price)}</td><td class="l" style="white-space:normal">${esc(o.message || o.reason)}</td></tr>`;
   } else {
-    const ev = STATE.events;
-    if (!ev.length) return $("#tabBody").innerHTML = `<div class="empty">No events yet.</div>`;
     h = `<table class="log"><thead><tr><th class="l">Time</th><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Event</th><th class="l">Detail</th></tr></thead><tbody>`;
-    for (const e of ev) h += `<tr><td class="ts">${fmtT(e.ts)}</td><td class="sym">${esc(e.symbol || "")}</td><td>${e.sleeve ? L[e.sleeve] : ""}</td>
+    for (const e of rows) h += `<tr><td class="ts">${fmtT(e.ts)}</td><td class="sym">${esc(e.symbol || "")}</td><td>${e.sleeve ? L[e.sleeve] : ""}</td>
       <td><span class="pill ${e.kind === "entry" ? "short" : e.kind === "error" || e.kind === "skip" ? "warn" : ""}">${esc(e.kind)}</span></td><td>${esc(e.message)}</td></tr>`;
   }
   $("#tabBody").innerHTML = h + "</tbody></table>";
 }
+
+for (const [id, key] of [["#fSym", "sym"], ["#fSleeve", "sleeve"], ["#fSide", "side"], ["#fPnl", "pnl"]])
+  $(id).onchange = e => { FLT[key] = e.target.value; e.target.blur(); renderTab(); };
+$("#fClear").onclick = () => { Object.keys(FLT).forEach(k => FLT[k] = ""); TSORT = {k: null, dir: -1}; renderTab(); };
+$("#tabBody").addEventListener("click", e => {
+  const th = e.target.closest("th[data-sort]"); if (!th) return;
+  const k = th.dataset.sort;
+  TSORT = {k, dir: TSORT.k === k ? -TSORT.dir : (["symbol", "sleeve", "side", "status"].includes(k) ? 1 : -1)};
+  renderTab();
+});
 
 // ---- interactions
 const GRADES = {"A+": 3, "A": 2, "B": 1.5, "C": 1};
@@ -562,7 +642,7 @@ $("#watch").onclick = async e => {
   catch (err) { alert(err.message); }
   refresh();
 };
-document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderTab(); });
+document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.onclick = () => { TAB = b.dataset.tab; TSORT = {k: null, dir: -1}; renderTab(); });
 $("#watch").onchange = async e => {
   const sel = e.target.closest("select.gradesel"); if (!sel || !sel.value) return;
   try { await api(bk(`/api/symbols/${sel.dataset.id}/grade`), {grade: sel.value}); } catch (err) { alert(err.message); }
