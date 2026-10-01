@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart the tranche dashboard to pick up updates
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart tranche.service

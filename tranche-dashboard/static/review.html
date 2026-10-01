@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trade Review</title>
+<style>
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --ink: #16181d; --ink-2: #4a505c; --muted: #7a808c;
+  --line: #e3e6eb; --accent: #2f5fd0; --good: #1a7f4b; --bad: #c0362c; --warn: #9a6700;
+  --chip: #eef1f6; --series: #2f5fd0; --grid: #eceef2;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --surface: #171a20; --ink: #e8eaee; --ink-2: #b4bac4; --muted: #858c98;
+    --line: #2a2f38; --accent: #7aa2ff; --good: #4cc38a; --bad: #ff6b5e; --warn: #e3b341;
+    --chip: #222730; --series: #3987e5; --grid: #22262e;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+  padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--surface); }
+header h1 { font-size: 17px; margin: 0; }
+header .meta { color: var(--muted); font-size: 12.5px; }
+header .spacer { flex: 1; }
+a { color: var(--accent); }
+a.btn, button { font: inherit; color: var(--ink); border: 1px solid var(--line); background: var(--chip);
+  border-radius: 6px; padding: 6px 10px; cursor: pointer; text-decoration: none; white-space: nowrap; }
+button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.small, a.small { padding: 2px 8px; font-size: 12px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+main { padding: 14px 20px 48px; display: grid; gap: 14px; max-width: 1500px; margin: 0 auto; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: end; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.filters label { display: grid; gap: 2px; font-size: 11.5px; color: var(--muted); }
+.filters select, .filters input { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; max-width: 190px; }
+.seg { display: flex; gap: 0; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12.5px; color: var(--muted); }
+.chip { display: inline-flex; gap: 6px; align-items: center; background: var(--chip); border-radius: 12px;
+  padding: 2px 4px 2px 10px; color: var(--ink); }
+.chip button { border: 0; background: none; padding: 0 6px; color: var(--muted); }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.kpi { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.kpi .l { color: var(--muted); font-size: 12px; }
+.kpi .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kpi .s { color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+.grid3 { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; align-items: start; }
+@media (max-width: 1000px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+section.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+section.card h2 { font-size: 14px; margin: 0 0 10px; display: flex; justify-content: space-between;
+  align-items: center; gap: 8px; flex-wrap: wrap; }
+section.card h2 small { color: var(--muted); font-weight: 400; }
+.chart { position: relative; }
+.chart svg { width: 100%; display: block; overflow: visible; }
+.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.14);
+  display: none; white-space: nowrap; z-index: 5; }
+.insights { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.insights li { line-height: 1.4; }
+.insights .n { color: var(--muted); font-size: 12px; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; user-select: none; }
+th.sort { cursor: pointer; }
+th.sort:hover { color: var(--ink); }
+th:first-child, td:first-child, td.l, th.l { text-align: left; }
+tbody tr.row { cursor: pointer; }
+tbody tr.row:hover, tbody tr.sel { background: var(--chip); }
+.pos { color: var(--good); } .neg { color: var(--bad); }
+.pill { display: inline-block; border-radius: 10px; padding: 1px 7px; font-size: 11.5px;
+  background: var(--chip); color: var(--ink-2); margin-right: 3px; }
+.pill.short { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+.pill.long { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+.pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.bar { display: inline-block; height: 8px; border-radius: 0 4px 4px 0; vertical-align: middle; }
+.barcell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.barcell .track { width: 90px; display: flex; }
+.barcell .half { width: 45px; display: flex; }
+.barcell .half.l { justify-content: flex-end; border-right: 1px solid var(--line); }
+.bar.neg { background: var(--bad); border-radius: 4px 0 0 4px; }
+.bar.pos { background: var(--good); }
+.detail td { white-space: normal; text-align: left; background: var(--bg); }
+.detail .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 4px 16px;
+  font-size: 12.5px; margin-bottom: 10px; }
+.detail .facts span { color: var(--muted); }
+.detail textarea, .daynote textarea { width: 100%; min-height: 64px; font: inherit; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; resize: vertical; }
+.detail input[type=text] { width: 100%; font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+.detail label, .daynote label { display: block; font-size: 12px; color: var(--muted); margin: 6px 0 3px; }
+.row-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 12.5px; }
+.msg.ok { color: var(--good); } .msg.err { color: var(--bad); }
+.cal { display: grid; grid-template-columns: repeat(5, 1fr) 0.9fr; gap: 4px; }
+.cal .hd { font-size: 11.5px; color: var(--muted); text-align: center; }
+.cal .day { min-height: 58px; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px;
+  font-size: 11.5px; cursor: pointer; display: flex; flex-direction: column; justify-content: space-between;
+  font-variant-numeric: tabular-nums; }
+.cal .day.out { visibility: hidden; }
+.cal .day.sel { outline: 2px solid var(--accent); outline-offset: -1px; }
+.cal .day .d { color: var(--muted); display: flex; justify-content: space-between; }
+.cal .day .p { font-weight: 600; font-size: 12.5px; }
+.cal .week { font-size: 11.5px; color: var(--ink-2); display: flex; flex-direction: column; justify-content: center;
+  align-items: flex-end; padding-right: 4px; font-variant-numeric: tabular-nums; }
+.daynote { margin-top: 10px; }
+.empty { color: var(--muted); padding: 12px 0; }
+.note-dot { color: var(--accent); }
+.hint { color: var(--muted); font-size: 12px; }
+@media (max-width: 640px) {
+  header, main { padding-left: 16px; padding-right: 16px; }
+  .cal .day { min-height: 46px; padding: 3px; }
+  .cal .day .p { font-size: 11px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <a class="btn" href="/">&larr; Dashboard</a>
+  <h1>Trade Review</h1>
+  <div class="meta" id="meta">Loading…</div>
+  <div class="spacer"></div>
+  <button id="csv" title="The trades matching the filters, one row per trade">Download CSV</button>
+</header>
+<main>
+  <div class="filters" id="filters">
+    <label>Book<div class="seg" id="bookSeg"></div></label>
+    <label>Closed<div class="seg" id="rangeSeg"></div></label>
+    <label>From <input type="date" id="from"></label>
+    <label>To <input type="date" id="to"></label>
+    <label>Strategy <select data-dim="strategy"></select></label>
+    <label>Side <select data-dim="side"></select></label>
+    <label>Symbol <select data-dim="symbol"></select></label>
+    <label>Grade <select data-dim="grade"></select></label>
+    <label>Exit <select data-dim="exit_type"></select></label>
+    <label>Sector <select data-dim="sector"></select></label>
+    <label>Tag <select data-dim="tag"></select></label>
+    <button id="clear" class="small">Clear filters</button>
+  </div>
+  <div class="chips" id="chips"></div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="grid3">
+    <section class="card">
+      <h2>Cumulative P&amp;L <small>net of borrow fees, by close time</small></h2>
+      <div class="chart" id="curve"></div>
+    </section>
+    <section class="card">
+      <h2>What the numbers say <small>rule-based, from the filtered trades</small></h2>
+      <ul class="insights" id="insights"></ul>
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section class="card">
+      <h2><span>P&amp;L calendar</span>
+        <span class="tabs"><button class="small" id="calPrev">&lsaquo;</button>
+        <b id="calTitle" style="min-width:120px;text-align:center"></b>
+        <button class="small" id="calNext">&rsaquo;</button></span></h2>
+      <div class="cal" id="cal"></div>
+      <div class="daynote" id="daynote"></div>
+    </section>
+    <section class="card">
+      <h2>R-multiple distribution <small>net P&amp;L &divide; risk planned at entry</small></h2>
+      <div class="chart" id="rdist"></div>
+      <p class="hint" id="rnote"></p>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2><span>Breakdown</span><div class="tabs" id="dimTabs"></div></h2>
+    <div class="tablewrap"><table id="breakdown"></table></div>
+    <p class="hint">Click a row to filter everything to it. Groups under 30 trades are flagged: treat them as a hint, not an edge.</p>
+  </section>
+
+  <section class="card">
+    <h2><span>Trades <small id="tradeCount"></small></span><small>Click a trade to see why it closed and add a note or tags</small></h2>
+    <div class="tablewrap"><table id="trades"></table></div>
+    <div style="margin-top:10px"><button id="more" class="small" hidden>Show more</button></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const usd = (v, d = 0) => { if (v == null) return "—"; if (!d && v && Math.abs(v) < 1) d = 2;  // no "−$0"
+  return (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}); };
+const signed = (v, d = 0) => v == null ? "—" : (v > 0 ? "+" : "") + usd(v, d);
+const pct = (v, d = 0) => v == null ? "—" : (v * 100).toFixed(d) + "%";
+const num = (v, d = 2) => v == null || !isFinite(v) ? "—" : Number(v).toFixed(d);
+const rr = v => v == null ? "—" : (v > 0 ? "+" : "") + Number(v).toFixed(2) + "R";
+const cls = v => v > 0 ? "pos" : v < 0 ? "neg" : "";
+const fmtT = iso => new Date(iso).toLocaleString(undefined, {month: "short", day: "numeric",
+  hour: "numeric", minute: "2-digit", timeZone: "America/New_York"});
+const hold = m => m < 60 ? `${m}m` : m < 60 * 24 ? `${(m / 60).toFixed(1)}h` : `${(m / 1440).toFixed(1)}d`;
+const todayET = () => new Date().toLocaleDateString("en-CA", {timeZone: "America/New_York"});
+const addDays = (iso, n) => { const d = new Date(iso + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+
+let DATA = null, BOOK = "all", F = {}, FROM = "", TO = "", RANGE = "all", DIM = "strategy",
+    SORT = {k: "exit_time", dir: -1}, SHOWN = 100, OPEN_ROW = null, CAL = null, SEL_DAY = null;
+
+const DIMS = [["strategy", "Strategy"], ["book_label", "Book"], ["symbol", "Symbol"], ["side", "Side"],
+  ["grade", "Grade"], ["exit_type", "Exit type"], ["time_of_day", "Time of day"], ["weekday", "Weekday"],
+  ["hold", "Hold time"], ["price_tier", "Price"], ["sector", "Sector"], ["cap_tier", "Market cap"],
+  ["float_tier", "Float"], ["tag", "Tag"]];
+const DIM_LABEL = Object.fromEntries(DIMS);
+const ORDER = {
+  weekday: ["Mon", "Tue", "Wed", "Thu", "Fri"],
+  hold: ["Under 1 hour", "Same day", "2 sessions", "3-5 sessions", "6-10 sessions", "Over 10 sessions"],
+  price_tier: ["under $1", "$1-5", "$5-20", "$20+"],
+  cap_tier: ["Nano (<$50M)", "Micro ($50-300M)", "Small ($300M-2B)", "Mid ($2-10B)", "Large (>$10B)", "Unknown"],
+  float_tier: ["Low (<10M)", "Medium (10-50M)", "High (>50M)", "Unknown"],
+  grade: ["A+", "A", "B", "C", "Custom risk"],
+};
+const RANGES = [["all", "All"], ["today", "Today"], ["7", "7D"], ["30", "30D"], ["mtd", "Month"]];
+
+async function api(path, body) {
+  const r = await fetch(path, {method: body === undefined ? "GET" : "POST",
+    headers: {"Content-Type": "application/json"}, body: body === undefined ? undefined : JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+async function load() {
+  try { DATA = await api("/api/review/trades"); }
+  catch (e) { $("#meta").innerHTML = `<span class="neg">Can't load trades: ${esc(e.message)}</span>`; return; }
+  render();
+}
+
+// ------------------------------------------------------------- filtering
+const groupsOf = (t, dim) => dim === "tag" ? (t.tags.length ? t.tags : ["(untagged)"]) : [t[dim]];
+function filtered(skipDim, allDates) {
+  return DATA.trades.filter(t =>
+    (BOOK === "all" || t.book === BOOK) &&
+    (allDates || ((!FROM || t.exit_day >= FROM) && (!TO || t.exit_day <= TO))) &&
+    Object.entries(F).every(([d, v]) => d === skipDim || groupsOf(t, d).includes(v)));
+}
+
+function stats(rows) {
+  const n = rows.length, nets = rows.map(t => t.net);
+  const wins = nets.filter(v => v > 0), losses = nets.filter(v => v < 0);
+  const sum = a => a.reduce((x, y) => x + y, 0);
+  const rs = rows.map(t => t.r).filter(v => v != null);
+  const gw = sum(wins), gl = -sum(losses);
+  return {n, net: sum(nets), wins: wins.length, losses: losses.length, be: n - wins.length - losses.length,
+    win_rate: n ? wins.length / n : null, pf: gl > 0 ? gw / gl : (gw > 0 ? Infinity : null),
+    avg_win: wins.length ? gw / wins.length : null, avg_loss: losses.length ? -gl / losses.length : null,
+    exp: n ? sum(nets) / n : null, avg_r: rs.length ? sum(rs) / rs.length : null,
+    best: n ? Math.max(...nets) : null, worst: n ? Math.min(...nets) : null,
+    fees: sum(rows.map(t => t.fees)), gross: sum(rows.map(t => t.gross)),
+    hold: n ? sum(rows.map(t => t.hold_min)) / n : null, gross_loss: gl};
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  const rows = filtered();
+  const books = DATA.books.map(b => `${b.label}`).join(" · ");
+  $("#meta").innerHTML = `${DATA.trades.length} closed trades across ${esc(books)} · ${DATA.open_trades} still open (not included)` +
+    (DATA.profiles_note ? ` · <span class="hint">${esc(DATA.profiles_note)}</span>` : "");
+  renderFilters();
+  renderKpis(rows);
+  renderCurve(rows);
+  renderInsights(rows);
+  renderCalendar();
+  renderRdist(rows);
+  renderBreakdown();
+  renderTrades(rows);
+}
+
+function renderFilters() {
+  $("#bookSeg").innerHTML = [["all", "All"], ...DATA.books.map(b => [b.key, b.label])]
+    .map(([k, l]) => `<button type="button" class="small ${BOOK === k ? "on" : ""}" data-book="${k}">${esc(l)}</button>`).join("");
+  $("#rangeSeg").innerHTML = RANGES.map(([k, l]) =>
+    `<button type="button" class="small ${RANGE === k ? "on" : ""}" data-range="${k}">${l}</button>`).join("");
+  $("#from").value = FROM; $("#to").value = TO;
+  for (const sel of document.querySelectorAll("select[data-dim]")) {
+    const d = sel.dataset.dim, vals = new Set();
+    for (const t of filtered(d)) groupsOf(t, d).forEach(v => vals.add(v));
+    if (F[d]) vals.add(F[d]);
+    const list = sortGroups(d, [...vals]);
+    sel.innerHTML = `<option value="">All</option>` + list.map(v =>
+      `<option ${F[d] === v ? "selected" : ""} value="${esc(v)}">${esc(v)}</option>`).join("");
+  }
+  const bar = Object.keys(F).filter(d => !document.querySelector(`select[data-dim="${d}"]`));
+  $("#chips").innerHTML = bar.length ? "Also filtered by: " + bar.map(d =>
+    `<span class="chip">${esc(DIM_LABEL[d] || d)}: <b>${esc(F[d])}</b><button data-unset="${d}" title="Remove">&times;</button></span>`).join("") : "";
+}
+
+function sortGroups(dim, vals) {
+  const o = ORDER[dim];
+  if (o) return vals.sort((a, b) => (o.indexOf(a) + 1 || 99) - (o.indexOf(b) + 1 || 99) || a.localeCompare(b));
+  return vals.sort((a, b) => String(a).localeCompare(String(b)));
+}
+
+function renderKpis(rows) {
+  const s = stats(rows);
+  let peak = 0, cum = 0, dd = 0;
+  for (const t of rows) { cum += t.net; peak = Math.max(peak, cum); dd = Math.max(dd, peak - cum); }
+  const kpi = (l, v, sub = "", c = "") => `<div class="kpi"><div class="l">${l}</div><div class="v ${c}">${v}</div><div class="s">${sub}</div></div>`;
+  $("#kpis").innerHTML =
+    kpi("Net P&amp;L", signed(s.net), `gross ${signed(s.gross)} · borrow ${usd(s.fees)}`, cls(s.net)) +
+    kpi("Trades", s.n, `${s.wins} W · ${s.losses} L${s.be ? ` · ${s.be} flat` : ""}`) +
+    kpi("Win rate", pct(s.win_rate), s.n && s.n < 30 ? "under 30 trades: noisy" : "") +
+    kpi("Profit factor", s.pf === Infinity ? "∞" : num(s.pf), "gross wins ÷ gross losses") +
+    kpi("Expectancy", signed(s.exp), `per trade · ${rr(s.avg_r)} avg`, cls(s.exp)) +
+    kpi("Avg win / loss", `${usd(s.avg_win)} / ${usd(s.avg_loss == null ? null : -s.avg_loss)}`,
+        s.avg_win && s.avg_loss ? `payoff ${num(s.avg_win / -s.avg_loss)}×` : "") +
+    kpi("Best / worst", `<span class="pos">${signed(s.best)}</span> <span class="hint">/</span> <span class="neg">${signed(s.worst)}</span>`, "single trade") +
+    kpi("Max drawdown", dd ? `−${usd(dd)}` : "$0", "peak-to-trough, closed trades", dd ? "neg" : "") +
+    kpi("Avg hold", s.hold == null ? "—" : hold(Math.round(s.hold)), "entry to exit");
+}
+
+// ------------------------------------------------------------ charts
+function renderCurve(rows) {
+  const el = $("#curve");
+  if (!rows.length) { el.innerHTML = `<div class="empty">No closed trades match these filters.</div>`; return; }
+  const W = Math.max(300, el.clientWidth || 800), H = W < 500 ? 190 : 230, L = 64, R = 12, T = 10, B = 26;
+  let cum = 0;
+  const pts = [{x: 0, y: 0, t: null}, ...rows.map((t, i) => ({x: i + 1, y: (cum += t.net), t}))];
+  const ys = pts.map(p => p.y), lo = Math.min(0, ...ys), hi = Math.max(0, ...ys), pad = (hi - lo) * 0.08 || 1;
+  const y0 = lo - pad, y1 = hi + pad, n = pts.length - 1 || 1;
+  const X = x => L + (W - L - R) * x / n, Y = y => T + (H - T - B) * (1 - (y - y0) / (y1 - y0));
+  const ticks = niceTicks(y0, y1, 4);
+  let s = `<svg viewBox="0 0 ${W} ${H}" style="height:${H}px">`;
+  for (const v of ticks) s += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)"/>` +
+    `<text x="${L - 6}" y="${Y(v) + 4}" text-anchor="end">${usd(v)}</text>`;
+  s += `<line x1="${L}" x2="${W - R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--muted)" stroke-width="1"/>`;
+  s += `<path d="${pts.map((p, i) => (i ? "L" : "M") + X(p.x).toFixed(1) + " " + Y(p.y).toFixed(1)).join("")}" fill="none" stroke="var(--series)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`;
+  const first = rows[0].exit_day, last = rows[rows.length - 1].exit_day;
+  s += `<text x="${L}" y="${H - 6}">${first}</text><text x="${W - R}" y="${H - 6}" text-anchor="end">${last}</text>`;
+  s += `<line id="cx" y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-dasharray="3 3" style="display:none"/>`;
+  s += `<circle id="cd" r="4" fill="var(--series)" stroke="var(--surface)" stroke-width="2" style="display:none"/>`;
+  s += `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" id="chit"/></svg><div class="tip"></div>`;
+  el.innerHTML = s;
+  const svg = el.querySelector("svg"), tip = el.querySelector(".tip");
+  svg.querySelector("#chit").onmousemove = e => {
+    const r = svg.getBoundingClientRect(), sx = (e.clientX - r.left) / r.width * W;
+    const i = Math.max(1, Math.min(n, Math.round((sx - L) / (W - L - R) * n))), p = pts[i];
+    const cx = svg.querySelector("#cx"), cd = svg.querySelector("#cd");
+    cx.setAttribute("x1", X(p.x)); cx.setAttribute("x2", X(p.x)); cx.style.display = "";
+    cd.setAttribute("cx", X(p.x)); cd.setAttribute("cy", Y(p.y)); cd.style.display = "";
+    tip.innerHTML = `<b>${signed(p.y)}</b> cumulative<br>#${i} ${esc(p.t.symbol)} ${esc(p.t.book_label)} · <span class="${cls(p.t.net)}">${signed(p.t.net)}</span><br><span class="hint">${fmtT(p.t.exit_time)} ET</span>`;
+    tip.style.display = "block";
+    const px = X(p.x) / W * r.width;
+    tip.style.left = Math.min(px + 12, r.width - tip.offsetWidth) + "px";
+    tip.style.top = Math.max(0, Y(p.y) - 50) + "px";
+  };
+  svg.querySelector("#chit").onmouseleave = () => { tip.style.display = "none";
+    svg.querySelector("#cx").style.display = "none"; svg.querySelector("#cd").style.display = "none"; };
+}
+
+function niceTicks(a, b, n) {
+  const span = b - a, step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0 || 1));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= step0) || mag;
+  const out = []; for (let v = Math.ceil(a / step) * step; v <= b; v += step) out.push(Math.round(v * 100) / 100);
+  return out;
+}
+
+function renderRdist(rows) {
+  const el = $("#rdist"), rs = rows.map(t => t.r).filter(v => v != null);
+  if (!rs.length) { el.innerHTML = `<div class="empty">No trades.</div>`; $("#rnote").textContent = ""; return; }
+  const edges = []; for (let v = -3; v <= 5; v += 0.5) edges.push(v);   // ≤-3 ... ≥5
+  const bins = Array(edges.length + 1).fill(0);
+  for (const r of rs) { let i = edges.findIndex(e => r < e); if (i < 0) i = edges.length; bins[i]++; }
+  const lab = i => i === 0 ? `< −3R` : i === edges.length ? `≥ +5R` : `${num(edges[i - 1], 1)} to ${num(edges[i], 1)}R`;
+  const W = Math.max(280, el.clientWidth || 520), H = 210, L = 30, B = 24, T = 8, max = Math.max(...bins), bw = (W - L) / bins.length;
+  let s = `<svg viewBox="0 0 ${W} ${H}" style="height:${H}px">`;
+  for (const v of niceTicks(0, max, 3).filter(v => Number.isInteger(v)))
+    s += `<line x1="${L}" x2="${W}" y1="${T + (H - T - B) * (1 - v / max)}" y2="${T + (H - T - B) * (1 - v / max)}" stroke="var(--grid)"/>` +
+         `<text x="${L - 5}" y="${T + (H - T - B) * (1 - v / max) + 4}" text-anchor="end">${v}</text>`;
+  bins.forEach((c, i) => {
+    const neg = i === 0 || edges[i] <= 0, h = (H - T - B) * c / max, x = L + i * bw + 1, y = H - B - h;
+    if (c) s += `<path d="M${x} ${H - B}V${y + Math.min(4, h)}q0 -4 4 -4h${bw - 10}q4 0 4 4V${H - B}Z" fill="var(${neg ? "--bad" : "--good"})"/>`;
+    s += `<rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - T - B}" fill="transparent" data-tip="${lab(i)}: <b>${c}</b> trade${c === 1 ? "" : "s"}"/>`;
+  });
+  const zx = L + (edges.indexOf(0) + 1) * bw;
+  s += `<line x1="${zx}" x2="${zx}" y1="${T}" y2="${H - B}" stroke="var(--muted)"/>`;
+  s += `<text x="${zx}" y="${H - 6}" text-anchor="middle">0R</text><text x="${L}" y="${H - 6}">−3R</text><text x="${W}" y="${H - 6}" text-anchor="end">+5R</text>`;
+  s += `</svg><div class="tip"></div>`;
+  el.innerHTML = s;
+  hoverTips(el);
+  const big = rs.filter(r => r >= 2).length, bad = rs.filter(r => r <= -1.5).length;
+  $("#rnote").textContent = `${rs.length} trades · ${big} at +2R or better · ${bad} at −1.5R or worse (bigger than the planned risk).`;
+}
+
+function hoverTips(el) {
+  const tip = el.querySelector(".tip");
+  el.querySelectorAll("[data-tip]").forEach(n => {
+    n.onmousemove = e => { const r = el.getBoundingClientRect(); tip.innerHTML = n.dataset.tip; tip.style.display = "block";
+      tip.style.left = Math.min(e.clientX - r.left + 12, r.width - tip.offsetWidth) + "px"; tip.style.top = (e.clientY - r.top - 36) + "px"; };
+    n.onmouseleave = () => tip.style.display = "none";
+  });
+}
+
+// ---------------------------------------------------------- insights
+function renderInsights(rows) {
+  const out = [], s = stats(rows);
+  if (!rows.length) { $("#insights").innerHTML = `<li class="empty">No trades in this view.</li>`; return; }
+  if (s.n < 30) out.push(`<b>Small sample:</b> ${s.n} trades. Win rate and profit factor settle down around 30+ trades per setup, so read everything below as a hint.`);
+  const group = dim => { const m = {}; for (const t of rows) for (const g of groupsOf(t, dim)) (m[g] ||= []).push(t);
+    return Object.entries(m).map(([g, r]) => ({g, ...stats(r)})); };
+  const n = x => `<span class="n">(${x.n} trade${x.n === 1 ? "" : "s"})</span>`;
+  // loss concentration
+  if (s.gross_loss > 0) {
+    const bySym = group("symbol").map(x => ({...x, loss: -rows.filter(t => t.symbol === x.g && t.net < 0).reduce((a, t) => a + t.net, 0)}))
+      .sort((a, b) => b.loss - a.loss);
+    const top = bySym[0], share = top.loss / s.gross_loss;
+    if (share >= 0.3 && bySym.length > 1)
+      out.push(`<b>${esc(top.g)}</b> produced <b class="neg">${pct(share)}</b> of all losing dollars (${usd(-top.loss)}) ${n(top)}. Net on it: <span class="${cls(top.net)}">${signed(top.net)}</span>.`);
+  }
+  const best = (dim, label, min = 3) => {
+    const g = group(dim).filter(x => x.n >= min);
+    if (g.length < 2) return;
+    g.sort((a, b) => b.net - a.net);
+    const hi = g[0], lo = g[g.length - 1];
+    out.push(`<b>${label}:</b> best ${esc(hi.g)} <span class="${cls(hi.net)}">${signed(hi.net)}</span>, PF ${hi.pf === Infinity ? "∞" : num(hi.pf)} ${n(hi)}; worst ${esc(lo.g)} <span class="${cls(lo.net)}">${signed(lo.net)}</span>, PF ${lo.pf === Infinity ? "∞" : num(lo.pf)} ${n(lo)}.`);
+  };
+  best("strategy", "Strategy");
+  best("book_label", "Timeframe");
+  best("time_of_day", "Entry window");
+  const grades = group("grade").filter(x => x.n >= 3 && x.avg_r != null);
+  if (grades.length >= 2) out.push(`<b>Grade:</b> ` + sortGroups("grade", grades.map(x => x.g)).map(g => {
+    const x = grades.find(y => y.g === g); return `${esc(g)} ${rr(x.avg_r)} avg ${n(x)}`; }).join(" · ") + ".");
+  const manual = rows.filter(t => t.exit_type.startsWith("Manual"));
+  if (manual.length) { const m = stats(manual), rule = stats(rows.filter(t => !t.exit_type.startsWith("Manual")));
+    out.push(`<b>Your manual exits</b> (flatten/remove): <span class="${cls(m.net)}">${signed(m.net)}</span>, ${rr(m.avg_r)} avg ${n(m)}; rule exits ${rr(rule.avg_r)} avg ${n(rule)}. This can't show what holding would have made.`); }
+  const sides = group("side");
+  if (sides.length === 2) out.push(`<b>Long vs short:</b> ` + sides.map(x => `${x.g} <span class="${cls(x.net)}">${signed(x.net)}</span> ${n(x)}`).join(" · ") + ".");
+  const days = {}; for (const t of rows) days[t.exit_day] = (days[t.exit_day] || 0) + t.net;
+  const dv = Object.entries(days).sort((a, b) => a[1] - b[1]);
+  if (dv.length > 1 && dv[0][1] < 0) {
+    const worstSyms = {}; rows.filter(t => t.exit_day === dv[0][0]).forEach(t => worstSyms[t.symbol] = (worstSyms[t.symbol] || 0) + t.net);
+    const ws = Object.entries(worstSyms).sort((a, b) => a[1] - b[1])[0];
+    out.push(`<b>Worst day:</b> ${dv[0][0]} <span class="neg">${signed(dv[0][1])}</span>, mostly ${esc(ws[0])} (${signed(ws[1])}). Best: ${dv[dv.length - 1][0]} <span class="${cls(dv[dv.length - 1][1])}">${signed(dv[dv.length - 1][1])}</span>. Green days: ${dv.filter(d => d[1] > 0).length} of ${dv.length}.`);
+  }
+  $("#insights").innerHTML = out.map(x => `<li>${x}</li>`).join("");
+}
+
+// ---------------------------------------------------------- calendar
+function renderCalendar() {
+  const rows = filtered(null, true), byDay = {};   // the calendar ignores the date filter
+  for (const t of rows) { const x = byDay[t.exit_day] ||= {net: 0, n: 0}; x.net += t.net; x.n++; }
+  if (!CAL) CAL = (rows.length ? rows[rows.length - 1].exit_day : todayET()).slice(0, 7);
+  const [y, m] = CAL.split("-").map(Number);
+  $("#calTitle").textContent = new Date(Date.UTC(y, m - 1, 15)).toLocaleString(undefined, {month: "long", year: "numeric", timeZone: "UTC"});
+  const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const maxAbs = Math.max(1, ...Object.values(byDay).map(d => Math.abs(d.net)));
+  let h = ["Mon", "Tue", "Wed", "Thu", "Fri", "Week"].map(d => `<div class="hd">${d}</div>`).join("");
+  let cells = [], week = {net: 0, n: 0};
+  const flush = () => {
+    if (!cells.length) return;
+    while (cells.length < 5) cells.push(`<div class="day out"></div>`);
+    h += cells.join("") + `<div class="week">${week.n ? `<b class="${cls(week.net)}">${signed(week.net)}</b><span>${week.n} tr</span>` : ""}</div>`;
+    cells = []; week = {net: 0, n: 0};
+  };
+  for (let d = 1; d <= days; d++) {
+    const iso = `${CAL}-${String(d).padStart(2, "0")}`, wd = (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+    if (wd >= 5) { flush(); continue; }
+    if (!cells.length) for (let k = 0; k < wd; k++) cells.push(`<div class="day out"></div>`);
+    const x = byDay[iso], note = DATA.day_notes[iso];
+    let style = "";
+    if (x && x.net) style = `background: color-mix(in srgb, var(${x.net > 0 ? "--good" : "--bad"}) ${Math.round(10 + 32 * Math.abs(x.net) / maxAbs)}%, var(--surface))`;
+    if (x) { week.net += x.net; week.n += x.n; }
+    cells.push(`<div class="day ${SEL_DAY === iso ? "sel" : ""}" data-day="${iso}" style="${style}" title="${x ? `${iso}: ${signed(x.net)} on ${x.n} trade(s)` : iso}${note ? " · has a note" : ""}">
+      <div class="d"><span>${d}</span>${note ? '<span class="note-dot">✎</span>' : ""}</div>
+      <div class="p">${x ? signed(x.net) : ""}</div><div class="hint">${x ? x.n + " tr" : ""}</div></div>`);
+  }
+  flush();
+  $("#cal").innerHTML = h;
+  renderDayNote();
+}
+
+function renderDayNote() {
+  const el = $("#daynote");
+  if (!SEL_DAY) { el.innerHTML = `<p class="hint">Click a day to filter to it and write that day's review note.</p>`; return; }
+  el.innerHTML = `<label>Review note for ${SEL_DAY} (what the market did, what you changed, what to do tomorrow)</label>
+    <textarea id="dayText">${esc(DATA.day_notes[SEL_DAY] || "")}</textarea>
+    <div class="row-actions"><button class="primary small" id="daySave">Save note</button>
+    <button class="small" id="dayClose">Show all days</button><span class="msg" id="dayMsg"></span></div>`;
+}
+
+// --------------------------------------------------------- breakdown
+function renderBreakdown() {
+  $("#dimTabs").innerHTML = DIMS.map(([k, l]) => `<button class="small ${DIM === k ? "on" : ""}" data-dim-tab="${k}">${l}</button>`).join("");
+  const rows = filtered(DIM), m = {};
+  for (const t of rows) for (const g of groupsOf(t, DIM)) (m[g] ||= []).push(t);
+  let groups = Object.entries(m).map(([g, r]) => ({g, ...stats(r)}));
+  if (ORDER[DIM] || DIM === "time_of_day") { const o = sortGroups(DIM, groups.map(x => x.g)); groups.sort((a, b) => o.indexOf(a.g) - o.indexOf(b.g)); }
+  else groups.sort((a, b) => b.net - a.net);
+  if (!groups.length) { $("#breakdown").innerHTML = `<tr><td class="empty">No trades.</td></tr>`; return; }
+  const maxAbs = Math.max(1, ...groups.map(x => Math.abs(x.net)));
+  const note = DIM === "tag" ? " (a trade with two tags counts in both)" : ["sector", "cap_tier", "float_tier"].includes(DIM) ? " (today's FMP values, not the trade date's)" : "";
+  let h = `<thead><tr><th class="l">${DIM_LABEL[DIM]}${note}</th><th>Trades</th><th>Win %</th><th>Net P&amp;L</th><th>PF</th><th>Avg R</th><th>Expectancy</th><th>Avg win</th><th>Avg loss</th><th>Borrow</th></tr></thead><tbody>`;
+  for (const x of groups) {
+    const w = Math.round(45 * Math.abs(x.net) / maxAbs);
+    h += `<tr class="row ${F[DIM] === x.g ? "sel" : ""}" data-drill="${esc(x.g)}"><td class="l"><b>${esc(x.g)}</b>${x.n < 30 ? ' <span class="pill warn" title="Under 30 trades">small sample</span>' : ""}</td>
+      <td>${x.n}</td><td>${pct(x.win_rate)}</td>
+      <td><div class="barcell"><span class="${cls(x.net)}">${signed(x.net)}</span><span class="track"><span class="half l">${x.net < 0 ? `<span class="bar neg" style="width:${w}px"></span>` : ""}</span><span class="half">${x.net > 0 ? `<span class="bar pos" style="width:${w}px"></span>` : ""}</span></span></div></td>
+      <td>${x.pf === Infinity ? "∞" : num(x.pf)}</td><td class="${cls(x.avg_r)}">${rr(x.avg_r)}</td><td class="${cls(x.exp)}">${signed(x.exp)}</td>
+      <td>${usd(x.avg_win)}</td><td>${x.avg_loss == null ? "—" : usd(x.avg_loss)}</td><td>${usd(x.fees)}</td></tr>`;
+  }
+  $("#breakdown").innerHTML = h + "</tbody>";
+}
+
+// ------------------------------------------------------------ trades
+const COLS = [["exit_time", "Closed", "l"], ["book_label", "Book", "l"], ["symbol", "Symbol", "l"], ["strategy", "Strategy", "l"],
+  ["side", "Side", "l"], ["qty", "Qty"], ["entry_price", "Entry"], ["exit_price", "Exit"], ["net", "Net P&L"], ["r", "R"],
+  ["hold_min", "Hold"], ["exit_type", "Exit type", "l"], ["grade", "Grade", "l"], ["tags", "Tags / note", "l"]];
+
+function renderTrades(rows) {
+  const k = SORT.k, dir = SORT.dir;
+  rows = rows.slice().sort((a, b) => { const x = a[k], y = b[k];
+    return (x == null) - (y == null) || (x < y ? -1 : x > y ? 1 : 0) * dir; });
+  $("#tradeCount").textContent = `${rows.length} shown by the filters`;
+  if (!rows.length) { $("#trades").innerHTML = `<tr><td class="empty">No closed trades match these filters.</td></tr>`; $("#more").hidden = true; return; }
+  let h = `<thead><tr>${COLS.map(([c, l, a]) => `<th class="sort ${a || ""}" data-sort="${c}">${l}${SORT.k === c ? (SORT.dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("")}</tr></thead><tbody>`;
+  for (const t of rows.slice(0, SHOWN)) {
+    const key = t.book + ":" + t.id;
+    h += `<tr class="row" data-key="${key}"><td class="l">${fmtT(t.exit_time)}</td><td class="l">${esc(t.book_label)}</td>
+      <td class="l"><b>${esc(t.symbol)}</b></td><td class="l">${esc(t.strategy)}</td>
+      <td class="l"><span class="pill ${t.side}">${t.side}</span></td><td>${t.qty.toLocaleString()}</td>
+      <td>${num(t.entry_price, t.entry_price < 1 ? 4 : 2)}</td><td>${num(t.exit_price, t.exit_price < 1 ? 4 : 2)}</td>
+      <td class="${cls(t.net)}">${signed(t.net)}</td><td class="${cls(t.r)}">${rr(t.r)}</td><td>${hold(t.hold_min)}</td>
+      <td class="l">${esc(t.exit_type)}</td><td class="l">${esc(t.grade)}${t.grade_at_entry ? "" : '<span class="hint" title="Opened before grades were recorded per trade: this is the symbol\'s current grade"> *</span>'}</td>
+      <td class="l">${t.tags.map(x => `<span class="pill">${esc(x)}</span>`).join("")}${t.note ? '<span class="note-dot" title="Has a note">✎</span>' : ""}</td></tr>`;
+    if (OPEN_ROW === key) h += detailRow(t);
+  }
+  $("#trades").innerHTML = h + "</tbody>";
+  $("#more").hidden = rows.length <= SHOWN;
+  $("#more").textContent = `Show more (${rows.length - SHOWN} hidden)`;
+}
+
+function detailRow(t) {
+  const all = [...new Set(DATA.trades.flatMap(x => x.tags))].sort();
+  const cap = t.market_cap ? usd(t.market_cap / 1e6) + "M" : "—", fl = t.float_shares ? (t.float_shares / 1e6).toFixed(1) + "M sh" : "—";
+  return `<tr class="detail"><td colspan="${COLS.length}">
+    <div class="facts">
+      <div><span>Opened</span><br>${fmtT(t.entry_time)} ET · ${esc(t.time_of_day)}</div>
+      <div><span>Closed</span><br>${fmtT(t.exit_time)} ET · ${t.sessions} session${t.sessions === 1 ? "" : "s"}</div>
+      <div><span>Size</span><br>${t.qty.toLocaleString()} sh · ${usd(t.notional)} notional</div>
+      <div><span>Risk planned at entry</span><br>${usd(t.risk)} → result ${rr(t.r)}</div>
+      <div><span>P&amp;L</span><br>gross ${signed(t.gross, 2)} · borrow ${usd(t.fees, 2)} · net <b class="${cls(t.net)}">${signed(t.net, 2)}</b></div>
+      <div><span>Company (FMP, today)</span><br>${esc(t.sector)} · ${esc(t.industry)}<br>cap ${cap} · float ${fl}</div>
+    </div>
+    <div class="hint">Why it closed: ${esc(t.exit_reason)}</div>
+    <label>Note</label><textarea data-note>${esc(t.note)}</textarea>
+    <label>Tags (comma separated, e.g. offering, earnings, chased, would have held)</label>
+    <input type="text" data-tags list="taglist" value="${esc(t.tags.join(", "))}">
+    <datalist id="taglist">${all.map(x => `<option value="${esc(x)}">`).join("")}</datalist>
+    <div class="row-actions"><button class="primary small" data-save="${t.book}:${t.id}">Save</button>
+      <a class="small" href="/api/${t.book}/bars/${encodeURIComponent(t.symbol)}" target="_blank" rel="noopener">Bars for ${esc(t.symbol)}</a>
+      <span class="msg" data-msg></span></div>
+  </td></tr>`;
+}
+
+function toCsv(rows) {
+  const cols = ["book_label", "symbol", "strategy", "side", "qty", "entry_time", "entry_price", "exit_time", "exit_price",
+    "risk", "gross", "fees", "net", "r", "hold_min", "sessions", "exit_type", "exit_reason", "grade", "time_of_day",
+    "weekday", "price_tier", "sector", "industry", "cap_tier", "float_tier", "tags", "note"];
+  const q = v => { v = Array.isArray(v) ? v.join("; ") : v ?? ""; v = String(v); return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
+  return [cols.join(","), ...rows.map(t => cols.map(c => q(typeof t[c] === "number" ? +t[c].toFixed(4) : t[c])).join(","))].join("\n");
+}
+
+// ------------------------------------------------------------ events
+function setRange(k) {
+  RANGE = k; const t = todayET();
+  if (k === "all") FROM = TO = "";
+  else if (k === "today") FROM = TO = t;
+  else if (k === "mtd") { FROM = t.slice(0, 8) + "01"; TO = ""; }
+  else { FROM = addDays(t, -Number(k) + 1); TO = ""; }
+  SEL_DAY = null;
+}
+function reset() { SHOWN = 100; OPEN_ROW = null; render(); }
+
+document.addEventListener("click", async e => {
+  const b = e.target.closest("[data-book]"); if (b) { BOOK = b.dataset.book; return reset(); }
+  const r = e.target.closest("[data-range]"); if (r) { setRange(r.dataset.range); return reset(); }
+  const u = e.target.closest("[data-unset]"); if (u) { delete F[u.dataset.unset]; return reset(); }
+  const dt = e.target.closest("[data-dim-tab]"); if (dt) { DIM = dt.dataset.dimTab; return renderBreakdown(); }
+  const dr = e.target.closest("[data-drill]");
+  if (dr) { if (F[DIM] === dr.dataset.drill) delete F[DIM]; else F[DIM] = dr.dataset.drill; return reset(); }
+  const so = e.target.closest("[data-sort]");
+  if (so) { const k = so.dataset.sort; SORT = {k, dir: SORT.k === k ? -SORT.dir : (["symbol", "book_label", "strategy", "side", "exit_type", "grade"].includes(k) ? 1 : -1)}; return renderTrades(filtered()); }
+  const sv = e.target.closest("[data-save]");
+  if (sv) {
+    const [book, id] = sv.dataset.save.split(":"), row = sv.closest("td"), msg = row.querySelector("[data-msg]");
+    try {
+      const res = await api("/api/review/journal", {book, id: Number(id), note: row.querySelector("[data-note]").value, tags: row.querySelector("[data-tags]").value});
+      const t = DATA.trades.find(x => x.book === book && x.id === Number(id)); t.note = res.note; t.tags = res.tags;
+      msg.className = "msg ok"; msg.textContent = "Saved";
+      setTimeout(() => { renderFilters(); renderBreakdown(); renderTrades(filtered()); }, 600);
+    } catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
+    return;
+  }
+  if (e.target.closest("tr.detail")) return;
+  const tr = e.target.closest("tr.row[data-key]");
+  if (tr) { OPEN_ROW = OPEN_ROW === tr.dataset.key ? null : tr.dataset.key; return renderTrades(filtered()); }
+  const day = e.target.closest(".day[data-day]");
+  if (day) {
+    if (SEL_DAY === day.dataset.day) { SEL_DAY = null; FROM = TO = ""; RANGE = "all"; }
+    else { SEL_DAY = FROM = TO = day.dataset.day; RANGE = ""; }
+    return reset();
+  }
+  if (e.target.id === "daySave") {
+    const msg = $("#dayMsg"), note = $("#dayText").value;
+    try { await api("/api/review/day", {day: SEL_DAY, note});
+      if (note.trim()) DATA.day_notes[SEL_DAY] = note.trim(); else delete DATA.day_notes[SEL_DAY];
+      msg.className = "msg ok"; msg.textContent = "Saved"; renderCalendar(); }
+    catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
+    return;
+  }
+  if (e.target.id === "dayClose") { SEL_DAY = null; FROM = TO = ""; RANGE = "all"; return reset(); }
+});
+document.addEventListener("change", e => {
+  const s = e.target.closest("select[data-dim]");
+  if (s) { if (s.value) F[s.dataset.dim] = s.value; else delete F[s.dataset.dim]; return reset(); }
+  if (e.target.id === "from" || e.target.id === "to") { FROM = $("#from").value; TO = $("#to").value; RANGE = ""; SEL_DAY = null; return reset(); }
+});
+$("#clear").onclick = () => { F = {}; BOOK = "all"; setRange("all"); reset(); };
+$("#more").onclick = () => { SHOWN += 200; renderTrades(filtered()); };
+$("#calPrev").onclick = () => { const [y, m] = CAL.split("-").map(Number); const d = new Date(Date.UTC(y, m - 2, 1)); CAL = d.toISOString().slice(0, 7); renderCalendar(); };
+$("#calNext").onclick = () => { const [y, m] = CAL.split("-").map(Number); const d = new Date(Date.UTC(y, m, 1)); CAL = d.toISOString().slice(0, 7); renderCalendar(); };
+$("#csv").onclick = () => {
+  if (!DATA) return;
+  const blob = new Blob([toCsv(filtered())], {type: "text/csv"}), a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = `trade_review_${BOOK}_${FROM || "all"}_${TO || "now"}.csv`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+let rsz; addEventListener("resize", () => { clearTimeout(rsz); rsz = setTimeout(() => { if (DATA) { const r = filtered(); renderCurve(r); renderRdist(r); } }, 150); });
+load();
+</script>
+</body>
+</html>
