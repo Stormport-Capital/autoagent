@@ -13,9 +13,11 @@ after each hourly check the paper account is brought to the model's net
 position with market orders. Alpaca is paper only: the paper endpoint is hard-coded.
 **Step-by-step keys and setup: [SETUP.md](SETUP.md).**
 
-**Interactive Brokers (paper or LIVE), one book:** set `IBKR_ACCOUNT` and
-`IBKR_BOOK` and that book trades an IBKR account through IB Gateway instead.
-Guards for real money:
+**Interactive Brokers (paper or LIVE), per stock:** set `IBKR_ACCOUNT` and one
+IBKR account, shared by all books, trades through IB Gateway. Each watchlist
+row's **Live** button picks which tranches (5/10, 10/20, VWAP) the account
+follows for that symbol, from that book. A ticker is live from one book at a
+time. Guards for real money:
 
 - Share cap (default **1 share per symbol**, in the model's direction).
 - **Daily loss limit** (default **$100**): flattens and halts for the day.
@@ -182,7 +184,8 @@ closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&
 - `data.py` — Polygon, Yahoo, Alpaca and demo providers (5-minute bars)
 - `broker.py` — broker sync: net-position mirror, order log, reconciliation, share cap,
   daily loss limit and kill switch; the Alpaca paper client
-- `ibkr.py` — Interactive Brokers client (ib_async via IB Gateway), paper or live
+- `ibkr.py` — Interactive Brokers client (ib_async via IB Gateway), paper or live;
+  its orders, log, kill switch and loss latch are kept in `tranche_live.db`
 - `deploy/ib-gateway/compose.yml` — IB Gateway + IBC in Docker for the server
 - `store.py` — SQLite state (`tranche.db`), including settings defaults
 - `app.py` — web server and the hourly scheduler

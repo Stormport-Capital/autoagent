@@ -54,6 +54,8 @@ button:disabled { opacity: .5; cursor: default; }
 .seg input { display: none; }
 .seg label:has(input:checked) { background: var(--accent); color: #fff; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); max-width: 360px; }
+dialog::backdrop { background: #0006; }
 button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
 .msg { font-size: 12.5px; margin-top: 8px; min-height: 1em; }
 .msg.err { color: var(--bad); } .msg.ok { color: var(--good); }
@@ -194,7 +196,12 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
       </section>
 
       <section class="card">
-        <h2><span id="bkTitle">Broker account</span> <small id="bkState"></small></h2>
+        <h2><span id="lvTitle">IBKR account</span> <small id="lvState"></small></h2>
+        <div id="lvBody"></div>
+      </section>
+
+      <section class="card">
+        <h2><span id="bkTitle">Alpaca paper account</span> <small id="bkState"></small></h2>
         <div id="bkBody"></div>
       </section>
     </div>
@@ -281,7 +288,7 @@ function renderBooks(S) {
   $("#bookTabs").innerHTML = S.books.map(b => {
     const r = b.equity / b.start - 1;
     return `<button data-book="${b.key}" class="${b.key === BOOK ? "on" : ""}">${esc(b.label)} book
-      <small>${usd(b.equity)} · ${pct(r, 2)}${b.sync_on ? (b.live ? " · LIVE on" : " · broker on") : ""}</small></button>`;
+      <small>${usd(b.equity)} · ${pct(r, 2)}${b.sync_on ? " · paper on" : ""}</small></button>`;
   }).join("");
   document.title = `Tranche Dashboard - ${S.book.label}`;
 }
@@ -290,7 +297,7 @@ function render() {
   const S = STATE, m = S.summary, o = m.overall;
   renderBooks(S);
   $("#meta").innerHTML = [
-    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : (S.settings.broker_sync_enabled && S.broker.configured ? (S.broker.live ? '<span class="pill short">Model + LIVE IBKR orders (real money)</span>' : `Model + ${esc(S.broker.venue)} orders`) : "Model only · no orders sent")}</span>`,
+    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : [S.settings.broker_sync_enabled ? "Alpaca PAPER orders" : "", S.live.configured && S.live.enabled ? (S.live.live ? '<span class="pill short">LIVE IBKR orders (real money)</span>' : "IBKR paper orders") : ""].filter(Boolean).join(" + ") || "Model only · no orders sent"}</span>`,
     `<span>Data: ${esc(S.provider)}</span>`,
     `<span>${S.demo ? "Sim time" : "Now"}: ${fmtT(S.now)} · market ${S.market_open ? "open" : "closed"}</span>`,
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
@@ -315,7 +322,8 @@ function render() {
 
   renderSettings(S.settings);
   renderWatch(S);
-  renderBroker(S.broker);
+  renderBroker(S.broker, {p: "bk", on: S.settings.broker_sync_enabled, toggle: bk("/api/settings"), key: "broker_sync_enabled", sync: bk("/api/broker/sync")});
+  renderBroker(S.live, {p: "lv", on: S.live.enabled, toggle: "/api/live/settings", key: "enabled", sync: "/api/live/sync", kill: "/api/live/kill", shared: true});
   renderChart(m.curve, m.starting_capital, S.broker.curve || []);
   renderPerf(m);
   renderTab();
@@ -346,7 +354,7 @@ function renderWatch(S) {
     const stack = n.ema5 == null ? "warming up" :
       `<span title="${n.ema5 < n.ema10 ? "5 below 10" : "5 above 10"}; ${n.ema10 < n.ema20 ? "10 below 20" : "10 above 20"}">${num(n.ema5)} / ${num(n.ema10)} / ${num(n.ema20)}</span>`;
     const below = n.vwap != null && s.last_price != null && s.last_price < n.vwap;
-    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}
+    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="The IBKR account follows these tranches">${STATE.live.live ? "LIVE" : "IBKR"} ${s.live.split(",").map(x => SL_SHORT[x] || x).join("+")}</span>` : ""}
         ${s.error ? `<div class="err-text">${esc(s.error)}</div>` : ""}</td>
       <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} ·
         <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
@@ -363,6 +371,7 @@ function renderWatch(S) {
       <td><button class="small" data-act="bars" data-sym="${esc(s.symbol)}" title="Every bar the engine used, with EMAs, ATR, VWAP and signals">Bars</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
         <button class="small" data-act="eod" data-id="${s.id}" data-on="${s.eod_close ? 0 : 1}" title="${s.eod_close ? "Stop closing at end of day (positions may be held overnight again)" : "Trade all day, then be flat at the 3:55 PM close every session"}">${s.eod_close ? "EOD close: on" : "EOD close: off"}</button>
+        ${STATE.live.configured ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" data-else="${esc(s.live_elsewhere || "")}" title="Choose which tranches the IBKR account follows for this symbol">${s.live ? "Live: on" : s.live_elsewhere ? `Live in ${esc(s.live_elsewhere)}` : "Live: off"}</button>` : ""}
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
         <button class="small" data-act="rename" data-id="${s.id}" data-sym="${esc(s.symbol)}" title="Ticker changed? Move this symbol and its open positions to the new ticker">Rename</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
@@ -375,7 +384,7 @@ function renderChart(curve, start, paper) {
   const W = svg.clientWidth || 600, H = 220, P = {l: 64, r: 12, t: 10, b: 24};
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const series = [{name: "Model", color: "var(--series)", pts: curve}];
-  if (paper.length) series.push({name: (STATE.broker && STATE.broker.venue) || "Broker", color: "var(--series-2)", pts: paper});
+  if (paper.length) series.push({name: "Alpaca paper", color: "var(--series-2)", pts: paper});
   $("#legend").innerHTML = series.length > 1
     ? series.map(se => `<span><i style="background:${se.color}"></i>${se.name}</span>`).join("") : "";
   const all = series.flatMap(se => se.pts);
@@ -422,60 +431,69 @@ function renderChart(curve, start, paper) {
   hit.onmouseleave = () => { tip.style.display = "none"; xh.setAttribute("visibility", "hidden"); dots.forEach(d => d.setAttribute("visibility", "hidden")); };
 }
 
-function renderBroker(B) {
-  const on = STATE.settings.broker_sync_enabled;
+const SL_SHORT = {EMA5_10: "5/10", EMA10_20: "10/20", VWAP: "VWAP"};
+
+// one broker card: this book's Alpaca paper account (p="bk") or the shared IBKR account (p="lv")
+function renderBroker(B, o) {
+  const id = x => $(`#${o.p}${x}`);
   if (!B.configured) {
-    $("#bkTitle").textContent = "Broker account";
-    $("#bkState").textContent = "not linked";
-    $("#bkBody").innerHTML = `<div class="hint">${esc(B.reason)}. See SETUP.md (Alpaca paper) or IBKR.md (Interactive Brokers).</div>`;
+    id("State").textContent = "not linked";
+    id("Body").innerHTML = `<div class="hint">${esc(B.reason)}. See ${o.shared ? "IBKR.md" : "SETUP.md"}.</div>`;
     return;
   }
-  const a = B.account, C = B.control || {}, V = esc(B.venue), live = B.live;
-  $("#bkTitle").textContent = `${B.venue} account`;
-  $("#bkState").innerHTML = (live ? '<span class="pill short">LIVE · real money</span> ' : "") +
-    (C.kill ? `<span class="pill warn">kill switch: ${esc(C.kill)}</span>` : on ? '<span class="pill long">sync on</span>' : '<span class="pill">sync off</span>');
+  const a = B.account, C = B.control || {}, V = esc(B.venue), live = B.live, on = o.on;
+  id("Title").textContent = `${B.venue} account`;
+  id("State").innerHTML = (live ? '<span class="pill short">LIVE · real money</span> ' : "") +
+    (C.kill ? `<span class="pill warn">kill switch: ${esc(C.kill)}</span>` : on ? '<span class="pill long">orders on</span>' : '<span class="pill">orders off</span>');
   const mism = (B.reconciliation || []).filter(r => !r.match);
-  let h = `<label class="switch"><input type="checkbox" id="bkToggle" ${on ? "checked" : ""}> Send the model's trades to ${V}</label>
-    <div class="hint">${esc(B.endpoint)}. Orders go out right after each ${esc(STATE.book.label)} check.</div>`;
+  let h = `<label class="switch"><input type="checkbox" id="${o.p}Toggle" ${on ? "checked" : ""}> Send ${o.shared ? "the Live symbols' trades" : "the model's trades"} to ${V}</label>
+    <div class="hint">${esc(B.endpoint)}. ${o.shared ? "Shared by all books: pick symbols and tranches with the <b>Live</b> button on each watchlist row. Orders go out after each check of the symbol's book." : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
   if (C.max_shares || C.daily_loss_limit)
-    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (the model's direction, not its size)` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
+    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (the chosen tranches' direction, not their size)` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
   if (a) h += `<div class="bk-kpis">
-      <div><span>${live ? "Net liquidation" : "Equity"}</span>${usd(a.equity)}</div><div><span>Today${C.daily_loss_limit ? ` (limit −${usd(C.daily_loss_limit)})` : ""}</span><b class="${cls(a.day_pl)}">${a.day_pl == null ? "—" : signed(a.day_pl)}</b></div>
+      <div><span>${o.shared ? "Net liquidation" : "Equity"}</span>${usd(a.equity)}</div><div><span>Today${C.daily_loss_limit ? ` (limit −${usd(C.daily_loss_limit)})` : ""}</span><b class="${cls(a.day_pl)}">${a.day_pl == null ? "—" : signed(a.day_pl)}</b></div>
       <div><span>Buying power</span>${a.buying_power == null ? "—" : usd(a.buying_power)}</div><div><span>Cash</span>${a.cash == null ? "—" : usd(a.cash)}</div></div>`;
   if (a && (a.trading_blocked || a.shorting_enabled === false))
     h += `<div class="msg err">${a.trading_blocked ? "Trading is blocked on this account. " : ""}${a.shorting_enabled === false ? "Shorting is disabled on this account." : ""}</div>`;
   if (C.stopped) h += `<div class="msg err">No orders are being sent: ${esc(C.stopped)}.</div>`;
   if (B.error) h += `<div class="msg err">${esc(B.error)}</div>`;
   h += `<div class="hint">Last sync: ${fmtT(B.last_sync)} · ${!a || B.error ? '<span class="neg">position check unavailable</span>' : mism.length ? `<span class="neg">${mism.length} symbol(s) differ from the model</span>` : "account matches the model"}</div>
-    <div class="row" style="margin-top:8px"><button type="button" id="bkSync" ${on && !C.kill ? "" : "disabled"}>Sync now</button>
-      <button type="button" id="bkPause" ${C.kill ? "disabled" : ""}>Pause orders</button>
-      <button type="button" id="bkFlat" class="danger" ${C.kill === "flatten" ? "disabled" : ""}>Flatten &amp; stop</button>
-      ${C.kill ? '<button type="button" id="bkResume">Resume</button>' : ""}</div>`;
+    <div class="row" style="margin-top:8px"><button type="button" id="${o.p}Sync" ${on && !C.kill ? "" : "disabled"}>Sync now</button>
+      ${o.kill ? `<button type="button" id="${o.p}Pause" ${C.kill ? "disabled" : ""}>Pause orders</button>
+      <button type="button" id="${o.p}Flat" class="danger" ${C.kill === "flatten" ? "disabled" : ""}>Flatten &amp; stop</button>
+      ${C.kill ? `<button type="button" id="${o.p}Resume">Resume</button>` : ""}` : ""}</div>`;
   if (a && !B.error && (B.reconciliation || []).length) {
-    h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>${live ? "Live" : "Broker"}</th><th>Broker P&amp;L</th></tr></thead><tbody>` +
-      B.reconciliation.map(r => `<tr><td class="sym">${esc(r.symbol)}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}${r.note ? `<div class="err-text" style="max-width:220px">${esc(r.note)}</div>` : ""}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
+    h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>${live ? "Live" : o.shared ? "IBKR" : "Paper"}</th><th>P&amp;L</th></tr></thead><tbody>` +
+      B.reconciliation.map(r => `<tr><td class="l"><span class="sym">${esc(r.symbol)}</span>${o.shared ? `<div class="hint" style="margin:0">${r.book ? `${esc(r.book)} · ${r.sleeves.map(x => SL_SHORT[x] || x).join(" + ")}` : "not live: closing"}</div>` : ""}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}${r.note ? `<div class="err-text" style="max-width:220px">${esc(r.note)}</div>` : ""}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
       `</tbody></table></div>`;
   }
-  $("#bkBody").innerHTML = h;
-  $("#bkToggle").onchange = async e => {
+  if (o.shared) {
+    const ords = (B.orders || []).slice(0, 10), evs = (B.events || []).slice(0, 8);
+    if (ords.length) h += `<details style="margin-top:8px"><summary>Recent IBKR orders</summary><div class="tablewrap"><table><thead><tr><th class="l">Time</th><th class="l">Symbol</th><th>Side</th><th>Qty</th><th class="l">Status</th><th>Fill</th></tr></thead><tbody>` +
+      ords.map(x => `<tr><td class="l">${fmtT(x.ts)}</td><td class="l sym">${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${x.qty}</td><td class="l">${esc(x.status)}${x.message ? `<div class="err-text" style="max-width:220px">${esc(x.message)}</div>` : ""}</td><td>${x.filled_avg_price == null ? "—" : num(x.filled_avg_price)}</td></tr>`).join("") + `</tbody></table></div></details>`;
+    if (evs.length) h += `<details style="margin-top:4px"><summary>IBKR log</summary><div class="hint">${evs.map(e => `${fmtT(e.ts)} · ${e.symbol ? esc(e.symbol) + ": " : ""}${esc(e.message)}`).join("<br>")}</div></details>`;
+  }
+  id("Body").innerHTML = h;
+  id("Toggle").onchange = async e => {
     if (e.target.checked) {
       const ok = live
-        ? prompt(`LIVE account, real money. Open model positions will be opened at ${B.venue} (capped at ${C.max_shares || "no"} share(s) per symbol). Type LIVE to start.`) === "LIVE"
-        : confirm(`Start sending orders to ${B.venue}? Any open model positions will be opened there.`);
+        ? prompt(`LIVE account, real money. The Live symbols' positions will be opened at ${B.venue} (capped at ${C.max_shares || "no"} share(s) per symbol). Type LIVE to start.`) === "LIVE"
+        : confirm(`Start sending orders to ${B.venue}? Any open ${o.shared ? "Live-symbol" : "model"} positions will be opened there.`);
       if (!ok) { e.target.checked = false; return; }
     }
-    try { await api(bk("/api/settings"), {broker_sync_enabled: e.target.checked}); } catch (err) { alert(err.message); }
+    try { await api(o.toggle, {[o.key]: e.target.checked}); } catch (err) { alert(err.message); }
     refresh();
   };
+  id("Sync").onclick = async ev => { ev.target.disabled = true; try { await api(o.sync, {}); } catch (err) { alert(err.message); } refresh(); };
+  if (!o.kill) return;
   const kill = async (mode, msg) => {
     if (msg && !confirm(msg)) return;
-    try { await api(bk("/api/broker/kill"), {mode}); } catch (err) { alert(err.message); }
+    try { await api(o.kill, {mode}); } catch (err) { alert(err.message); }
     refresh();
   };
-  $("#bkSync").onclick = async ev => { ev.target.disabled = true; try { await api(bk("/api/broker/sync"), {}); } catch (err) { alert(err.message); } refresh(); };
-  $("#bkPause").onclick = () => kill("pause", `Pause: nothing more is sent to ${B.venue} (no entries, no exits) until you press Resume. Positions there stay as they are.`);
-  $("#bkFlat").onclick = () => kill("flatten", `Flatten & stop: cancel working orders and close every position this dashboard manages at ${B.venue} now, then send nothing until you press Resume. The model keeps trading on its own.`);
-  if ($("#bkResume")) $("#bkResume").onclick = () => kill("off", `Resume: the next sync brings ${B.venue} back to the model's current positions (it re-opens anything the model still holds).`);
+  id("Pause").onclick = () => kill("pause", `Pause: nothing more is sent to ${B.venue} (no entries, no exits) until you press Resume. Positions there stay as they are.`);
+  id("Flat").onclick = () => kill("flatten", `Flatten & stop: cancel working orders and close every position this dashboard manages at ${B.venue} now, then send nothing until you press Resume. The model keeps trading on its own.`);
+  if (id("Resume")) id("Resume").onclick = () => kill("off", `Resume: the next sync brings ${B.venue} back to the Live symbols' current positions (it re-opens what the chosen tranches still hold).`);
 }
 
 function statRow(name, st, extra = "") {
@@ -673,6 +691,21 @@ $("#watch").onclick = async e => {
     try { await api(bk(`/api/symbols/${b.dataset.id}/borrow`), {pct: v.trim() === "" ? null : Number(v)}); } catch (err) { alert(err.message); }
     return refresh();
   }
+  if (b.dataset.act === "live") {
+    if (b.dataset.else) { alert(`${b.dataset.sym} is live from the ${b.dataset.else} book. Turn it off there first: the IBKR account holds one position per ticker.`); return; }
+    const dlg = $("#liveDlg"), cur = (b.dataset.v || "").split(",");
+    $("#liveSym").textContent = `${b.dataset.sym} (${STATE.book.label} book)`;
+    $("#liveCap").textContent = (STATE.live.control || {}).max_shares || "no";
+    dlg.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = cur.includes(c.value));
+    dlg.onclose = async () => {
+      if (dlg.returnValue === "cancel" || !dlg.returnValue) return;
+      const sleeves = dlg.returnValue === "off" ? [] : [...dlg.querySelectorAll("input:checked")].map(c => c.value);
+      try { await api(bk(`/api/symbols/${b.dataset.id}/live`), {sleeves}); } catch (err) { alert(err.message); }
+      refresh();
+    };
+    dlg.returnValue = ""; dlg.showModal();
+    return;
+  }
   if (b.dataset.act === "eod") {
     try { await api(bk(`/api/symbols/${b.dataset.id}/eod`), {on: b.dataset.on === "1"}); } catch (err) { alert(err.message); }
     return refresh();
@@ -696,5 +729,15 @@ window.addEventListener("resize", () => STATE && renderChart(STATE.summary.curve
 refresh();
 setInterval(refresh, 5000);
 </script>
+<dialog id="liveDlg">
+  <form method="dialog">
+    <h3 style="margin:0 0 6px">IBKR live: <span id="liveSym"></span></h3>
+    <div class="hint" style="margin:0 0 8px">The IBKR account follows the net position of the ticked tranches in this book, capped at <span id="liveCap"></span> share(s), in their direction. The model keeps trading all three either way.</div>
+    <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross</label><br>
+    <label class="switch"><input type="checkbox" value="EMA10_20"> 10/20 EMA cross</label><br>
+    <label class="switch"><input type="checkbox" value="VWAP"> VWAP fail (short)</label>
+    <div class="row" style="margin-top:12px"><button value="save" class="primary">Save</button> <button value="off">Live off</button> <button value="cancel">Cancel</button></div>
+  </form>
+</dialog>
 </body>
 </html>

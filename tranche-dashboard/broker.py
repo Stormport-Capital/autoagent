@@ -144,10 +144,23 @@ class BrokerSync:
         self.needs_followup = False            # an order was working: re-sync soon
 
     # ---------------------------------------------------------------- sync
-    def desired(self) -> dict[str, int]:
+    def _net(self) -> dict[str, int]:
+        """The model's net shares per symbol (longs positive, shorts negative)."""
         want: dict[str, int] = {}
         for t in self.store.q("SELECT symbol, side, qty FROM tranches WHERE status='open'"):
             want[t["symbol"]] = want.get(t["symbol"], 0) + (t["qty"] if t["side"] == "long" else -t["qty"])
+        return want
+
+    def _renamed(self) -> dict[str, str]:
+        """New ticker -> old ticker, for symbols renamed in the app."""
+        return {r["symbol"]: r["renamed_from"] for r in self.store.q(
+            "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL")}
+
+    def _recon_extra(self, sym: str) -> dict:
+        return {}
+
+    def desired(self) -> dict[str, int]:
+        want = self._net()
         if self.max_shares:  # same direction as the model, at most max_shares
             want = {s: max(-self.max_shares, min(self.max_shares, q)) for s, q in want.items()}
         return want
@@ -186,9 +199,7 @@ class BrokerSync:
         busy = {o["symbol"]: o for o in self.broker.open_orders()}
         self.needs_followup = False
         # a renamed ticker waits until the account has converted the old one
-        waiting = {r["symbol"]: r["renamed_from"] for r in self.store.q(
-            "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL")
-            if pos.get(r["renamed_from"])}
+        waiting = {new: old for new, old in self._renamed().items() if pos.get(old)}
         for sym in sorted(self.managed() | set(want)):
             target, cur = want.get(sym, 0), pos.get(sym, 0)
             if self.max_shares and abs(target) > self.max_shares:  # never: desired() caps it
@@ -459,6 +470,7 @@ class BrokerSync:
                 "unrealized": float(p["unrealized_pl"]) if p else None,
                 "match": paper == want.get(sym, 0),
                 "note": held.get(sym),
+                **self._recon_extra(sym),
             })
         acct = self.snapshot["account"]
         now = datetime.now(ET)
@@ -491,3 +503,67 @@ class BrokerSync:
             "orders": self.store.q("SELECT * FROM orders ORDER BY id DESC LIMIT 200"),
             "curve": self.store.q("SELECT ts, equity FROM broker_equity ORDER BY ts"),
         }
+
+
+class LiveSync(BrokerSync):
+    """The IBKR account, shared by all books. Each watchlist symbol picks which
+    of its tranches the account follows (symbols.live, e.g. 'EMA5_10,VWAP');
+    the account holds the sign of those tranches' net position, capped at
+    max_shares. A ticker is live from one book at a time (books may disagree on
+    direction, and the account holds one position per ticker). Orders, events,
+    the kill switch and the loss-limit latch live in this sync's own store."""
+
+    def __init__(self, store, broker, books: dict, **kw):
+        super().__init__(store, broker, **kw)
+        self.books = books  # key -> (label, Store)
+
+    def enabled(self) -> bool:
+        return bool(self.store.settings()["broker_sync_enabled"])
+
+    def selections(self) -> dict[str, dict]:
+        """ticker -> {book, label, sleeves} for every live symbol."""
+        out = {}
+        for key, (label, st) in self.books.items():
+            for r in st.q("SELECT id, symbol, live FROM symbols WHERE live IS NOT NULL "
+                          "AND status != 'removed'"):
+                out.setdefault(r["symbol"], {"book": key, "label": label, "id": r["id"],
+                                             "sleeves": r["live"].split(",")})
+        return out
+
+    def live_in(self, ticker: str, except_book: str | None = None) -> str | None:
+        """Label of the book where `ticker` is already live (None = nowhere)."""
+        for key, (label, st) in self.books.items():
+            if key != except_book and st.q("SELECT 1 FROM symbols WHERE symbol=? AND live IS NOT "
+                                           "NULL AND status != 'removed'", (ticker,)):
+                return label
+        return None
+
+    def _net(self) -> dict[str, int]:
+        want: dict[str, int] = {}
+        for sym, sel in self.selections().items():
+            st = self.books[sel["book"]][1]
+            marks = ",".join("?" * len(sel["sleeves"]))
+            for t in st.q(f"SELECT side, qty FROM tranches WHERE status='open' AND symbol_id=? "
+                          f"AND sleeve IN ({marks})", (sel["id"], *sel["sleeves"])):
+                want[sym] = want.get(sym, 0) + (t["qty"] if t["side"] == "long" else -t["qty"])
+            want.setdefault(sym, 0)
+        return want
+
+    def managed(self) -> set[str]:
+        """Live symbols, plus anything this link ever traded: a symbol switched
+        off (or removed) is closed, never left behind."""
+        traded = {r["symbol"] for r in self.store.q("SELECT DISTINCT symbol FROM orders")}
+        return set(self.selections()) | traded
+
+    def _renamed(self) -> dict[str, str]:
+        out = {}
+        for _label, st in self.books.values():
+            out.update({r["symbol"]: r["renamed_from"] for r in st.q(
+                "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL "
+                "AND live IS NOT NULL")})
+        return out
+
+    def _recon_extra(self, sym: str) -> dict:
+        sel = self.selections().get(sym)
+        return {"book": sel["label"] if sel else None,
+                "sleeves": sel["sleeves"] if sel else []}

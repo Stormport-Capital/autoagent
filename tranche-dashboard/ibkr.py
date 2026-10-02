@@ -1,4 +1,7 @@
-"""Interactive Brokers link (paper or LIVE) for ONE book, through IB Gateway.
+"""Interactive Brokers link (paper or LIVE), shared by all books, through IB Gateway.
+
+Which symbols and tranches it trades is chosen per watchlist row (Live button);
+broker.LiveSync turns those choices into one target position per ticker.
 
 IBKRBroker speaks the same small interface as broker.AlpacaPaper (account,
 positions, open_orders, submit, get_order) plus cancel / quote / short_check /
@@ -35,7 +38,6 @@ from dataclasses import dataclass
 
 from broker import BrokerError
 
-BOOK_KEYS = ("1h", "15m", "5m")
 DEFAULT_PORTS = {"paper": 4002, "live": 4001}  # IB Gateway; TWS uses 7497 / 7496
 DONE = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
 STATUS = {"Filled": "filled", "Cancelled": "canceled", "ApiCancelled": "canceled",
@@ -45,7 +47,6 @@ WARNING_CODES = {0, 399, 2104, 2106, 2107, 2108, 2158, 10167}  # informational, 
 
 @dataclass
 class IBKRConfig:
-    book: str
     account: str
     mode: str                  # paper | live
     host: str = "127.0.0.1"
@@ -88,9 +89,6 @@ def config_from_env(env=None) -> IBKRConfig | None:
         raise BrokerError(f"IBKR_MODE=paper but {account} is not a paper account ID (DU...)")
     if mode == "live" and not (account.startswith("U") and account[1:].isdigit()):
         raise BrokerError(f"IBKR_MODE=live but {account} is not a live account ID (U...)")
-    book = (env.get("IBKR_BOOK") or "").strip().lower()
-    if book not in BOOK_KEYS:
-        raise BrokerError("set IBKR_BOOK to the one book that trades at IBKR: 1h, 15m or 5m")
     order_type = (env.get("IBKR_ORDER_TYPE") or "limit").strip().lower()
     if order_type not in ("limit", "market"):
         raise BrokerError("IBKR_ORDER_TYPE must be limit or market")
@@ -98,7 +96,7 @@ def config_from_env(env=None) -> IBKRConfig | None:
     if mode == "live" and loss <= 0:
         raise BrokerError("IBKR_DAILY_LOSS_LIMIT must be above 0 for a live account")
     return IBKRConfig(
-        book=book, account=account, mode=mode,
+        account=account, mode=mode,
         host=(env.get("IBKR_HOST") or "127.0.0.1").strip(),
         port=_num(env, "IBKR_PORT", DEFAULT_PORTS[mode], int, 1),
         client_id=_num(env, "IBKR_CLIENT_ID", 17, int, 0),

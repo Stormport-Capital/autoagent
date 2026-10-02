@@ -1,16 +1,46 @@
 # Interactive Brokers link (paper or LIVE)
 
-One book (the one you name in `IBKR_BOOK`) can trade an Interactive Brokers
-account instead of an Alpaca paper account. The same sync logic is used, with
-extra guards for real money. The other two books keep their Alpaca paper links.
+One Interactive Brokers account, paper or live, is shared by all three books.
+**You choose per stock what it trades:** each watchlist row has a **Live**
+button where you tick which tranches the IBKR account follows for that symbol:
+
+- 5/10 EMA cross
+- 10/20 EMA cross
+- VWAP fail
+
+Any combination works, from any book. The Alpaca paper accounts are not
+affected; each book keeps its own.
+
+## Choosing what trades live
+
+- **Per symbol, per tranche, per book.** Example:
+  - GRML: 15-min book, VWAP only.
+  - USDE: Hourly book, 10/20 only.
+  - KNRX: 5-min book, 5/10 + 10/20.
+- **A ticker is live from one book at a time.** The IBKR account holds one
+  position per ticker. If the Hourly and 15-min books disagreed on GRML's
+  direction, they would fight. The dashboard refuses the second book and says
+  which book has it.
+  - To move a ticker to another book: **Live off** in the first book, then
+    tick the tranches in the second.
+- **Several tranches ticked:** the account follows their combined net
+  position. For example, 5/10 long 120 sh + VWAP short 40 sh = net long, so
+  +1 share.
+- **Live off, Remove, or a book Reset** closes that ticker's IBKR position at
+  the next sync. A ticker the link ever traded is never left behind.
+- **The model is not changed.** It keeps trading all three tranches and
+  reporting their performance. Live only decides what the IBKR account
+  follows.
 
 ## What it does
 
 - **It follows the direction, not the size.** With the default `IBKR_MAX_SHARES=1`,
-  the account holds **−1, 0 or +1 share** of each symbol: short when the model's
-  net position is short, long when it's long, flat when it's flat. So the live
-  P&L is **not** the model's P&L. It tests the plumbing: signals, orders,
+  the account holds **−1, 0 or +1 share** of each Live symbol: short when the
+  chosen tranches are net short, long when net long, flat when flat. So the
+  live P&L is **not** the model's P&L. It tests the plumbing: signals, orders,
   borrow, fills and fees.
+- **When orders go out:** after each check of the symbol's book. A 5-min-book
+  symbol syncs every 5 minutes; an Hourly one, hourly.
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.
@@ -56,8 +86,8 @@ extra guards for real money. The other two books keep their Alpaca paper links.
     from iBorrowDesk.
   - The model's overnight borrow limit (200%) then makes those symbols flat by
     15:55. The account follows the model.
-- **Only symbols in this book are touched.** Anything else in the account is
-  left alone. That includes manual trades and their orders.
+- **Only Live symbols (and ones it traded before) are touched.** Anything else
+  in the account is left alone. That includes manual trades and their orders.
 - **The account ID sets the mode.** `IBKR_MODE=paper` needs a `DU…` paper
   account and `IBKR_MODE=live` needs a `U…` live account. IB Gateway must be
   logged in to exactly that account, or nothing is sent.
@@ -128,18 +158,21 @@ Add these lines to `/opt/tranche/autoagent/tranche-dashboard/.env`:
 ```
 IBKR_ACCOUNT=DU1234567
 IBKR_MODE=paper
-IBKR_BOOK=15m
 ```
 
 Then run `systemctl restart tranche` and check the startup lines with
 `journalctl -u tranche -n 40 --no-pager`:
 
 ```
-IBKR paper (15-min): OK - DU1234567 net liquidation $1,000,000.00; cap 1 share(s), daily loss limit $100
+IBKR paper: OK - DU1234567 net liquidation $1,000,000.00; cap 1 share(s) per symbol, daily loss limit $100; 0 live symbol(s)
 ```
 
-On the dashboard, open the book's tab. The broker card shows
-**IBKR paper account**. Turn on **Send the model's trades to IBKR paper**.
+On the dashboard, the **IBKR paper account** card shows on every book tab.
+
+1. On each watchlist row you want traded, click **Live: off**, tick the
+   tranches, then click **Save**. The row shows a red pill such as
+   `IBKR VWAP`.
+2. Turn on **Send the Live symbols' trades to IBKR paper** in the IBKR card.
 
 ### 4. Paper test, then live
 
@@ -158,11 +191,9 @@ On the dashboard, open the book's tab. The broker card shows
    ```
 
    Then run `systemctl restart tranche`.
-4. **Start live orders.** Switching orders on for a LIVE book requires typing
-   **LIVE**. The card shows a red **LIVE · real money** badge.
-
-Only one book can trade the IBKR account. IBKR nets one position per symbol per
-account, so two books would fight each other.
+4. **Start live orders.** Switching orders on for a LIVE account requires
+   typing **LIVE**. The card shows a red **LIVE · real money** badge. Your
+   Live selections carry over from the paper test.
 
 ## Costs at one share
 
@@ -185,7 +216,6 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 |---|---|---|
 | `IBKR_ACCOUNT` | (off) | `DU…` paper or `U…` live account ID |
 | `IBKR_MODE` | `paper` | `paper` or `live`; must match the account ID |
-| `IBKR_BOOK` | (required) | `1h`, `15m` or `5m` |
 | `IBKR_MAX_SHARES` | 1 | Max shares per symbol, either direction |
 | `IBKR_DAILY_LOSS_LIMIT` | 100 | $ loss in a day that halts and flattens (live: must be > 0) |
 | `IBKR_MAX_ORDER_USD` | 1000 | Max value of one order |
@@ -198,7 +228,7 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 
 ## Not covered
 
-- **No resting stop orders at IBKR.** Exits happen at the book's bar checks,
+- **No resting stop orders at IBKR.** Exits happen at the symbol's book's bar checks,
   as in the model. A gap between checks is not protected. The loss limit is
   checked once a minute and acts at market.
 - **No pre-borrow and no locate purchase.** If IBKR can't borrow a stock, that

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from datetime import date, datetime, time, timedelta
 
-from broker import AlpacaPaper, BrokerError, BrokerSync
+from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync
 import app
 import review
 from app import bar_for_boundary, boundaries
@@ -1690,7 +1690,7 @@ class FakeIB:
 
 
 def ib_cfg(**kw):
-    env = {"IBKR_ACCOUNT": "DU123", "IBKR_MODE": "paper", "IBKR_BOOK": "15m"}
+    env = {"IBKR_ACCOUNT": "DU123", "IBKR_MODE": "paper"}
     env.update(kw)
     return ibkr.config_from_env(env)
 
@@ -1701,8 +1701,8 @@ class IBKRConfigTests(unittest.TestCase):
 
     def test_defaults(self):
         c = ib_cfg()
-        self.assertEqual((c.book, c.mode, c.port, c.max_shares, c.daily_loss_limit),
-                         ("15m", "paper", 4002, 1, 100.0))
+        self.assertEqual((c.mode, c.port, c.max_shares, c.daily_loss_limit),
+                         ("paper", 4002, 1, 100.0))
         live = ib_cfg(IBKR_ACCOUNT="U7654321", IBKR_MODE="live")
         self.assertEqual(live.port, 4001)
 
@@ -1715,8 +1715,6 @@ class IBKRConfigTests(unittest.TestCase):
             ib_cfg(IBKR_MODE="real")
 
     def test_book_and_numbers_validated(self):
-        with self.assertRaisesRegex(BrokerError, "IBKR_BOOK"):
-            ib_cfg(IBKR_BOOK="")
         with self.assertRaises(BrokerError):
             ib_cfg(IBKR_MAX_SHARES="0")
         with self.assertRaises(BrokerError):
@@ -1977,29 +1975,184 @@ class LiveGuardTests(unittest.TestCase):
         BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
         self.assertEqual(fb.sent, [("AAA", "sell", 100)])
 
-    def test_link_puts_ibkr_on_its_book_only(self):
-        keys = ("IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOK", "APCA_15M_API_KEY_ID",
-                "APCA_15M_API_SECRET_KEY")
+    def test_link_live_from_env(self):
+        keys = ("IBKR_ACCOUNT", "IBKR_MODE")
         old = {k: os.environ.get(k) for k in keys}
         orig = ibkr.IBKRBroker.__init__
         try:
             ibkr.IBKRBroker.__init__ = lambda self, cfg, **kw: orig(self, cfg, ib=FakeIB(), api=FakeApi)
-            os.environ.update({"IBKR_ACCOUNT": "DU123", "IBKR_MODE": "paper", "IBKR_BOOK": "5m",
-                               "APCA_15M_API_KEY_ID": "PK15", "APCA_15M_API_SECRET_KEY": "s"})
-            links = app.link_papers(demo=False)
-            self.assertIsInstance(links["5m"][0], ibkr.IBKRBroker)
-            self.assertIsInstance(links["15m"][0], AlpacaPaper)
-            self.assertIsNone(app.link_papers(demo=True)["5m"][0])
-            os.environ["IBKR_MODE"] = "live"  # DU account with live mode: refused, book unlinked
-            links = app.link_papers(demo=False)
-            self.assertIsNone(links["5m"][0])
-            self.assertIn("not a live account", links["5m"][1])
+            for k in keys:
+                os.environ.pop(k, None)
+            self.assertIsNone(app.link_live(False)[0])
+            os.environ.update({"IBKR_ACCOUNT": "DU123", "IBKR_MODE": "paper"})
+            self.assertIsInstance(app.link_live(False)[0], ibkr.IBKRBroker)
+            self.assertIsNone(app.link_live(True)[0])
+            os.environ["IBKR_MODE"] = "live"  # DU account with live mode: refused, not linked
+            ib, note = app.link_live(False)
+            self.assertIsNone(ib)
+            self.assertIn("not a live account", note)
         finally:
             ibkr.IBKRBroker.__init__ = orig
             for k, v in old.items():
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
+
+
+
+class LiveSelectionTests(unittest.TestCase):
+    """The shared IBKR link: per symbol, per tranche, from any one book."""
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
+        self.engines = {k: Engine(self.stores[k], ScriptedProvider([])) for k in ("1h", "15m", "5m")}
+        self.ib = FakeIB()
+        self.b = ibkr.IBKRBroker(ib_cfg(), ib=self.ib, api=FakeApi)
+        labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
+        self.live = LiveSync(self.stores["live"], self.b,
+                             {k: (labels[k], self.stores[k]) for k in labels},
+                             fill_wait_s=0, max_shares=1, daily_loss_limit=100)
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    def add(self, book, sym):
+        self.engines[book].add_symbols(sym, "long_short", 1.0, self.NOW)
+        return self.stores[book].q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+
+    def tranche(self, book, sym, sleeve, side, qty):
+        st = self.stores[book]
+        sid = st.q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+        st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                entry_price, stop_price, risk_dollars, fee_through)
+                VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21')""",
+             (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
+
+    def test_only_the_chosen_tranches_count(self):
+        sid = self.add("15m", "AAA")
+        self.tranche("15m", "AAA", "EMA5_10", "long", 100)
+        self.tranche("15m", "AAA", "VWAP", "short", 50)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.placed, [])  # nothing is live yet
+        self.engines["15m"].set_live(sid, ["VWAP"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.engines["15m"].set_live(sid, ["EMA5_10"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": 1})
+        self.engines["15m"].set_live(sid, ["EMA5_10", "VWAP"], self.NOW)  # net +50
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": 1})
+        self.engines["15m"].set_live(sid, [], self.NOW)  # switched off: closed, not abandoned
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {})
+
+    def test_symbols_from_different_books(self):
+        a = self.add("1h", "AAA")
+        b = self.add("5m", "BBB")
+        self.add("15m", "CCC")
+        self.tranche("1h", "AAA", "EMA10_20", "short", 30)
+        self.tranche("5m", "BBB", "VWAP", "short", 20)
+        self.tranche("15m", "CCC", "EMA5_10", "long", 99)  # not live: never sent
+        self.engines["1h"].set_live(a, ["EMA10_20"], self.NOW)
+        self.engines["5m"].set_live(b, ["VWAP", "EMA5_10"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": -1})
+        rows = {r["symbol"]: r for r in self.live.status()["reconciliation"]}
+        self.assertEqual((rows["AAA"]["book"], rows["AAA"]["sleeves"]), ("Hourly", ["EMA10_20"]))
+        self.assertEqual(rows["BBB"]["sleeves"], ["EMA5_10", "VWAP"])
+        self.assertNotIn("CCC", rows)
+
+    def test_live_selection_is_exclusive_per_ticker(self):
+        a = self.add("1h", "AAA")
+        self.add("15m", "AAA")
+        self.assertIsNone(self.live.live_in("AAA"))
+        self.engines["1h"].set_live(a, ["VWAP"], self.NOW)
+        self.assertEqual(self.live.live_in("AAA", except_book="15m"), "Hourly")
+        self.assertIsNone(self.live.live_in("AAA", except_book="1h"))
+
+    def test_removed_symbol_is_closed(self):
+        a = self.add("15m", "AAA")
+        self.tranche("15m", "AAA", "VWAP", "short", 10)
+        self.engines["15m"].set_live(a, ["VWAP"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.stores["15m"].x("UPDATE symbols SET last_price=10 WHERE id=?", (a,))
+        self.engines["15m"].set_status(a, "removed", self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {})
+
+    def test_set_live_validation(self):
+        a = self.add("15m", "AAA")
+        with self.assertRaises(ValidationError):
+            self.engines["15m"].set_live(a, ["MACD"], self.NOW)
+        self.assertEqual(self.engines["15m"].set_live(a, ["VWAP", "EMA5_10"], self.NOW),
+                         ["EMA5_10", "VWAP"])
+
+    def test_http_live_routes(self):
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        self.add("1h", "AAA")
+        b = self.add("15m", "AAA")
+        a1 = self.stores["1h"].q("SELECT id FROM symbols")[0]["id"]
+
+        class Clock:
+            demo = False
+
+            def now(s):
+                return self.NOW
+
+        class B:
+            def __init__(s, key, label, eng):
+                s.key, s.label, s.engine, s.minutes = key, label, eng, eng.minutes
+                s.sched = app.Scheduler(eng, Clock(), None, self.live)
+                s.link_note = "no paper keys"
+        books = {k: B(k, l, self.engines[k]) for k, l in (("1h", "Hourly"), ("15m", "15-min"), ("5m", "5-min"))}
+        old = os.environ.pop("TRANCHE_PASSWORD", None)
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(books, "demo", None, None, self.live))
+        finally:
+            if old is not None:
+                os.environ["TRANCHE_PASSWORD"] = old
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def call(path, body):
+            req = urllib.request.Request(base + path, method="POST", data=_json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, _json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, _json.loads(e.read())
+        try:
+            self.assertEqual(call(f"/api/1h/symbols/{a1}/live", {"sleeves": ["VWAP"]})[0], 200)
+            code, err = call(f"/api/15m/symbols/{b}/live", {"sleeves": ["EMA5_10"]})
+            self.assertEqual(code, 400)
+            self.assertIn("already live from the Hourly book", err["error"])
+            self.assertEqual(call(f"/api/15m/symbols/{b}/live", {"sleeves": []})[0], 200)  # off is fine
+            self.assertEqual(call("/api/live/settings", {"enabled": True})[0], 200)
+            self.assertTrue(self.live.enabled())
+            self.assertEqual(call("/api/live/kill", {"mode": "pause"})[0], 200)
+            self.assertEqual(self.live.stop_reason(self.NOW)[0], "pause")
+            self.assertEqual(call("/api/live/kill", {"mode": "nuke"})[0], 400)
+            self.assertEqual(call("/api/live/kill", {"mode": "off"})[0], 200)
+            with urllib.request.urlopen(base + "/api/1h/state") as r:
+                st = _json.loads(r.read())
+            self.assertTrue(st["live"]["configured"])
+            self.assertEqual(st["live"]["venue"], "IBKR paper")
+            with urllib.request.urlopen(base + "/api/15m/state") as r:
+                st = _json.loads(r.read())
+            self.assertEqual(st["symbols"][0]["live_elsewhere"], "Hourly")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

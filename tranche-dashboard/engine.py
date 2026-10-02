@@ -263,6 +263,22 @@ class Engine:
                     f"limit")
         return None
 
+    def set_live(self, symbol_id: int, sleeves, now: datetime) -> list[str]:
+        """Which of this symbol's tranches the IBKR account follows (empty =
+        none). The model itself keeps trading all three either way."""
+        sym = self._symbol(symbol_id)
+        asked = set(sleeves or [])
+        if asked - set(SLEEVE_LABELS):
+            raise ValidationError("unknown tranche")
+        sleeves = [s for s in SLEEVE_LABELS if s in asked]
+        if sleeves and sym["status"] == "removed":
+            raise ValidationError(f"{sym['symbol']} was removed")
+        self.store.x("UPDATE symbols SET live=? WHERE id=?", (",".join(sleeves) or None, symbol_id))
+        self.store.log(now, "live", f"{sym['symbol']}: IBKR follows " + (
+            " + ".join(SLEEVE_LABELS[s] for s in sleeves) if sleeves else "nothing (live off)"),
+            sym["symbol"])
+        return sleeves
+
     def set_eod_close(self, symbol_id: int, on: bool, now: datetime) -> None:
         """Day-trade mode: the symbol still trades all session, but takes no new
         entries from 15:55 ET and is flat at the 15:55 5-minute close."""

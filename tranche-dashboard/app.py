@@ -12,8 +12,9 @@ account.
 
 The model is simulated. Orders go only to a linked broker account, only when
 switched on in the dashboard: an Alpaca PAPER account per book (broker.py /
-SETUP.md), or for ONE book an Interactive Brokers account, paper or live, with
-a share cap, a daily loss limit and a kill switch (ibkr.py / IBKR.md).
+SETUP.md), and one Interactive Brokers account, paper or live, shared by all
+books, trading only the symbols and tranches marked Live, with a share cap, a
+daily loss limit and a kill switch (ibkr.py / IBKR.md).
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from backup import Backups, backup_folder
-from broker import AlpacaPaper, BrokerError, BrokerSync
+from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync
 import ibkr
 from data import make_provider, redact
 from engine import SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
@@ -72,7 +73,7 @@ KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
 OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
                  "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",  # 15-min book's paper account
                  "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",  # 5-min book's paper account
-                 "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOK")  # Interactive Brokers (IBKR.md)
+                 "IBKR_ACCOUNT", "IBKR_MODE")  # Interactive Brokers (IBKR.md)
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -195,11 +196,13 @@ class Scheduler(threading.Thread):
     """One book's clock: a tick at the 9:30 open (for yesterday's last bar)
     and as each intraday bar closes."""
 
-    def __init__(self, engine: Engine, clock, sync: BrokerSync | None = None):
+    def __init__(self, engine: Engine, clock, sync: BrokerSync | None = None,
+                 live: LiveSync | None = None):
         super().__init__(daemon=True)
         self.engine, self.clock = engine, clock
         self.minutes = engine.minutes
-        self.sync = sync  # never set in demo mode
+        self.sync = sync  # this book's Alpaca paper link; never set in demo mode
+        self.live = live  # the shared IBKR link; never set in demo mode
         self.last_tick: datetime | None = None
         self.last_error: str | None = None
 
@@ -219,6 +222,8 @@ class Scheduler(threading.Thread):
     def run_sync(self) -> None:
         if self.sync and self.engine.store.settings()["broker_sync_enabled"]:
             self.sync.sync(self.clock.now())
+        if self.live and self.live.enabled():
+            self.live.sync(self.clock.now())
 
     def retry_due(self, now: datetime, boundary: datetime) -> bool:
         """Re-check every 3 min for up to 40 min after a boundary while some
@@ -244,11 +249,11 @@ class Scheduler(threading.Thread):
                 self.run_tick()
             elif due and self.retry_due(now, due[-1]):
                 self.run_tick()  # the feed hadn't finished that hour yet: look again
-            elif self.sync and self.sync.needs_followup and self.sync.last_sync \
-                    and (now - self.sync.last_sync).total_seconds() >= 60:
+            elif any(s and s.needs_followup and s.last_sync
+                     and (now - s.last_sync).total_seconds() >= 60 for s in (self.sync, self.live)):
                 self.run_sync()  # an order was still working: finish the job
-            elif self.sync and self.engine.store.settings()["broker_sync_enabled"]:
-                self.sync.watch(now)  # daily loss limit, between bar checks
+            elif self.live and self.live.enabled():
+                self.live.watch(now)  # daily loss limit, between bar checks
 
 
 class DemoDriver(threading.Thread):
@@ -327,11 +332,6 @@ def connection_check(provider, papers: list, now: datetime) -> list[str]:
             continue
         try:
             a = paper.account()
-            if isinstance(paper, ibkr.IBKRBroker):
-                lines.append(f"{venue} ({label}): OK - {a['account_id']} net liquidation "
-                             f"${float(a['equity']):,.2f}; cap {paper.max_shares} share(s), "
-                             f"daily loss limit ${paper.daily_loss_limit:,.0f}")
-                continue
             lines.append(f"{venue} ({label}): OK - equity ${float(a['equity']):,.2f}, "
                          f"shorting {'enabled' if a.get('shorting_enabled') else 'DISABLED'}"
                          + (", TRADING BLOCKED" if a.get("trading_blocked") else ""))
@@ -340,11 +340,24 @@ def connection_check(provider, papers: list, now: datetime) -> list[str]:
     return lines
 
 
+def live_check(live: "LiveSync | None", note: str | None) -> str:
+    if live is None:
+        return f"IBKR: not linked - {note}"
+    b = live.broker
+    try:
+        a = b.account()
+        return (f"{b.venue}: OK - {a['account_id']} net liquidation ${float(a['equity']):,.2f}; "
+                f"cap {b.max_shares} share(s) per symbol, daily loss limit "
+                f"${b.daily_loss_limit:,.0f}; {len(live.selections())} live symbol(s)")
+    except Exception as e:
+        return f"{b.venue}: FAILED - {_short(e)}"
+
+
 def market_open(now: datetime) -> bool:
     return now.weekday() < 5 and RTH_OPEN <= now.time() < time(16, 0)
 
 
-def build_state(book: Book, books: list, provider_name: str, demo) -> dict:
+def build_state(book: Book, books: list, provider_name: str, demo, live=None) -> dict:
     engine, sched = book.engine, book.sched
     store = engine.store
     now = sched.clock.now()
@@ -357,12 +370,12 @@ def build_state(book: Book, books: list, provider_name: str, demo) -> dict:
         s["snapshot"] = json.loads(s["snapshot"]) if s["snapshot"] else None
         s["tranches"] = by_sym.get(s["id"], {})
         s["unrealized"] = sum(t["unrealized"] - t["borrow_fees"] for t in s["tranches"].values())
+        s["live_elsewhere"] = live.live_in(s["symbol"], book.key) if live else None
     return {
         "book": {"key": book.key, "label": book.label, "minutes": book.minutes},
         "books": [{"key": b.key, "label": b.label, "equity": b.engine.equity(),
                    "start": b.engine.store.settings()["starting_capital"],
                    "linked": b.sched.sync is not None,
-                   "live": bool(b.sched.sync and b.sched.sync.live),
                    "sync_on": b.engine.store.settings()["broker_sync_enabled"]} for b in books],
         "now": now.isoformat(),
         "demo": sched.clock.demo,
@@ -378,6 +391,7 @@ def build_state(book: Book, books: list, provider_name: str, demo) -> dict:
         "summary": summ,
         "events": store.q("SELECT * FROM events ORDER BY id DESC LIMIT 300"),
         "broker": broker_state(book),
+        "live": live_state(live, book.sched.clock.demo),
     }
 
 
@@ -387,9 +401,20 @@ def broker_state(book: Book) -> dict:
         return {"configured": False, "reason": "disabled in demo mode"}
     if sched.sync is None:
         return {"configured": False, "reason": book.link_note or "paper keys not configured"}
-    return {"configured": True,
-            "endpoint": getattr(sched.sync.broker, "endpoint", "paper-api.alpaca.markets"),
-            **sched.sync.status()}
+    return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
+
+
+LIVE_NOTE = "set IBKR_ACCOUNT in .env (see IBKR.md)"
+
+
+def live_state(live, demo=False) -> dict:
+    if demo:
+        return {"configured": False, "reason": "disabled in demo mode"}
+    if live is None:
+        return {"configured": False, "reason": LIVE_NOTE}
+    return {"configured": True, "endpoint": live.broker.endpoint, "enabled": live.enabled(),
+            **live.status(),
+            "events": live.store.q("SELECT * FROM events ORDER BY id DESC LIMIT 12")}
 
 
 def check_auth(header: str | None, password: str | None) -> bool:
@@ -406,7 +431,7 @@ def check_auth(header: str | None, password: str | None) -> bool:
     return hmac.compare_digest(supplied.encode(), password.encode())
 
 
-def make_handler(books: dict, provider_name: str, demo, backups=None):
+def make_handler(books: dict, provider_name: str, demo, backups=None, live=None):
     password = os.environ.get("TRANCHE_PASSWORD") or None
     ordered = list(books.values())
     profiles = ProfileCache(ordered[0].engine.store)
@@ -463,7 +488,7 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                 return self._send(200, review_payload(review_books(), profiles))
             book, rest = self._route()
             if book and rest == "/state":
-                st = build_state(book, ordered, provider_name, demo)
+                st = build_state(book, ordered, provider_name, demo, live)
                 st["backup"] = backups.status() if backups else None
                 return self._send(200, st)
             if book and rest == "/download.db":
@@ -529,6 +554,8 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                                                         body.get("note"), body.get("tags")))
                 except (ValidationError, ValueError) as e:
                     return self._send(400, {"error": str(e)})
+            if self.path.startswith("/api/live/"):
+                return self._live_post(self.path[len("/api/live"):])
             book, rest = self._route()
             if book is None:
                 return self._send(404, {"error": "not found"})
@@ -559,6 +586,21 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                 elif m := re.fullmatch(r"/symbols/(\d+)/borrow", rest):
                     engine.set_borrow(int(m.group(1)), body.get("pct"), now)
                     return self._send(200, {"ok": True})
+                elif m := re.fullmatch(r"/symbols/(\d+)/live", rest):
+                    if live is None:
+                        raise ValidationError(f"IBKR is not linked: {LIVE_NOTE}")
+                    sid = int(m.group(1))
+                    sleeves = body.get("sleeves") or []
+                    sym = engine.store.q("SELECT symbol FROM symbols WHERE id=?", (sid,))
+                    other = sym and sleeves and live.live_in(sym[0]["symbol"], book.key)
+                    if other:
+                        raise ValidationError(f"{sym[0]['symbol']} is already live from the {other} "
+                                              f"book. Turn it off there first: the IBKR account "
+                                              f"holds one position per ticker.")
+                    engine.set_live(sid, sleeves, now)
+                    if live.enabled():
+                        threading.Thread(target=live.sync, args=(now,), daemon=True).start()
+                    return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/eod", rest):
                     engine.set_eod_close(int(m.group(1)), bool(body.get("on")), now)
                     threading.Thread(target=sched.run_tick, daemon=True).start()
@@ -586,21 +628,40 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                     if sched.sync is None:
                         raise ValidationError(f"{book.label} book is not linked to a broker")
                     sched.sync.sync(now)
-                elif rest == "/broker/kill":
-                    if sched.sync is None:
-                        raise ValidationError(f"{book.label} book is not linked to a broker")
-                    mode = body.get("mode")
-                    try:
-                        sched.sync.set_kill(None if mode == "off" else mode, now)
-                    except BrokerError as e:
-                        raise ValidationError(str(e))
-                    if mode == "flatten":  # straight away, whether or not sync is switched on
-                        threading.Thread(target=sched.sync.sync, args=(now,), daemon=True).start()
                 else:
                     return self._send(404, {"error": "not found"})
                 self._send(200, {"ok": True})
             except (ValidationError, json.JSONDecodeError) as e:
                 self._send(400, {"error": str(e)})
+
+        def _live_post(self, rest: str):
+            try:
+                if live is None:
+                    raise ValidationError(f"IBKR is not linked: {LIVE_NOTE}")
+                body = self._body()
+                now = ordered[0].sched.clock.now()
+                if rest == "/settings":
+                    on = bool(body.get("enabled"))
+                    live.store.save_settings({"broker_sync_enabled": on})
+                    live.store.log(now, "broker", f"orders to {live.venue} switched "
+                                   f"{'ON' if on else 'OFF'}")
+                    if on:
+                        threading.Thread(target=live.sync, args=(now,), daemon=True).start()
+                elif rest == "/sync":
+                    live.sync(now)
+                elif rest == "/kill":
+                    mode = body.get("mode")
+                    try:
+                        live.set_kill(None if mode == "off" else mode, now)
+                    except BrokerError as e:
+                        raise ValidationError(str(e))
+                    if mode == "flatten":  # straight away, whether or not orders are switched on
+                        threading.Thread(target=live.sync, args=(now,), daemon=True).start()
+                else:
+                    return self._send(404, {"error": "not found"})
+                return self._send(200, {"ok": True})
+            except (ValidationError, json.JSONDecodeError) as e:
+                return self._send(400, {"error": str(e)})
 
     return Handler
 
@@ -638,10 +699,9 @@ Highlighted rows fired a signal. <a href="{esc(symbol)}.csv">Download CSV</a></p
 
 
 def link_papers(demo: bool) -> dict[str, tuple]:
-    """(broker | None, note) per book. No two books may share an account: the
-    broker nets one position per symbol per account, so two books trading the
-    same symbol there would fight each other. When IBKR_ACCOUNT is set, the
-    book named by IBKR_BOOK trades at Interactive Brokers instead of Alpaca."""
+    """(AlpacaPaper | None, note) per book. No two books may share a paper
+    account: Alpaca nets one position per symbol per account, so two books
+    trading the same symbol there would fight each other."""
     out, labels, seen = {}, {k: label for k, _m, label, _p, _db in BOOKS}, {}
     for key, _minutes, _label, prefix, _db in BOOKS:
         if demo:
@@ -663,21 +723,21 @@ def link_papers(demo: bool) -> dict[str, tuple]:
                               f"needs a separate Alpaca paper account (see SETUP.md)")
         else:
             seen[kid] = key
+    return out
+
+
+def link_live(demo: bool) -> tuple:
+    """(IBKRBroker | None, note). Bad IBKR settings leave it unlinked, never
+    half-linked; the paper books keep running."""
     if demo:
-        return out
+        return None, "disabled in demo mode"
     try:
         cfg = ibkr.config_from_env()
-        if cfg:
-            if out[cfg.book][0] is not None:
-                print(f"  IBKR: the {labels[cfg.book]} book trades at IBKR; its Alpaca paper "
-                      f"keys are not used")
-            out[cfg.book] = (ibkr.IBKRBroker(cfg), None)
+        if cfg is None:
+            return None, LIVE_NOTE
+        return ibkr.IBKRBroker(cfg), None
     except BrokerError as e:
-        book = (os.environ.get("IBKR_BOOK") or "").strip().lower()
-        print(f"  IBKR: NOT LINKED - {e}")
-        if book in out:
-            out[book] = (None, f"IBKR settings in .env are not valid: {e}")
-    return out
+        return None, f"IBKR settings in .env are not valid: {e}"
 
 
 def main() -> None:
@@ -722,21 +782,25 @@ def main() -> None:
     provider = CachedProvider(make_provider(
         args.provider, demo_origin=clock.now().date() - timedelta(days=60)))
     papers = link_papers(args.demo)
+    ib, live_note = link_live(args.demo)
+    live = None
+    if ib is not None:
+        live = LiveSync(Store(str(HERE / "tranche_live.db")), ib,
+                        {k: (label, stores[k]) for k, _m, label, _p, _db in BOOKS},
+                        max_shares=ib.max_shares, daily_loss_limit=ib.daily_loss_limit)
 
     books: dict[str, Book] = {}
     for key, minutes, label, _prefix, _db in BOOKS:
         store = stores[key]
         engine = Engine(store, provider, minutes)
         paper, note = papers[key]
-        sync = BrokerSync(store, paper, max_shares=getattr(paper, "max_shares", None),
-                          daily_loss_limit=getattr(paper, "daily_loss_limit", None)) \
-            if paper else None
+        sync = BrokerSync(store, paper) if paper else None
         if sync is None and store.settings()["broker_sync_enabled"]:
             store.save_settings({"broker_sync_enabled": False})
         if args.demo:
             engine.add_symbols("DEMOA DEMOB", "long_short", 1.0, clock.now())
             engine.add_symbols("DEMOC", "short_only", 2.0, clock.now())
-        books[key] = Book(key, minutes, label, engine, Scheduler(engine, clock, sync), note)
+        books[key] = Book(key, minutes, label, engine, Scheduler(engine, clock, sync, live), note)
 
     if not args.demo:
         print("Checking connections...")
@@ -744,6 +808,7 @@ def main() -> None:
                 provider, [(b.label, papers[k][0], papers[k][1]) for k, b in books.items()],
                 clock.now()):
             print("  " + line)
+        print("  " + live_check(live, live_note))
     demo = None
     if args.demo:
         demo = DemoDriver(clock, [b.sched for b in books.values()], args.demo_speed)
@@ -753,18 +818,22 @@ def main() -> None:
             b.sched.start()
     backups = None
     if not args.demo:
-        backups = Backups({k: b.engine.store for k, b in books.items()}, backup_folder(HERE), clock)
+        stores_to_back_up = {k: b.engine.store for k, b in books.items()}
+        if live:
+            stores_to_back_up["live"] = live.store
+        backups = Backups(stores_to_back_up, backup_folder(HERE), clock)
         try:
             written = backups.run_backup("startup")
             print(f"  backup: OK - {len(written)} files -> {backups.folder}")
         except Exception as e:
             print(f"  backup: FAILED - {e}")
         backups.start()
-    server.RequestHandlerClass = make_handler(books, provider.name, demo, backups)
-    linked = ", ".join(f"{b.label} {b.sched.sync.venue if b.sched.sync else 'not linked'}"
+    server.RequestHandlerClass = make_handler(books, provider.name, demo, backups, live)
+    linked = ", ".join(f"{b.label} {'linked' if b.sched.sync else 'not linked'}"
                        for b in books.values())
     print(f"Tranche dashboard on {url}  (provider={provider.name}"
-          f"{', DEMO clock' if args.demo else ''}; brokers: {linked})")
+          f"{', DEMO clock' if args.demo else ''}; alpaca paper: {linked}; "
+          f"ibkr: {live.broker.venue if live else 'not linked'})")
     if args.open:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     try:

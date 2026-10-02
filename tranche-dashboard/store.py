@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     grade TEXT,                             -- A+ / A / B / C, or NULL = custom risk %
     renamed_from TEXT,                      -- previous ticker after a symbol change
     eod_close INTEGER NOT NULL DEFAULT 0,   -- 1 = day trades only: flat by the 15:55 close
-    borrow_pct REAL                         -- this symbol's annual borrow fee %; NULL = book default
+    borrow_pct REAL,                        -- this symbol's annual borrow fee %; NULL = book default
+    live TEXT                               -- tranches mirrored to the IBKR account, e.g. 'EMA5_10,VWAP'
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
@@ -142,6 +143,8 @@ class Store:
             self.db.execute("ALTER TABLE symbols ADD COLUMN eod_close INTEGER NOT NULL DEFAULT 0")
         if "borrow_pct" not in scols:  # databases created before per-symbol borrow
             self.db.execute("ALTER TABLE symbols ADD COLUMN borrow_pct REAL")
+        if "live" not in scols:  # databases created before per-symbol IBKR selection
+            self.db.execute("ALTER TABLE symbols ADD COLUMN live TEXT")
         # One-time: the old flat 10%/yr default understated small-cap borrow (150-630%/yr
         # observed at IBKR, Oct 2026). A book still on that untouched default moves to 250%.
         if not self.db.execute("SELECT 1 FROM settings WHERE key='_borrow_default_v2'").fetchone():
