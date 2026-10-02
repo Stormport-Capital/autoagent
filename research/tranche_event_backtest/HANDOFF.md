@@ -72,13 +72,11 @@ feeds bars in and reads trades out.
 ## Decisions — second round (Dean, 2026-10-02)
 
 1. **Security master:** approved, up to 407 FMP profile calls, run on the PC.
-   (See "Open for Dean": the final rules need 573.)
+   Raised to **573** by the update below.
 2. **2.5x suspect rule:** dropped entirely.
 3. **Possible unapplied splits** are excluded as data errors and listed in
-   the Excluded tab with the reason. Definition (unchanged from what Dean
-   approved): a split recorded within ±5 calendar days, gold's split factor
-   flat between the prior day and day 0, and a jump of 2.5x or more
-   (`events.possible_unapplied_split`).
+   the Excluded tab with the reason. The definition was replaced by the
+   update below.
 4. **Same bars under two tickers:** keep the ticker that was listed that day.
 5. **As-traded** price and volume for the $1 and 10,000-share tests.
 6. **No "3+ events" exclusion:** included; the Events tab flags symbols with
@@ -87,6 +85,25 @@ feeds bars in and reads trades out.
    flagged on the Events tab (`short_history`).
 8. **Steps 3-5 run on Dean's PC** (local Claude Code with the FMP key), not in
    the cloud.
+
+## Decisions — update (Dean, 2026-10-02; overrides the rounds above where they differ)
+
+1. **Profile lookups:** up to **573** FMP profile calls approved (was 407).
+   See "Open for Dean": the new split rule keeps more events, and 591 are now
+   needed.
+2. **Split-error exclusion:** exclude an event as a split error ONLY when
+   BOTH are true:
+   - (a) a recorded split takes effect between the prior close and the end
+     of the event day (prior close date < split date <= event date);
+   - (b) the jump is within 20% of that split's ratio (a 1-for-6 split
+     excludes jumps between 4.8x and 7.2x).
+   - Every other event stays in the study, including PLRZ and GSIW.
+   - Code: `events.split_error`; `spec.SPLIT_ERROR_TOLERANCE` = 0.20. The
+     jump is high / prior close for INTRADAY_100 and close / prior close for
+     CLOSE_100 (gold prices). With two splits in that interval, each ratio
+     and their product are tried; the closest one counts.
+3. **Step D unchanged:** at most 3 FMP test calls, estimate the pull, then
+   STOP for Dean's approval.
 
 ## Choices Dean approved as is
 
@@ -114,7 +131,7 @@ feeds bars in and reads trades out.
   rows), hence the FMP profile calls.
 - **Gold data quality:** rows on non-trading days (INHD 2025-11-23,
   UOKA 2026-02-08), a ticker with trailing whitespace (`MGRT `), identical
-  bars under two tickers (FMP ticker changes), unapplied splits.
+  bars under two tickers (FMP ticker changes), splits gold did not apply.
 - **Reference count:** Dean's quick count was 477 CLOSE_100 events across 356
   symbols with only the price and volume filters. Here: 507 / 365
   (adjusted basis), 489 / 363 (as-traded price and volume), 470 / 350
@@ -125,50 +142,77 @@ feeds bars in and reads trades out.
 
 ## Current counts (inputs/ as committed; no security master yet)
 
-`python events.py`, as-traded basis, both suspect rules dropped:
+`python events.py`, as-traded basis, suspect rules dropped, split-error rule
+as updated:
 
 | | INTRADAY_100 | CLOSE_100 |
 |---|---|---|
 | Candidates | 3,698 (969 symbols) | 2,083 (621) |
-| Price < $1 (as-traded) | 2,633 | 1,501 |
+| Price < $1 (as-traded) | 2,653 | 1,508 |
 | Avg volume < 10,000 (as-traded) | 100 | 80 |
-| Data error: possible unapplied split | 74 | 58 |
+| Data error: split error (updated rule) | 34 | 21 |
 | Duplicate whitespace row | 5 | 2 |
 | Dated on a non-trading day | 4 | 2 |
-| **PENDING** (exchange / type unknown) | **882 (540 symbols)** | **440 (330)** |
+| **PENDING** (exchange / type unknown) | **902 (551 symbols)** | **470 (349)** |
 
-- Both lists share 329 pending symbol-days.
-- Flags among pending: 301 INTRADAY / 76 CLOSE events belong to symbols with
-  3+ events; 14 / 6 have short history; 27 / 12 have same-bars partners.
-- HELD vs FADED (INTRADAY): 329 / 553.
+- Split errors that would otherwise pass price and volume: 13 INTRADAY / 19
+  CLOSE. Events with a split taking effect on the event day: 55 / 41.
+- Both lists share 345 pending symbol-days.
+- Flags among pending: 307 INTRADAY / 80 CLOSE events belong to symbols with
+  3+ events; 14 / 6 have short history; 28 / 12 have same-bars partners.
+- HELD vs FADED (INTRADAY): 346 / 556.
 - The INTRADAY $1 test here uses the as-traded price at the 2x level; the
   final test uses the signal bar's as-traded close.
 
-## Open for Dean (raised 2026-10-02, not yet answered)
+### Split-error borderline cases (within 10% of a tolerance edge)
 
-1. **Profile calls:** dropping the 2.5x rule raised the symbols needing a
-   profile from 407 to **573** (same-bars partners included).
-   `security_master.py --max-calls 407` stops without calling. Ask Dean
-   before using more than 407.
-2. **Unapplied-split exclusion is larger than approved:** 74 INTRADAY / 58
-   CLOSE (33 / 49 pass price and volume) against the 27 / 41 Dean approved.
-   - **Why it grew:** it now runs before the price and volume filters, and
-     the suspect rules no longer remove events first. The definition is
-     unchanged.
-   - **Likely real moves among them:** 17 INTRADAY / 12 CLOSE have the
-     split dated before the prior-close day. Several have jumps nowhere near
-     the split ratio and may be real moves:
-     - PLRZ 2025-12-02: 2.65x vs 1-for-6
-     - FGL 2026-02-13: 2.62x vs 1-for-100
-     - VCIG 2026-03-04: 2.91x vs 1-for-60
-     - GSIW 2026-03-09: 3.87x vs 1-for-200
-   - Every one is in the Excluded tab with the split date for review.
-3. **Pull size:** upper bound before the exchange filter, from
+Jump / split ratio between 0.72 and 0.88 or between 1.08 and 1.32, among
+events with a split taking effect on the event day:
+
+| List | Symbol | Event date | Split | Jump | Jump / ratio | Result |
+|---|---|---|---|---|---|---|
+| INTRADAY | CHAI | 2025-10-07 | 1-for-4 | 4.905x | 1.226 | stays (pending) |
+| INTRADAY | HTCR | 2026-04-06 | 1-for-20 | 23.353x | 1.168 | split error |
+| INTRADAY | APLZ | 2026-06-03 | 1-for-5 | 5.654x | 1.131 | split error |
+| INTRADAY | NBIZ | 2026-06-03 | 1-for-10 | 11.011x | 1.101 | split error |
+| INTRADAY | PW | 2026-06-03 | 1-for-10 | 12.687x | 1.269 | stays (pending) |
+| INTRADAY | SILO | 2026-06-03 | 1-for-15 | 17.886x | 1.192 | split error |
+| INTRADAY | HUBC | 2026-06-08 | 1-for-20 | 16.335x | 0.817 | split error |
+| INTRADAY | POM | 2026-06-22 | 1-for-18 | 20.093x | 1.116 | split error |
+| INTRADAY | FCUV | 2026-06-23 | 1-for-4 | 3.410x | 0.853 | split error |
+| INTRADAY | AMZE | 2026-07-27 | 1-for-8 | 5.927x | 0.741 | stays in the split rule; excluded for price < $1 |
+| INTRADAY | XCH | 2026-08-21 | 1-for-20 | 21.645x | 1.082 | split error |
+| INTRADAY | LGHL | 2026-09-10 | 1-for-20 | 21.849x | 1.093 | split error |
+| INTRADAY | ONDU | 2026-09-22 | 1-for-4 | 4.386x | 1.097 | split error |
+| INTRADAY | WHLR | 2026-09-22 | 1-for-9 | 10.183x | 1.131 | split error |
+| CLOSE | HTCR | 2026-04-06 | 1-for-20 | 22.882x | 1.144 | split error |
+| CLOSE | APLZ | 2026-06-03 | 1-for-5 | 5.639x | 1.128 | split error |
+| CLOSE | PW | 2026-06-03 | 1-for-10 | 11.145x | 1.115 | split error |
+| CLOSE | SILO | 2026-06-03 | 1-for-15 | 17.514x | 1.168 | split error |
+| CLOSE | POM | 2026-06-22 | 1-for-18 | 19.535x | 1.085 | split error |
+| CLOSE | KWM | 2026-08-03 | 1-for-30 (recorded twice: 08-02 and 08-03) | 36.096x | 1.203 | stays (pending) |
+| CLOSE | GPUS | 2026-08-25 | 1-for-5 | 4.274x | 0.855 | split error |
+| CLOSE | JAGX | 2026-09-17 | 1-for-15 | 11.808x | 0.787 | stays (pending) |
+| CLOSE | CRMX | 2026-09-22 | 1-for-4 | 3.327x | 0.832 | split error |
+| CLOSE | ONDU | 2026-09-22 | 1-for-4 | 4.386x | 1.097 | split error |
+| CLOSE | DCX | 2026-09-28 | 1-for-160 | 124.899x | 0.781 | stays (pending) |
+
+KWM has the same 1-for-30 split recorded on two consecutive dates (08-02,
+a Sunday, and 08-03). Taken as one split, its jump is 1.203x the ratio, just
+outside the band. Taken as two, the combined ratio is 900 and does not match.
+
+## Open for Dean
+
+1. **Profile calls (new conflict):** the updated split rule keeps more events,
+   so **591** symbols now need a profile (same-bars partners included) against
+   the **573** approved. `security_master.py --max-calls 573` stops without
+   calling. Ask Dean before using more than 573.
+2. **Pull size:** upper bound before the exchange filter, from
    `python plan_pull.py`:
-   - 1,322 events, 573 symbols, 67,120 symbol-sessions
-   - 5.24M regular-hours bars (12.89M with pre/post-market)
-   - about 14,214 requests at 7-day chunks
-   - about 576 MB regular-hours only (1.42 GB with pre/post-market), at an
+   - 1,372 events, 591 symbols, 69,389 symbol-sessions
+   - 5.41M regular-hours bars (13.32M with pre/post-market)
+   - about 14,693 requests at 7-day chunks
+   - about 595 MB regular-hours only (1.47 GB with pre/post-market), at an
      estimated 110 bytes per bar
    - This must be re-estimated after Steps C and D, and needs Dean's
      approval before the pull.
@@ -211,7 +255,7 @@ FMP only; nothing has run on real intraday data.
   synthetic trade formulas and every summary and entry-day row equal Python.
 - **Speed on the 4-core cloud container** (synthetic, one event, ~86
   sessions): 1h about 6 s, 15m about 27 s, 5m about 107 s. That is
-  ~140 s per event across the three books, about 13 h for 1,322 events on 4
+  ~140 s per event across the three books, about 13 h for 1,372 events on 4
   cores (fewer events after the exchange filter).
 
 ## What's left (Dean's PC prompt, Steps A-E)
@@ -247,7 +291,7 @@ python events.py
 #   ('2025-08-01'..'2026-11-30') into inputs/splits.csv; read-only
 
 # Step C: security master (stops with a message if more than the budget is needed)
-python security_master.py --max-calls 407
+python security_master.py --max-calls 573
 python events.py                                 # applies inputs/security_master.csv
 
 # Step D: probe and estimate, then STOP for approval

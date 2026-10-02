@@ -46,9 +46,12 @@ AVG_VOLUME_SESSIONS = 20
 EXCHANGES = ("NASDAQ", "NYSE", "AMEX")  # AMEX = NYSE American in FMP's naming
 FLAG_MIN_EVENTS = 3             # flag (not exclude) a symbol with this many events in the list
 CA_WINDOW_DAYS = 5              # a split "near" the event = recorded within +/- this many calendar days
-UNAPPLIED_SPLIT_MIN_JUMP = 2.5  # data-error exclusion: split near the event, gold factor flat, jump >= this
+SPLIT_ERROR_TOLERANCE = 0.20    # split-error exclusion: split effective (ref day, event day] AND
+                                #   jump within +/-20% of the split ratio (Dean, 2026-10-02 update)
+SPLIT_ERROR_REVIEW_BAND = 0.10  # report events within +/-10% of either tolerance edge for review
 # Dropped (Dean, 2026-10-02 second round): the 2.5x-jump-without-split suspect
-# rule and the 3+-events exclusion.
+# rule and the 3+-events exclusion. Replaced (Dean, 2026-10-02 update): the
+# "split within +/-5 days, gold factor flat, jump >= 2.5x" exclusion.
 
 # Backtest windows (Dean, Step 4 and pull plan)
 ENTRY_LAST_DAY = 25             # entries on trading days 0..25 after the event

@@ -98,13 +98,31 @@ def price_at_signal(r: dict, ev: spec.EventSpec) -> D:
     return level if PRICE_BASIS == "adjusted" else level / r["factor"]
 
 
-def possible_unapplied_split(e: dict) -> bool:
-    """A split is recorded within +/-5 calendar days, gold's split factor does
-    not step between the prior day and day 0, and the jump is 2.5x or more: the
-    jump may be the split itself (approved as a data-error exclusion, Dean,
-    answer 3 of the second round)."""
-    return bool(e["splits_within_5d"]) and not e["factor_step_on_day"] \
-        and e["jump"] >= D(str(spec.UNAPPLIED_SPLIT_MIN_JUMP))
+def split_error(e: dict) -> bool:
+    """Exclude an event as a split error ONLY when both hold (Dean, 2026-10-02,
+    replacing the earlier rule): (a) a recorded split takes effect after the
+    prior close and by the end of the event day (ref_date < action_date <=
+    event_date), and (b) the jump is within SPLIT_ERROR_TOLERANCE (20%) of that
+    split's ratio (denominator / numerator; a 1-for-6 split excludes jumps of
+    4.8x to 7.2x). Every other event stays in the study."""
+    return e["split_error_match"]
+
+
+def _split_match(r: dict, sym_splits) -> tuple[str, list[D]]:
+    """Splits effective after the prior close and by the end of the event day
+    (ref_date < action_date <= event_date), and their ratios (denominator /
+    numerator). With more than one such split the combined ratio is also tried."""
+    ref_d, d0 = date.fromisoformat(r["ref_date"]), date.fromisoformat(r["trade_date"])
+    hits = [(a, n, m) for a, n, m in sym_splits if ref_d < a <= d0 and n]
+    if not hits:
+        return "", []
+    ratios = [m / n for _a, n, m in hits]
+    if len(hits) > 1:
+        prod = D(1)
+        for x in ratios:
+            prod *= x
+        ratios.append(prod)
+    return ";".join(f"{a}:{n:g}-for-{m:g}" for a, n, m in hits), ratios
 
 
 def listed_ticker(group: set[str], day: date, master: dict | None) -> str | None:
@@ -137,6 +155,9 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
         jump = level / r["ref_close"]
         near = [s for s in splits.get(sym, []) if abs((s[0] - d).days) <= spec.CA_WINDOW_DAYS]
         vol = r["avgvol_adj"] if VOLUME_BASIS == "adjusted" else r["avgvol_raw"]
+        tol = D(str(spec.SPLIT_ERROR_TOLERANCE))
+        in_day, ratios = _split_match(r, splits.get(sym, []))
+        rel = min((jump / x for x in ratios), key=lambda v: abs(v - 1)) if ratios else None
         e = {
             "symbol": sym, "event_type": ev.name, "event_date": r["trade_date"],
             "ref_date": r["ref_date"], "ref_close_adj": r["ref_close"],
@@ -152,6 +173,9 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
             "short_history": r["n_prior"] < spec.AVG_VOLUME_SESSIONS,
             "splits_within_5d": ";".join(f"{a}:{n:g}-for-{m:g}" for a, n, m in near),
             "factor_step_on_day": r["factor"] != r["ref_factor"],
+            "split_effective_on_event_day": in_day,
+            "jump_over_split_ratio": round(rel, 4) if rel is not None else None,
+            "split_error_match": rel is not None and (1 - tol) <= rel <= (1 + tol),
             "same_bars_as": ";".join(sorted(same[(r["trade_date"], r["open"], r["high"], r["low"],
                                                   r["close"], r["volume"])] - {sym})),
             "raw_symbol": r["symbol"],
@@ -171,9 +195,10 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
             e["status"], e["reason"] = "EXCLUDED", f"duplicate row: ticker {e['raw_symbol']!r} has trailing whitespace, same bars as {e['symbol']}"
         elif d not in session_set:
             e["status"], e["reason"] = "EXCLUDED", "event date is not a trading session (weekend/holiday row in gold)"
-        elif possible_unapplied_split(e):
-            e["status"], e["reason"] = "EXCLUDED", (f"data error: possible unapplied split (split recorded "
-                                                    f"{e['splits_within_5d']}, gold factor unchanged, jump {e['jump']:.2f}x)")
+        elif split_error(e):
+            e["status"], e["reason"] = "EXCLUDED", (f"data error: split error (split {e['split_effective_on_event_day']} "
+                                                    f"takes effect on the event day; jump {e['jump']:.2f}x is "
+                                                    f"{e['jump_over_split_ratio']:.2f} x the split ratio)")
         elif e["price_test"] < D(str(spec.MIN_PRICE)):
             what = "close" if ev.basis == "close" else "price at 2x prior close; signal-bar close is re-tested on intraday bars"
             e["status"], e["reason"] = "EXCLUDED", f"price < $1 ({what}, {PRICE_BASIS})"
