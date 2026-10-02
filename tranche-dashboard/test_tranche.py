@@ -1062,7 +1062,7 @@ class FakeBroker:
 
     def submit(self, symbol, qty, side, cid):
         if symbol in self.reject:
-            raise BrokerError("Alpaca 403: asset not shortable")
+            raise BrokerError(getattr(self, "submit_err", "Alpaca 403: asset not shortable"))
         self.sent.append((symbol, side, qty))
         oid = f"o{len(self.orders)}"
         o = {"id": oid, "symbol": symbol, "status": "accepted", "filled_qty": "0",
@@ -1239,6 +1239,47 @@ class BrokerSyncTests(unittest.TestCase):
         fb.pos = {}                                           # or: old ticker closed by hand
         sync.sync(self.NOW)
         self.assertEqual(fb.sent, [("FFR", "sell", 100)])
+
+    def test_short_refusal_is_not_retried_today(self):
+        self.add("NOSH")
+        self.tranche("NOSH", "EMA5_10", "short", 50)
+        fb = FakeBroker(reject={"NOSH"})
+        fb.submit_err = "Alpaca 422: asset \"NOSH\" cannot be sold short"
+        sync = BrokerSync(self.store, fb, fill_wait_s=0)
+        for _ in range(4):
+            sync.sync(self.NOW)
+        self.assertEqual(len(self.store.q("SELECT 1 FROM orders")), 1)   # tried once, not 4x
+        skips = self.store.q("SELECT message FROM events WHERE kind='broker-skip'")
+        self.assertEqual(len(skips), 1)                                   # logged once
+        self.assertIn("can't short", skips[0]["message"])
+        self.assertIn("can't short", sync.status()["reconciliation"][0]["note"])
+        sync.sync(self.NOW + timedelta(days=1))                           # next session: try again
+        self.assertEqual(len(self.store.q("SELECT 1 FROM orders")), 2)
+
+    def test_short_refusal_never_blocks_a_cover_or_long(self):
+        self.add("COV")
+        self.tranche("COV", "EMA5_10", "short", 50)
+        fb = FakeBroker(positions={"COV": -20}, reject={"COV"})
+        fb.submit_err = "Alpaca 422: asset \"COV\" cannot be sold short"
+        sync = BrokerSync(self.store, fb, fill_wait_s=0)
+        sync.sync(self.NOW)                      # tries to add 30 more short: refused
+        fb.reject = set()
+        self.store.x("UPDATE tranches SET status='closed'")
+        sync.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(fb.sent[-1], ("COV", "buy", 20))   # the cover still goes out
+
+    def test_halt_pauses_ten_minutes(self):
+        self.add("HLT")
+        self.tranche("HLT", "EMA5_10", "long", 10)
+        fb = FakeBroker(reject={"HLT"})
+        fb.submit_err = "Alpaca 422: market order rejected due to trading halt on symbol: \"HLT\""
+        sync = BrokerSync(self.store, fb, fill_wait_s=0)
+        sync.sync(self.NOW)
+        sync.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(len(self.store.q("SELECT 1 FROM orders")), 1)
+        fb.reject = set()
+        sync.sync(self.NOW + timedelta(minutes=11))
+        self.assertEqual(fb.sent, [("HLT", "buy", 10)])
 
     def test_status_reports_mismatch(self):
         self.add("MIS")
