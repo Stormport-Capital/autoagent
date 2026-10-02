@@ -20,6 +20,19 @@ paper account's position in each watched symbol to the model's NET quantity
     session; "not found" / not tradable stops every order in it until the next
     session; a trading halt pauses it for 10 minutes. Covers and long exits are
     never held back by a short refusal. Each skip is logged once per day.
+
+The same BrokerSync drives the IBKR link (ibkr.py), with three extra guards
+that are on whenever max_shares / daily_loss_limit are given:
+  * Share cap: the account mirrors the SIGN of the model's net position, capped
+    at max_shares per symbol (1 = one-share tests).
+  * Daily loss limit: the first equity reading of each ET day is the day's
+    start. When equity (or IBKR's own daily P&L, whichever is worse) is down
+    by the limit, the link latches HALTED for the rest of that day: working
+    orders are cancelled, managed positions are closed, nothing else is sent.
+    It clears by itself the next day.
+  * Kill switch (dashboard): "pause" sends nothing at all and leaves positions
+    as they are; "flatten" cancels working orders, closes managed positions and
+    then sends nothing. Both persist across restarts until Resume.
 """
 
 from __future__ import annotations
@@ -101,16 +114,28 @@ class AlpacaPaper:
             "time_in_force": "day", "client_order_id": client_order_id})
 
 
-NO_SHORT = re.compile(r"cannot be sold short|not shortable|not easy to borrow|no shares available", re.I)
+NO_SHORT = re.compile(r"cannot be sold short|not shortable|not easy to borrow|no shares available|"
+                      r"not available for short|no shares to borrow", re.I)
 NO_TRADE = re.compile(r"not found|not tradable|not active", re.I)
 HALTED = re.compile(r"halt", re.I)
 HALT_PAUSE = timedelta(minutes=10)
 
 
+KILL_MODES = ("pause", "flatten")
+WATCH_EVERY_S = 60
+
+
 class BrokerSync:
-    def __init__(self, store, broker, fill_wait_s: float = 20.0):
+    def __init__(self, store, broker, fill_wait_s: float = 20.0, max_shares: int | None = None,
+                 daily_loss_limit: float | None = None):
         self.store, self.broker = store, broker
         self.fill_wait_s = fill_wait_s
+        self.max_shares = max_shares
+        self.daily_loss_limit = daily_loss_limit or None
+        self.venue = getattr(broker, "venue", "Alpaca paper")
+        self.live = bool(getattr(broker, "live", False))
+        self.short_notes: dict[str, tuple] = {}  # symbol -> (ET day, why no short)
+        self._watched = 0.0
         self.lock = threading.Lock()
         self.last_sync: datetime | None = None
         self.last_error: str | None = None
@@ -123,6 +148,8 @@ class BrokerSync:
         want: dict[str, int] = {}
         for t in self.store.q("SELECT symbol, side, qty FROM tranches WHERE status='open'"):
             want[t["symbol"]] = want.get(t["symbol"], 0) + (t["qty"] if t["side"] == "long" else -t["qty"])
+        if self.max_shares:  # same direction as the model, at most max_shares
+            want = {s: max(-self.max_shares, min(self.max_shares, q)) for s, q in want.items()}
         return want
 
     def managed(self) -> set[str]:
@@ -132,43 +159,13 @@ class BrokerSync:
         with self.lock:
             try:
                 self._refresh_orders()
-                want = self.desired()
-                pos = {s: int(float(p["qty"])) for s, p in self.broker.positions().items()}
-                busy = {o["symbol"] for o in self.broker.open_orders()}
-                self.needs_followup = False
-                # a renamed ticker waits until the paper account has converted the old one
-                waiting = {r["symbol"]: r["renamed_from"] for r in self.store.q(
-                    "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL")
-                    if pos.get(r["renamed_from"])}
-                for sym in sorted(self.managed() | set(want)):
-                    target, cur = want.get(sym, 0), pos.get(sym, 0)
-                    if sym in waiting:
-                        if target != cur:
-                            self.store.log(now, "broker-wait", f"paper still holds "
-                                           f"{waiting[sym]} {pos[waiting[sym]]:+d}; no {sym} order "
-                                           f"until Alpaca converts it (or close {waiting[sym]} "
-                                           f"in the Alpaca app)", sym)
-                        continue
-                    if target == cur:
-                        continue
-                    if sym in busy:
-                        self.needs_followup = True
-                        continue
-                    why = self._held_back(now, sym, opens_short=False)
-                    if why:
-                        self._log_skip(now, sym, why)
-                        continue
-                    if cur and target and (cur > 0) != (target > 0):
-                        order = self._submit(now, sym, -cur, f"close {cur:+d} before reversing")
-                        if not order or not self._await_fill(order):
-                            self.needs_followup = order is not None
-                            continue  # opening leg goes out on a follow-up sync
-                        cur = 0
-                    why = self._held_back(now, sym, opens_short=target < 0 and target < min(cur, 0))
-                    if why:
-                        self._log_skip(now, sym, why)
-                        continue
-                    self._submit(now, sym, target - cur, f"model {target:+d}, paper {cur:+d}")
+                acct = self.broker.account()
+                self._check_loss(now, float(acct["equity"]))
+                stop = self.stop_reason(now)
+                if stop and stop[0] == "pause":
+                    self._log_skip(now, None, stop[1])
+                else:
+                    self._sync_positions(now, flatten=stop is not None)
                 acct = self.broker.account()
                 self.store.x("INSERT OR REPLACE INTO broker_equity VALUES (?, ?)",
                              (now.isoformat(), float(acct["equity"])))
@@ -178,6 +175,170 @@ class BrokerSync:
                 self.store.log(now, "broker-error", self.last_error[:300])
             self.last_sync = now
             self.snapshot_at = 0.0  # force a fresh account read
+
+    def _sync_positions(self, now: datetime, flatten: bool) -> None:
+        if flatten:  # kill switch or loss limit: nothing may still be working
+            for sym, o in self._our_working().items():
+                if sym in self.managed():
+                    self._cancel(now, sym, o, "closing everything")
+        want = {} if flatten else self.desired()
+        pos = {s: int(float(p["qty"])) for s, p in self.broker.positions().items()}
+        busy = {o["symbol"]: o for o in self.broker.open_orders()}
+        self.needs_followup = False
+        # a renamed ticker waits until the account has converted the old one
+        waiting = {r["symbol"]: r["renamed_from"] for r in self.store.q(
+            "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL")
+            if pos.get(r["renamed_from"])}
+        for sym in sorted(self.managed() | set(want)):
+            target, cur = want.get(sym, 0), pos.get(sym, 0)
+            if self.max_shares and abs(target) > self.max_shares:  # never: desired() caps it
+                raise BrokerError(f"{sym}: target {target:+d} is above the share cap")
+            if sym in waiting:
+                if target != cur:
+                    self.store.log(now, "broker-wait", f"{self.venue} still holds "
+                                   f"{waiting[sym]} {pos[waiting[sym]]:+d}; no {sym} order "
+                                   f"until the broker converts it (or close {waiting[sym]} "
+                                   f"in the broker's app)", sym)
+                continue
+            if target == cur:
+                continue
+            if sym in busy:
+                self.needs_followup = True
+                self._reprice(now, sym, busy[sym])
+                continue
+            why = self._held_back(now, sym, opens_short=False)
+            if why:
+                self._log_skip(now, sym, why)
+                continue
+            if cur and target and (cur > 0) != (target > 0):
+                order = self._submit(now, sym, -cur, f"close {cur:+d} before reversing")
+                if not order or not self._await_fill(order):
+                    self.needs_followup = order is not None
+                    continue  # opening leg goes out on a follow-up sync
+                cur = 0
+            opens_short = target < 0 and target < min(cur, 0)
+            why = self._held_back(now, sym, opens_short=opens_short)
+            if not why and opens_short:
+                why = self._short_check(now, sym, min(cur, 0) - target)
+            if why:
+                self._log_skip(now, sym, why)
+                continue
+            self._submit(now, sym, target - cur,
+                         "kill switch / loss limit: close" if flatten
+                         else f"model {target:+d}, {self.venue} {cur:+d}")
+
+    def _short_check(self, now: datetime, sym: str, qty: int) -> str | None:
+        check = getattr(self.broker, "short_check", None)
+        if check is None:
+            return None
+        why = check(sym, qty)
+        if why:
+            self.short_notes[sym] = (now.astimezone(ET).date(), why)
+        else:
+            self.short_notes.pop(sym, None)
+        return why
+
+    def _our_working(self) -> dict[str, dict]:
+        """Working broker orders this app sent (never someone else's)."""
+        ours = {r["broker_order_id"] for r in self.store.q(
+            "SELECT broker_order_id FROM orders WHERE broker_order_id IS NOT NULL")}
+        return {o["symbol"]: o for o in self.broker.open_orders() if o["id"] in ours}
+
+    def _cancel(self, now: datetime, sym: str, o: dict, why: str) -> None:
+        cancel = getattr(self.broker, "cancel", None)
+        if cancel is None:
+            return
+        cancel(o["id"])
+        self.store.log(now, "broker", f"cancelled working order {o['id']} ({why})", sym)
+
+    def _reprice(self, now: datetime, sym: str, o: dict) -> None:
+        """A limit order of ours still unfilled after reprice_s is cancelled;
+        the follow-up sync sends a fresh one at the new quote."""
+        wait = getattr(self.broker, "reprice_s", 0)
+        if not wait:
+            return
+        row = self.store.q("SELECT ts FROM orders WHERE broker_order_id=?", (o["id"],))
+        if row and (now - datetime.fromisoformat(row[0]["ts"])).total_seconds() >= wait:
+            self._cancel(now, sym, o, f"unfilled after {wait}s; re-pricing")
+
+    # ------------------------------------------------------------ live guards
+    def _ctl(self, key: str) -> str | None:
+        r = self.store.q("SELECT value FROM broker_control WHERE key=?", (key,))
+        return r[0]["value"] if r else None
+
+    def _set_ctl(self, key: str, value: str | None) -> None:
+        if value is None:
+            self.store.x("DELETE FROM broker_control WHERE key=?", (key,))
+        else:
+            self.store.x("INSERT OR REPLACE INTO broker_control VALUES (?, ?)", (key, value))
+
+    def set_kill(self, mode: str | None, now: datetime) -> None:
+        """'pause', 'flatten', or None (resume). Persists across restarts."""
+        if mode not in (None, *KILL_MODES):
+            raise BrokerError("kill switch mode must be pause, flatten or off")
+        self._set_ctl("kill", mode)
+        self.store.log(now, "broker-kill", {
+            None: f"kill switch off: orders to {self.venue} resume at the next sync",
+            "pause": f"kill switch: PAUSED, nothing is sent to {self.venue}; positions stay",
+            "flatten": f"kill switch: FLATTEN, closing managed {self.venue} positions; "
+                       "nothing else is sent"}[mode])
+
+    def day_start(self, now: datetime) -> float | None:
+        r = self._ctl("day_start")
+        if r:
+            day, eq = r.split("|")
+            if day == now.astimezone(ET).date().isoformat():
+                return float(eq)
+        return None
+
+    def _check_loss(self, now: datetime, equity: float) -> bool:
+        """Latch the day's start equity; halt for the day at the loss limit.
+        True when it has just tripped."""
+        day = now.astimezone(ET).date().isoformat()
+        start = self.day_start(now)
+        if start is None:
+            self._set_ctl("day_start", f"{day}|{equity}")
+            start = equity
+        if not self.daily_loss_limit or (self._ctl("halt") or "").startswith(day + "|"):
+            return False
+        pl = equity - start
+        own = getattr(self.broker, "day_pnl", None)
+        if own is not None:
+            ib = own()
+            if ib is not None:
+                pl = min(pl, ib)
+        if pl > -self.daily_loss_limit:
+            return False
+        why = (f"daily loss limit hit: {self.venue} day P&L {pl:+,.2f} vs "
+               f"-{self.daily_loss_limit:,.0f}")
+        self._set_ctl("halt", f"{day}|{why}")
+        self.store.log(now, "broker-halt", why + "; closing managed positions, no more orders "
+                       "today (the model keeps trading)")
+        return True
+
+    def stop_reason(self, now: datetime) -> tuple[str, str] | None:
+        kill = self._ctl("kill")
+        if kill:
+            return kill, f"kill switch is on ({kill}); Resume on the dashboard to send orders"
+        halt = self._ctl("halt") or ""
+        day = now.astimezone(ET).date().isoformat()
+        if halt.startswith(day + "|"):
+            return "flatten", halt.split("|", 1)[1] + "; orders resume tomorrow"
+        return None
+
+    def watch(self, now: datetime) -> None:
+        """Called every scheduler pass: re-checks the loss limit once a minute
+        between bar checks, and flattens straight away if it trips."""
+        if not self.daily_loss_limit or _time.monotonic() - self._watched < WATCH_EVERY_S:
+            return
+        self._watched = _time.monotonic()
+        try:
+            with self.lock:
+                tripped = self._check_loss(now, float(self.broker.account()["equity"]))
+        except (BrokerError, requests.RequestException):
+            return  # the next sync reports it
+        if tripped:
+            self.sync(now)
 
     def _held_back(self, now: datetime, sym: str, opens_short: bool) -> str | None:
         """Why an order for `sym` should not be sent right now, from its latest
@@ -198,25 +359,28 @@ class BrokerSync:
             if when.astimezone(ET).date() != today:
                 return None
             if NO_TRADE.search(msg):
-                return f"Alpaca won't trade it today ({msg[:80]})"
+                return f"{self.venue} won't trade it today ({msg[:80]})"
             if opens_short and r["side"] == "sell" and NO_SHORT.search(msg):
-                return f"Alpaca paper can't short it today ({msg[:80]})"
+                return f"{self.venue} can't short it today ({msg[:80]})"
         return None
 
-    def _log_skip(self, now: datetime, sym: str, why: str) -> None:
+    def _log_skip(self, now: datetime, sym: str | None, why: str) -> None:
         day_start = datetime.combine(now.astimezone(ET).date(), datetime.min.time(), tzinfo=ET)
-        seen = self.store.q("SELECT ts FROM events WHERE kind='broker-skip' AND symbol=? "
-                            "ORDER BY id DESC LIMIT 1", (sym,))
-        if seen and datetime.fromisoformat(seen[0]["ts"]) >= day_start:
+        seen = self.store.q("SELECT ts, message FROM events WHERE kind='broker-skip' AND "
+                            "symbol IS ? ORDER BY id DESC LIMIT 1", (sym,))
+        if seen and datetime.fromisoformat(seen[0]["ts"]) >= day_start and why in seen[0]["message"]:
             return
-        self.store.log(now, "broker-skip", f"not sent to paper: {why}. The model keeps trading "
-                       "it; the paper account stays as is.", sym)
+        self.store.log(now, "broker-skip", f"not sent to {self.venue}: {why}. The model keeps "
+                       "trading; the broker account stays as is.", sym)
 
     def blocked(self, now: datetime) -> dict[str, str]:
         """Symbols whose new shorts (or all orders) are held back right now."""
         out = {}
         for sym in self.managed():
             why = self._held_back(now, sym, opens_short=True)
+            note = self.short_notes.get(sym)
+            if not why and note and note[0] == now.astimezone(ET).date():
+                why = note[1]
             if why:
                 out[sym] = why
         return out
@@ -228,8 +392,14 @@ class BrokerSync:
             """INSERT INTO orders (ts, symbol, side, qty, reason, client_order_id, status)
                VALUES (?,?,?,?,?,?, 'submitting')""",
             (now.isoformat(), sym, side, abs(delta), reason, cid))
+        kw = {}
+        if hasattr(self.broker, "quote"):  # IBKR: the model's last price as a fallback reference
+            r = self.store.q("SELECT last_price FROM symbols WHERE symbol=? AND last_price IS NOT "
+                             "NULL ORDER BY id DESC LIMIT 1", (sym,))
+            if r:
+                kw["ref_price"] = r[0]["last_price"]
         try:
-            o = self.broker.submit(sym, abs(delta), side, cid)
+            o = self.broker.submit(sym, abs(delta), side, cid, **kw)
         except BrokerError as e:
             self.store.x("UPDATE orders SET status='rejected', message=? WHERE id=?", (str(e)[:300], row))
             self.store.log(now, "broker-reject", f"{side} {abs(delta)} rejected: {e}", sym)
@@ -290,11 +460,26 @@ class BrokerSync:
                 "note": held.get(sym),
             })
         acct = self.snapshot["account"]
+        now = datetime.now(ET)
+        start = self.day_start(now)
+        day_pl = None
+        if acct:
+            if acct.get("last_equity") is not None:
+                day_pl = float(acct["equity"]) - float(acct["last_equity"])
+            elif start is not None:
+                day_pl = float(acct["equity"]) - start
+        stop = self.stop_reason(now)
         return {
+            "venue": self.venue, "live": self.live,
+            "control": {"kill": self._ctl("kill"), "stopped": stop[1] if stop else None,
+                        "max_shares": self.max_shares, "daily_loss_limit": self.daily_loss_limit,
+                        "day_start": start},
             "account": None if not acct else {
-                "equity": float(acct["equity"]), "cash": float(acct["cash"]),
-                "buying_power": float(acct["buying_power"]),
-                "day_pl": float(acct["equity"]) - float(acct["last_equity"]),
+                "equity": float(acct["equity"]),
+                "cash": None if acct.get("cash") is None else float(acct["cash"]),
+                "buying_power": None if acct.get("buying_power") is None
+                else float(acct["buying_power"]),
+                "day_pl": day_pl, "account_id": acct.get("account_id"),
                 "status": acct.get("status"), "shorting_enabled": acct.get("shorting_enabled"),
                 "pattern_day_trader": acct.get("pattern_day_trader"),
                 "trading_blocked": acct.get("trading_blocked"),

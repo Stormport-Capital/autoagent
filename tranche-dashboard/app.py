@@ -10,8 +10,10 @@ account.
     python app.py --provider alpaca    # Alpaca market data (keys via env)
     python app.py --demo               # synthetic prices on a fast simulated clock
 
-The model is simulated. Orders go only to an Alpaca PAPER account, only when
-linked (keys in .env) and switched on in the dashboard; see broker.py / SETUP.md.
+The model is simulated. Orders go only to a linked broker account, only when
+switched on in the dashboard: an Alpaca PAPER account per book (broker.py /
+SETUP.md), or for ONE book an Interactive Brokers account, paper or live, with
+a share cap, a daily loss limit and a kill switch (ibkr.py / IBKR.md).
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from urllib.parse import parse_qs, urlparse
 
 from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync
+import ibkr
 from data import make_provider, redact
 from engine import SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
@@ -68,7 +71,8 @@ class Server(ThreadingHTTPServer):
 KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
 OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
                  "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",  # 15-min book's paper account
-                 "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY")  # 5-min book's paper account
+                 "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",  # 5-min book's paper account
+                 "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOK")  # Interactive Brokers (IBKR.md)
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -243,6 +247,8 @@ class Scheduler(threading.Thread):
             elif self.sync and self.sync.needs_followup and self.sync.last_sync \
                     and (now - self.sync.last_sync).total_seconds() >= 60:
                 self.run_sync()  # an order was still working: finish the job
+            elif self.sync and self.engine.store.settings()["broker_sync_enabled"]:
+                self.sync.watch(now)  # daily loss limit, between bar checks
 
 
 class DemoDriver(threading.Thread):
@@ -315,16 +321,22 @@ def connection_check(provider, papers: list, now: datetime) -> list[str]:
         lines.append("to switch data source, add TRANCHE_PROVIDER=polygon or "
                      "TRANCHE_PROVIDER=fmp to .env and restart")
     for label, paper, note in papers:
+        venue = getattr(paper, "venue", "Alpaca paper")
         if paper is None:
-            lines.append(f"Alpaca paper ({label}): not linked - {note}")
+            lines.append(f"{venue} ({label}): not linked - {note}")
             continue
         try:
             a = paper.account()
-            lines.append(f"Alpaca paper ({label}): OK - equity ${float(a['equity']):,.2f}, "
+            if isinstance(paper, ibkr.IBKRBroker):
+                lines.append(f"{venue} ({label}): OK - {a['account_id']} net liquidation "
+                             f"${float(a['equity']):,.2f}; cap {paper.max_shares} share(s), "
+                             f"daily loss limit ${paper.daily_loss_limit:,.0f}")
+                continue
+            lines.append(f"{venue} ({label}): OK - equity ${float(a['equity']):,.2f}, "
                          f"shorting {'enabled' if a.get('shorting_enabled') else 'DISABLED'}"
                          + (", TRADING BLOCKED" if a.get("trading_blocked") else ""))
         except Exception as e:
-            lines.append(f"Alpaca paper ({label}): FAILED - {_short(e)}")
+            lines.append(f"{venue} ({label}): FAILED - {_short(e)}")
     return lines
 
 
@@ -350,6 +362,7 @@ def build_state(book: Book, books: list, provider_name: str, demo) -> dict:
         "books": [{"key": b.key, "label": b.label, "equity": b.engine.equity(),
                    "start": b.engine.store.settings()["starting_capital"],
                    "linked": b.sched.sync is not None,
+                   "live": bool(b.sched.sync and b.sched.sync.live),
                    "sync_on": b.engine.store.settings()["broker_sync_enabled"]} for b in books],
         "now": now.isoformat(),
         "demo": sched.clock.demo,
@@ -374,7 +387,9 @@ def broker_state(book: Book) -> dict:
         return {"configured": False, "reason": "disabled in demo mode"}
     if sched.sync is None:
         return {"configured": False, "reason": book.link_note or "paper keys not configured"}
-    return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
+    return {"configured": True,
+            "endpoint": getattr(sched.sync.broker, "endpoint", "paper-api.alpaca.markets"),
+            **sched.sync.status()}
 
 
 def check_auth(header: str | None, password: str | None) -> bool:
@@ -527,8 +542,8 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                     if s["broker_sync_enabled"] and not was:
                         if sched.sync is None:
                             engine.update_settings({"broker_sync_enabled": False})
-                            raise ValidationError(f"{book.label} book is not linked to an "
-                                                  f"Alpaca paper account: {book.link_note}")
+                            raise ValidationError(f"{book.label} book is not linked to a "
+                                                  f"broker account: {book.link_note}")
                         threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif rest == "/symbols":
                     added = engine.add_symbols(body.get("symbols", ""), body.get("mode"),
@@ -569,8 +584,18 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                     threading.Thread(target=sched.run_sync, daemon=True).start()
                 elif rest == "/broker/sync":
                     if sched.sync is None:
-                        raise ValidationError(f"{book.label} book is not linked to Alpaca paper")
+                        raise ValidationError(f"{book.label} book is not linked to a broker")
                     sched.sync.sync(now)
+                elif rest == "/broker/kill":
+                    if sched.sync is None:
+                        raise ValidationError(f"{book.label} book is not linked to a broker")
+                    mode = body.get("mode")
+                    try:
+                        sched.sync.set_kill(None if mode == "off" else mode, now)
+                    except BrokerError as e:
+                        raise ValidationError(str(e))
+                    if mode == "flatten":  # straight away, whether or not sync is switched on
+                        threading.Thread(target=sched.sync.sync, args=(now,), daemon=True).start()
                 else:
                     return self._send(404, {"error": "not found"})
                 self._send(200, {"ok": True})
@@ -613,9 +638,10 @@ Highlighted rows fired a signal. <a href="{esc(symbol)}.csv">Download CSV</a></p
 
 
 def link_papers(demo: bool) -> dict[str, tuple]:
-    """(AlpacaPaper | None, note) per book. No two books may share a paper
-    account: Alpaca nets one position per symbol per account, so two books
-    trading the same symbol there would fight each other."""
+    """(broker | None, note) per book. No two books may share an account: the
+    broker nets one position per symbol per account, so two books trading the
+    same symbol there would fight each other. When IBKR_ACCOUNT is set, the
+    book named by IBKR_BOOK trades at Interactive Brokers instead of Alpaca."""
     out, labels, seen = {}, {k: label for k, _m, label, _p, _db in BOOKS}, {}
     for key, _minutes, _label, prefix, _db in BOOKS:
         if demo:
@@ -637,6 +663,20 @@ def link_papers(demo: bool) -> dict[str, tuple]:
                               f"needs a separate Alpaca paper account (see SETUP.md)")
         else:
             seen[kid] = key
+    if demo:
+        return out
+    try:
+        cfg = ibkr.config_from_env()
+        if cfg:
+            if out[cfg.book][0] is not None:
+                print(f"  IBKR: the {labels[cfg.book]} book trades at IBKR; its Alpaca paper "
+                      f"keys are not used")
+            out[cfg.book] = (ibkr.IBKRBroker(cfg), None)
+    except BrokerError as e:
+        book = (os.environ.get("IBKR_BOOK") or "").strip().lower()
+        print(f"  IBKR: NOT LINKED - {e}")
+        if book in out:
+            out[book] = (None, f"IBKR settings in .env are not valid: {e}")
     return out
 
 
@@ -688,7 +728,9 @@ def main() -> None:
         store = stores[key]
         engine = Engine(store, provider, minutes)
         paper, note = papers[key]
-        sync = BrokerSync(store, paper) if paper else None
+        sync = BrokerSync(store, paper, max_shares=getattr(paper, "max_shares", None),
+                          daily_loss_limit=getattr(paper, "daily_loss_limit", None)) \
+            if paper else None
         if sync is None and store.settings()["broker_sync_enabled"]:
             store.save_settings({"broker_sync_enabled": False})
         if args.demo:
@@ -719,10 +761,10 @@ def main() -> None:
             print(f"  backup: FAILED - {e}")
         backups.start()
     server.RequestHandlerClass = make_handler(books, provider.name, demo, backups)
-    linked = ", ".join(f"{b.label} {'linked' if b.sched.sync else 'not linked'}"
+    linked = ", ".join(f"{b.label} {b.sched.sync.venue if b.sched.sync else 'not linked'}"
                        for b in books.values())
     print(f"Tranche dashboard on {url}  (provider={provider.name}"
-          f"{', DEMO clock' if args.demo else ''}; alpaca paper: {linked})")
+          f"{', DEMO clock' if args.demo else ''}; brokers: {linked})")
     if args.open:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     try:

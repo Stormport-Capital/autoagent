@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS broker_equity (
     ts TEXT PRIMARY KEY,
     equity REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS broker_control (  -- kill switch, loss-limit halt, day-start equity
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS day_notes (   -- Trade Review: one note per trading day
     day TEXT PRIMARY KEY,
     note TEXT NOT NULL

@@ -54,6 +54,7 @@ button:disabled { opacity: .5; cursor: default; }
 .seg input { display: none; }
 .seg label:has(input:checked) { background: var(--accent); color: #fff; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
 .msg { font-size: 12.5px; margin-top: 8px; min-height: 1em; }
 .msg.err { color: var(--bad); } .msg.ok { color: var(--good); }
 .tablewrap { overflow-x: auto; }
@@ -193,7 +194,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
       </section>
 
       <section class="card">
-        <h2>Alpaca paper account <small id="bkState"></small></h2>
+        <h2><span id="bkTitle">Broker account</span> <small id="bkState"></small></h2>
         <div id="bkBody"></div>
       </section>
     </div>
@@ -222,7 +223,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
         <button data-tab="open" class="on">Open positions</button>
         <button data-tab="closed">Closed trades</button>
         <button data-tab="symbols">By symbol</button>
-        <button data-tab="orders">Paper orders</button>
+        <button data-tab="orders">Broker orders</button>
         <button data-tab="log">Signal log</button>
       </div>
     </h2>
@@ -280,7 +281,7 @@ function renderBooks(S) {
   $("#bookTabs").innerHTML = S.books.map(b => {
     const r = b.equity / b.start - 1;
     return `<button data-book="${b.key}" class="${b.key === BOOK ? "on" : ""}">${esc(b.label)} book
-      <small>${usd(b.equity)} · ${pct(r, 2)}${b.sync_on ? " · paper on" : ""}</small></button>`;
+      <small>${usd(b.equity)} · ${pct(r, 2)}${b.sync_on ? (b.live ? " · LIVE on" : " · broker on") : ""}</small></button>`;
   }).join("");
   document.title = `Tranche Dashboard - ${S.book.label}`;
 }
@@ -289,7 +290,7 @@ function render() {
   const S = STATE, m = S.summary, o = m.overall;
   renderBooks(S);
   $("#meta").innerHTML = [
-    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : (S.settings.broker_sync_enabled ? "Model + Alpaca PAPER orders" : "Model only · no orders sent")}</span>`,
+    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : (S.settings.broker_sync_enabled && S.broker.configured ? (S.broker.live ? '<span class="pill short">Model + LIVE IBKR orders (real money)</span>' : `Model + ${esc(S.broker.venue)} orders`) : "Model only · no orders sent")}</span>`,
     `<span>Data: ${esc(S.provider)}</span>`,
     `<span>${S.demo ? "Sim time" : "Now"}: ${fmtT(S.now)} · market ${S.market_open ? "open" : "closed"}</span>`,
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
@@ -374,7 +375,7 @@ function renderChart(curve, start, paper) {
   const W = svg.clientWidth || 600, H = 220, P = {l: 64, r: 12, t: 10, b: 24};
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const series = [{name: "Model", color: "var(--series)", pts: curve}];
-  if (paper.length) series.push({name: "Alpaca paper", color: "var(--series-2)", pts: paper});
+  if (paper.length) series.push({name: (STATE.broker && STATE.broker.venue) || "Broker", color: "var(--series-2)", pts: paper});
   $("#legend").innerHTML = series.length > 1
     ? series.map(se => `<span><i style="background:${se.color}"></i>${se.name}</span>`).join("") : "";
   const all = series.flatMap(se => se.pts);
@@ -424,35 +425,57 @@ function renderChart(curve, start, paper) {
 function renderBroker(B) {
   const on = STATE.settings.broker_sync_enabled;
   if (!B.configured) {
+    $("#bkTitle").textContent = "Broker account";
     $("#bkState").textContent = "not linked";
-    $("#bkBody").innerHTML = `<div class="hint">${esc(B.reason)}. See SETUP.md.</div>`;
+    $("#bkBody").innerHTML = `<div class="hint">${esc(B.reason)}. See SETUP.md (Alpaca paper) or IBKR.md (Interactive Brokers).</div>`;
     return;
   }
-  const a = B.account;
-  $("#bkState").innerHTML = on ? '<span class="pill long">sync on</span>' : '<span class="pill">sync off</span>';
+  const a = B.account, C = B.control || {}, V = esc(B.venue), live = B.live;
+  $("#bkTitle").textContent = `${B.venue} account`;
+  $("#bkState").innerHTML = (live ? '<span class="pill short">LIVE · real money</span> ' : "") +
+    (C.kill ? `<span class="pill warn">kill switch: ${esc(C.kill)}</span>` : on ? '<span class="pill long">sync on</span>' : '<span class="pill">sync off</span>');
   const mism = (B.reconciliation || []).filter(r => !r.match);
-  let h = `<label class="switch"><input type="checkbox" id="bkToggle" ${on ? "checked" : ""}> Send the model's trades to Alpaca paper</label>
-    <div class="hint">Paper endpoint only (${esc(B.endpoint)}). Orders are market orders sent right after each ${esc(STATE.book.label)} check.</div>`;
+  let h = `<label class="switch"><input type="checkbox" id="bkToggle" ${on ? "checked" : ""}> Send the model's trades to ${V}</label>
+    <div class="hint">${esc(B.endpoint)}. Orders go out right after each ${esc(STATE.book.label)} check.</div>`;
+  if (C.max_shares || C.daily_loss_limit)
+    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (the model's direction, not its size)` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
   if (a) h += `<div class="bk-kpis">
-      <div><span>Paper equity</span>${usd(a.equity)}</div><div><span>Today</span><b class="${cls(a.day_pl)}">${signed(a.day_pl)}</b></div>
-      <div><span>Buying power</span>${usd(a.buying_power)}</div><div><span>Cash</span>${usd(a.cash)}</div></div>`;
+      <div><span>${live ? "Net liquidation" : "Equity"}</span>${usd(a.equity)}</div><div><span>Today${C.daily_loss_limit ? ` (limit −${usd(C.daily_loss_limit)})` : ""}</span><b class="${cls(a.day_pl)}">${a.day_pl == null ? "—" : signed(a.day_pl)}</b></div>
+      <div><span>Buying power</span>${a.buying_power == null ? "—" : usd(a.buying_power)}</div><div><span>Cash</span>${a.cash == null ? "—" : usd(a.cash)}</div></div>`;
   if (a && (a.trading_blocked || a.shorting_enabled === false))
     h += `<div class="msg err">${a.trading_blocked ? "Trading is blocked on this account. " : ""}${a.shorting_enabled === false ? "Shorting is disabled on this account." : ""}</div>`;
+  if (C.stopped) h += `<div class="msg err">No orders are being sent: ${esc(C.stopped)}.</div>`;
   if (B.error) h += `<div class="msg err">${esc(B.error)}</div>`;
-  h += `<div class="hint">Last sync: ${fmtT(B.last_sync)} · ${!a || B.error ? '<span class="neg">position check unavailable</span>' : mism.length ? `<span class="neg">${mism.length} symbol(s) differ from the model</span>` : "paper matches the model"}</div>
-    <div class="row" style="margin-top:8px"><button type="button" id="bkSync" ${on ? "" : "disabled"}>Sync now</button></div>`;
+  h += `<div class="hint">Last sync: ${fmtT(B.last_sync)} · ${!a || B.error ? '<span class="neg">position check unavailable</span>' : mism.length ? `<span class="neg">${mism.length} symbol(s) differ from the model</span>` : "account matches the model"}</div>
+    <div class="row" style="margin-top:8px"><button type="button" id="bkSync" ${on && !C.kill ? "" : "disabled"}>Sync now</button>
+      <button type="button" id="bkPause" ${C.kill ? "disabled" : ""}>Pause orders</button>
+      <button type="button" id="bkFlat" class="danger" ${C.kill === "flatten" ? "disabled" : ""}>Flatten &amp; stop</button>
+      ${C.kill ? '<button type="button" id="bkResume">Resume</button>' : ""}</div>`;
   if (a && !B.error && (B.reconciliation || []).length) {
-    h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>Paper</th><th>Paper P&amp;L</th></tr></thead><tbody>` +
+    h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>${live ? "Live" : "Broker"}</th><th>Broker P&amp;L</th></tr></thead><tbody>` +
       B.reconciliation.map(r => `<tr><td class="sym">${esc(r.symbol)}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}${r.note ? `<div class="err-text" style="max-width:220px">${esc(r.note)}</div>` : ""}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
       `</tbody></table></div>`;
   }
   $("#bkBody").innerHTML = h;
   $("#bkToggle").onchange = async e => {
-    if (e.target.checked && !confirm("Start sending orders to the Alpaca PAPER account? Any open model positions will be opened there at market.")) { e.target.checked = false; return; }
+    if (e.target.checked) {
+      const ok = live
+        ? prompt(`LIVE account, real money. Open model positions will be opened at ${B.venue} (capped at ${C.max_shares || "no"} share(s) per symbol). Type LIVE to start.`) === "LIVE"
+        : confirm(`Start sending orders to ${B.venue}? Any open model positions will be opened there.`);
+      if (!ok) { e.target.checked = false; return; }
+    }
     try { await api(bk("/api/settings"), {broker_sync_enabled: e.target.checked}); } catch (err) { alert(err.message); }
     refresh();
   };
+  const kill = async (mode, msg) => {
+    if (msg && !confirm(msg)) return;
+    try { await api(bk("/api/broker/kill"), {mode}); } catch (err) { alert(err.message); }
+    refresh();
+  };
   $("#bkSync").onclick = async ev => { ev.target.disabled = true; try { await api(bk("/api/broker/sync"), {}); } catch (err) { alert(err.message); } refresh(); };
+  $("#bkPause").onclick = () => kill("pause", `Pause: nothing more is sent to ${B.venue} (no entries, no exits) until you press Resume. Positions there stay as they are.`);
+  $("#bkFlat").onclick = () => kill("flatten", `Flatten & stop: cancel working orders and close every position this dashboard manages at ${B.venue} now, then send nothing until you press Resume. The model keeps trading on its own.`);
+  if ($("#bkResume")) $("#bkResume").onclick = () => kill("off", `Resume: the next sync brings ${B.venue} back to the model's current positions (it re-opens anything the model still holds).`);
 }
 
 function statRow(name, st, extra = "") {
@@ -548,7 +571,7 @@ function renderTab() {
   filterSummary(all, rows);
   if (TAB === "closed") exportLink();
   const none = {open: "No open positions.", closed: "No closed trades yet.", symbols: "No closed trades yet.",
-    orders: "No paper orders yet.", log: "No events yet."}[TAB];
+    orders: "No broker orders yet.", log: "No events yet."}[TAB];
   if (!all.length) return $("#tabBody").innerHTML = `<div class="empty">${none}</div>`;
   if (!rows.length) return $("#tabBody").innerHTML = `<div class="empty">Nothing matches these filters.</div>`;
   let h = "";
