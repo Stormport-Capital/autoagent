@@ -44,9 +44,11 @@ MIN_PRICE = 1.0                 # price at the signal time
 MIN_AVG_VOLUME = 10_000         # average shares over the prior 20 sessions
 AVG_VOLUME_SESSIONS = 20
 EXCHANGES = ("NASDAQ", "NYSE", "AMEX")  # AMEX = NYSE American in FMP's naming
-SUSPECT_MIN_EVENTS = 3          # a symbol with this many events in the period
-SUSPECT_JUMP = 2.5              # a jump this large with no recorded corporate action
-CA_WINDOW_DAYS = 5              # "recorded corporate action" = split within +/- this many calendar days
+FLAG_MIN_EVENTS = 3             # flag (not exclude) a symbol with this many events in the list
+CA_WINDOW_DAYS = 5              # a split "near" the event = recorded within +/- this many calendar days
+UNAPPLIED_SPLIT_MIN_JUMP = 2.5  # data-error exclusion: split near the event, gold factor flat, jump >= this
+# Dropped (Dean, 2026-10-02 second round): the 2.5x-jump-without-split suspect
+# rule and the 3+-events exclusion.
 
 # Backtest windows (Dean, Step 4 and pull plan)
 ENTRY_LAST_DAY = 25             # entries on trading days 0..25 after the event

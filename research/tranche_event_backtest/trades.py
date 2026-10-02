@@ -18,6 +18,7 @@ prices it at whatever rate Dean sets. It does not change gross P&L or R.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections import defaultdict
 from datetime import date, datetime
@@ -59,11 +60,15 @@ def ema_unit(store, sleeve: str, entry_time: str) -> str:
     return "pct" if "p75 adverse move" in msg else "abs" if "x ATR" in msg else "?"
 
 
+def sessions_between(sessions: list[date], a: date, b: date) -> int:
+    """Trading days from a to b: same day = 0 (Dean, answer 12)."""
+    return bisect.bisect_right(sessions, b) - bisect.bisect_right(sessions, a)
+
+
 def extract(run, sessions: list[date], mark: float) -> list[dict]:
     """`mark`: the last available price when the data ends (the close of the
     last regular-hours 5-minute bar simulated); open trades are valued there."""
     store = run.store
-    idx = {d: i for i, d in enumerate(sessions)}
     last_price = mark
     groups = defaultdict(list)
     for t in store.q("SELECT * FROM tranches ORDER BY id"):
@@ -88,7 +93,7 @@ def extract(run, sessions: list[date], mark: float) -> list[dict]:
             exit_legs.append((None, last_price, sum(t["qty"] for t in opened), "OPEN",
                               sum(t["borrow_fees"] for t in opened)))
         last_exit = exit_legs[-1][0]
-        hold = (idx[last_exit.date()] - idx[entry_dt.date()]) if last_exit else None
+        hold = sessions_between(sessions, entry_dt.date(), last_exit.date()) if last_exit else None
         unit = ema_unit(store, sleeve, entry_time) if sleeve != "VWAP" else "stop"
         row = {
             "strategy": STRATEGY[(sleeve, trig)], "timeframe": run.book, "direction": side,

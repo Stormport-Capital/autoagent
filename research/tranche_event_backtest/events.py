@@ -7,9 +7,11 @@ split list from sql/splits.sql (inputs/splits.csv), the session calendar
 and common-stock filters.
 
 Every candidate ends up in exactly one bucket: TESTED, EXCLUDED (with the
-first failing reason) or SUSPECT (with every suspect reason). Events whose
-exchange or security type is not yet known are marked PENDING_METADATA and
-stay out of TESTED until a security master is supplied.
+first failing reason) or PENDING (exchange / security type not yet known, or
+the listed ticker of a same-bars pair undetermined). PENDING events stay out
+of TESTED until a security master is supplied. There are no suspect
+exclusions (Dean, second round: the 2.5x and 3+ events rules are dropped; 3+
+events and short history are flags on the Events tab).
 
     python events.py                # writes out/events_*.csv, out/excluded_*.csv,
                                     # out/reconciliation.csv
@@ -35,11 +37,10 @@ COLS = ("symbol,trade_date,source,open,high,low,close,raw_close,factor,volume,re
 NUM = ("open", "high", "low", "close", "raw_close", "factor", "ref_close", "ref_raw_close",
        "ref_factor", "avgvol_adj", "avgvol_raw")
 
-# Basis for the $1 and 10,000-share tests. Gold's own convention is "all
-# calculations use adjusted prices" (migration 048), so adjusted is the default.
-# Open question for Dean: as-traded instead? Both counts are reported.
-PRICE_BASIS = os.environ.get("EVENT_PRICE_BASIS", "adjusted")    # adjusted | as_traded
-VOLUME_BASIS = os.environ.get("EVENT_VOLUME_BASIS", "adjusted")  # adjusted | as_traded
+# Basis for the $1 and 10,000-share tests: as-traded (Dean, answer 5 of the
+# second round). `adjusted` is kept only to reproduce the earlier counts.
+PRICE_BASIS = os.environ.get("EVENT_PRICE_BASIS", "as_traded")    # as_traded | adjusted
+VOLUME_BASIS = os.environ.get("EVENT_VOLUME_BASIS", "as_traded")  # as_traded | adjusted
 
 
 def load_candidates(pattern: str = "cand_*.csv") -> list[dict]:
@@ -87,13 +88,34 @@ def load_master() -> dict[str, dict] | None:
 
 def price_at_signal(r: dict, ev: spec.EventSpec) -> D:
     """CLOSE events: the day's close. INTRADAY events: the signal bar's close is
-    only known from intraday bars; until then the 2x level stands in for it."""
+    only known from intraday bars; until then the price at the 2x level stands
+    in for it. As-traded = adjusted / that day's gold split factor (migration 048:
+    adjusted = raw x cum_split_factor), so a split between the prior day and day
+    0 does not distort it."""
     if ev.basis == "close":
-        px = r["close"] if PRICE_BASIS == "adjusted" else r["raw_close"]
-    else:
-        ref = r["ref_close"] if PRICE_BASIS == "adjusted" else r["ref_raw_close"]
-        px = ref * D(str(ev.multiple))
-    return px
+        return r["close"] if PRICE_BASIS == "adjusted" else r["raw_close"]
+    level = r["ref_close"] * D(str(ev.multiple))
+    return level if PRICE_BASIS == "adjusted" else level / r["factor"]
+
+
+def possible_unapplied_split(e: dict) -> bool:
+    """A split is recorded within +/-5 calendar days, gold's split factor does
+    not step between the prior day and day 0, and the jump is 2.5x or more: the
+    jump may be the split itself (approved as a data-error exclusion, Dean,
+    answer 3 of the second round)."""
+    return bool(e["splits_within_5d"]) and not e["factor_step_on_day"] \
+        and e["jump"] >= D(str(spec.UNAPPLIED_SPLIT_MIN_JUMP))
+
+
+def listed_ticker(group: set[str], day: date, master: dict | None) -> str | None:
+    """Of several tickers carrying identical bars on `day`, the one listed that
+    day (Dean, answer 4): the only one with a security-master profile whose IPO
+    date is on or before `day`. None when that does not single one out."""
+    if master is None:
+        return None
+    ok = [s for s in group if master.get(s, {}).get("profile_found") == "yes"
+          and (not master[s].get("ipo_date") or master[s]["ipo_date"] <= day.isoformat())]
+    return ok[0] if len(ok) == 1 else None
 
 
 def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> list[dict]:
@@ -101,7 +123,7 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
     mult = D(str(ev.multiple))
     base = [r for r in rows if ev.basis == "high" or r["close"] >= mult * r["ref_close"]]
     # identical bars under two tickers on the same day (FMP serves an old and a new
-    # ticker with one history); which one was listed that day needs the master
+    # ticker with one history)
     same = defaultdict(set)
     for r in rows:
         same[(r["trade_date"], r["open"], r["high"], r["low"], r["close"], r["volume"])].add(
@@ -125,18 +147,19 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
             "held_faded": ("HELD" if r["close"] >= mult * r["ref_close"] else "FADED")
             if ev.basis == "high" else "",
             "price_test": round(price_at_signal(r, ev), 6), "price_basis": PRICE_BASIS,
-            "avg_vol_20": vol, "volume_basis": VOLUME_BASIS, "prior_sessions": r["n_prior"],
+            "avg_vol_20": round(vol, 1) if vol is not None else None, "volume_basis": VOLUME_BASIS,
+            "prior_sessions": r["n_prior"],
+            "short_history": r["n_prior"] < spec.AVG_VOLUME_SESSIONS,
             "splits_within_5d": ";".join(f"{a}:{n:g}-for-{m:g}" for a, n, m in near),
             "factor_step_on_day": r["factor"] != r["ref_factor"],
             "same_bars_as": ";".join(sorted(same[(r["trade_date"], r["open"], r["high"], r["low"],
                                                   r["close"], r["volume"])] - {sym})),
             "raw_symbol": r["symbol"],
             "exchange": "", "security_type": "",
-            "suspect_many_events": False, "suspect_jump_no_ca": False,
-            "possible_unapplied_split": False,
+            "events_in_list": 0, "symbol_3plus_events": False,
             "status": "", "reason": "",
         }
-        if master is not None and sym in master:
+        if master is not None and master.get(sym, {}).get("profile_found") == "yes":
             e["exchange"] = master[sym].get("exchange", "")
             e["security_type"] = master[sym].get("security_type", "")
         events.append(e)
@@ -148,8 +171,11 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
             e["status"], e["reason"] = "EXCLUDED", f"duplicate row: ticker {e['raw_symbol']!r} has trailing whitespace, same bars as {e['symbol']}"
         elif d not in session_set:
             e["status"], e["reason"] = "EXCLUDED", "event date is not a trading session (weekend/holiday row in gold)"
+        elif possible_unapplied_split(e):
+            e["status"], e["reason"] = "EXCLUDED", (f"data error: possible unapplied split (split recorded "
+                                                    f"{e['splits_within_5d']}, gold factor unchanged, jump {e['jump']:.2f}x)")
         elif e["price_test"] < D(str(spec.MIN_PRICE)):
-            what = "close" if ev.basis == "close" else "2x prior close (signal-bar close needs intraday bars)"
+            what = "close" if ev.basis == "close" else "price at 2x prior close; signal-bar close is re-tested on intraday bars"
             e["status"], e["reason"] = "EXCLUDED", f"price < $1 ({what}, {PRICE_BASIS})"
         elif e["avg_vol_20"] is None or e["avg_vol_20"] < spec.MIN_AVG_VOLUME:
             e["status"], e["reason"] = "EXCLUDED", f"avg volume prior 20 sessions < 10,000 ({VOLUME_BASIS})"
@@ -157,32 +183,29 @@ def build(ev: spec.EventSpec, rows: list[dict], splits, sessions, master) -> lis
             e["status"], e["reason"] = "EXCLUDED", f"exchange {e['exchange']} not NASDAQ/NYSE/NYSE American"
         elif master is not None and e["security_type"] and e["security_type"] != "common":
             e["status"], e["reason"] = "EXCLUDED", f"not common stock ({e['security_type']})"
+        elif e["same_bars_as"]:
+            group = {e["symbol"], *e["same_bars_as"].split(";")}
+            keep = listed_ticker(group, d, master)
+            if keep is not None and keep != e["symbol"]:
+                e["status"], e["reason"] = "EXCLUDED", f"same bars as {keep} on this day; {keep} was the listed ticker"
 
-    # suspects among the events still standing
-    live = [e for e in events if not e["status"]]
-    per_symbol = Counter(e["symbol"] for e in live)
-    for e in live:
-        why = []
-        if per_symbol[e["symbol"]] >= spec.SUSPECT_MIN_EVENTS:
-            e["suspect_many_events"] = True
-            why.append(f"symbol has {per_symbol[e['symbol']]} {ev.name} events in the period")
-        if e["jump"] >= D(str(spec.SUSPECT_JUMP)) and not e["splits_within_5d"]:
-            e["suspect_jump_no_ca"] = True
-            why.append(f"jump {e['jump']:.2f}x with no recorded split within ±{spec.CA_WINDOW_DAYS} days")
-        if why:
-            e["status"], e["reason"] = "SUSPECT", "; ".join(why)
     for e in events:
         if e["status"]:
             continue
         pend = []
-        if master is None or e["symbol"] not in master:
-            pend.append("exchange and security type unknown (no security master)")
-        if e["same_bars_as"]:
-            pend.append(f"same bars as {e['same_bars_as']} on this day: listed ticker unknown")
-        if e["splits_within_5d"] and not e["factor_step_on_day"] and e["jump"] >= D(str(spec.SUSPECT_JUMP)):
-            e["possible_unapplied_split"] = True
-            pend.append("split recorded within ±5 days but gold not adjusted: jump may be the split")
+        if master is None or master.get(e["symbol"], {}).get("profile_found") != "yes":
+            pend.append("exchange and security type unknown (no FMP profile)")
+        if e["same_bars_as"] and listed_ticker({e["symbol"], *e["same_bars_as"].split(";")},
+                                               date.fromisoformat(e["event_date"]), master) is None:
+            pend.append(f"same bars as {e['same_bars_as']} on this day: listed ticker UNKNOWN")
         e["status"], e["reason"] = ("PENDING", "; ".join(pend)) if pend else ("TESTED", "")
+
+    # flags, not exclusions (Dean, answers 6 and 7 of the second round)
+    live = [e for e in events if e["status"] in ("TESTED", "PENDING")]
+    per_symbol = Counter(e["symbol"] for e in live)
+    for e in live:
+        e["events_in_list"] = per_symbol[e["symbol"]]
+        e["symbol_3plus_events"] = per_symbol[e["symbol"]] >= spec.FLAG_MIN_EVENTS
     return events
 
 
@@ -207,8 +230,8 @@ def main() -> None:
         events = build(ev, rows, splits, sessions, master)
         built[name] = events
         write(os.path.join(OUT, f"events_{name}.csv"), [e for e in events if e["status"] in ("TESTED", "PENDING")])
-        write(os.path.join(OUT, f"excluded_{name}.csv"), [e for e in events if e["status"] in ("EXCLUDED", "SUSPECT")])
-        c = Counter((e["status"], e["reason"].split(" (")[0] if e["status"] == "EXCLUDED" else e["status"]) for e in events)
+        write(os.path.join(OUT, f"excluded_{name}.csv"), [e for e in events if e["status"] == "EXCLUDED"])
+        c = Counter((e["status"], e["reason"].split(" (")[0].split(":")[0] if e["status"] == "EXCLUDED" else e["status"]) for e in events)
         recon.append({"event_type": name, "bucket": "CANDIDATES", "reason": "", "events": len(events),
                       "symbols": len({e["symbol"] for e in events})})
         for (st, why), n in sorted(c.items()):

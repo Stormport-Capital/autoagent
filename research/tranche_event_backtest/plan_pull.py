@@ -16,7 +16,9 @@ probe measures it.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import sys
 from collections import defaultdict
 from datetime import date, timedelta
@@ -72,7 +74,28 @@ def splits_inside(merged, splits) -> int:
                for s in splits.get(sym, []) if a <= s[0] <= b)
 
 
+def probe_figures() -> dict:
+    """Bars per session and bytes per bar measured by probe.py, when it has run."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "probe.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        p = json.load(f)
+    c = p.get("call3_depth") if isinstance(p.get("call3_depth"), dict) else {}
+    out = {}
+    if c.get("bars"):
+        out["bytes_per_bar"] = c["bytes"] / c["bars"]
+        out["extended_hours"] = bool(c.get("premarket_bars") or c.get("afterhours_bars"))
+    return out
+
+
 def main(statuses=("PENDING", "TESTED")) -> None:
+    global BYTES_PER_BAR
+    pf = probe_figures()
+    if pf:
+        BYTES_PER_BAR = pf["bytes_per_bar"]
+        print(f"probe: {BYTES_PER_BAR:.0f} bytes per bar, extended hours "
+              f"{'included' if pf['extended_hours'] else 'not included'} (use the matching bars_/mb_ line)")
     rows, splits = events.load_candidates(), events.load_splits()
     sessions = events.load_sessions()
     full = sorted(set(sessions) | set(EXTRA_SESSIONS))

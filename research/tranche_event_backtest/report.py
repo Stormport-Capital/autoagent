@@ -245,12 +245,14 @@ def write_workbook(path, trade_rows, events, excluded, checks):
     for title, rows in (("Events", events), ("Excluded", excluded)):
         ws = wb.create_sheet(title)
         if rows:
-            ws.append(list(rows[0].keys()))
+            head = list(dict.fromkeys(k for r in rows for k in r))   # union of columns, first-seen order
+            ws.append(head)
             for cell in ws[1]:
                 cell.font = BOLD
             for r in rows:
+                vals = [r.get(k) for k in head]
                 ws.append([("yes" if v else "no") if isinstance(v, bool) else
-                           float(v) if isinstance(v, Decimal) else _naive(v) for v in r.values()])
+                           float(v) if isinstance(v, Decimal) else _naive(v) for v in vals])
             ws.freeze_panes = "B2"
     ws = wb.create_sheet("Checks")
     for line in checks:

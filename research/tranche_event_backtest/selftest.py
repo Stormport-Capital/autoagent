@@ -62,7 +62,7 @@ def _legs(store, r):
 def check_costs(events, sessions):
     e = events[0]
     bars = intraday.load_bars(e.bars_path)
-    pause, end = runner.entry_window(e, sessions, sessions[-1])
+    pause, end = runner.entry_window(e, sessions, sessions[-1])  # no extensions
     zero = replay.run_event(e.symbol, bars, "1h", e.added_at, sessions, pause, end)
     mark = bars[-1].close
     rows = [r for r in trades.extract(zero, sessions, mark) if r["status"] == "CLOSED"]
@@ -86,16 +86,20 @@ def check_costs(events, sessions):
     print(f"costs: {len(rows)} closed trades; workbook net R vs engine net R, worst |diff| {worst:.6f}")
 
 
-def check_workbook(rows, tmp):
+def check_workbook(rows, tmp, xl: str | None = None):
+    """Recalculate a workbook in LibreOffice and compare every formula result
+    with Python. `xl` = an existing workbook built from `rows` (the real
+    output); default = a fresh one written here."""
     if not shutil.which("soffice"):
         print("workbook: skipped (LibreOffice not installed)")
         return
     from openpyxl import load_workbook
-    xl = os.path.join(tmp, "selftest.xlsx")
-    report.write_workbook(xl, rows, [{"event": "synthetic"}], [{"excluded": "none"}], ["synthetic self-test"])
+    if xl is None:
+        xl = os.path.join(tmp, "selftest.xlsx")
+        report.write_workbook(xl, rows, [{"event": "synthetic"}], [{"excluded": "none"}], ["synthetic self-test"])
     subprocess.run(["soffice", "--headless", "--calc", "--convert-to", "xlsx", "--outdir",
                     os.path.join(tmp, "calc"), xl], check=True, capture_output=True)
-    wb = load_workbook(os.path.join(tmp, "calc", "selftest.xlsx"), data_only=True)
+    wb = load_workbook(os.path.join(tmp, "calc", os.path.basename(xl)), data_only=True)
     ws = wb["Trades"]
     hdr = [c.value for c in ws[1]]
     py = {(r["event_id"], r["timeframe"], r["strategy"], r["direction"], r["entry_time"].replace(tzinfo=None)):
