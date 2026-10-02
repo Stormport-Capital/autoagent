@@ -162,7 +162,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           <label for="starting_capital">Portfolio size ($)</label>
           <input id="starting_capital" type="number" min="1000" step="1000">
           <div class="row">
-            <div><label for="borrow_rate_pct">Borrow rate (%/yr)</label><input id="borrow_rate_pct" type="number" step="0.5" min="0"></div>
+            <div><label for="borrow_rate_pct" title="Used for every symbol without its own rate (set one with the Borrow button on its row)">Default borrow (%/yr)</label><input id="borrow_rate_pct" type="number" step="1" min="0"></div>
             <div><label for="borrow_day_count">Day count</label>
               <select id="borrow_day_count"><option value="360">360</option><option value="365">365</option></select></div>
           </div>
@@ -176,6 +176,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
           </div>
           <div class="row">
             <div><label for="bar_close_delay_min">Check delay (min)</label><input id="bar_close_delay_min" type="number" step="1" min="0"></div>
+            <div><label for="overnight_borrow_max_pct" title="Shorts in a symbol whose own borrow rate (set with its Borrow button) is above this are closed at the 3:55 PM close instead of held overnight. Symbols on the default rate are not forced flat. Longs are not affected. 0 = off">Overnight borrow limit (%/yr)</label><input id="overnight_borrow_max_pct" type="number" step="1" min="0"></div>
           </div>
           <div class="row">
             <div><label for="vwap_max_sessions" title="VWAP short: cover at the last check of this session held, counting the entry day as 1. 0 = no time limit">VWAP max hold (sessions)</label><input id="vwap_max_sessions" type="number" step="1" min="0" max="30"></div>
@@ -306,7 +307,7 @@ function render() {
     kpi("Total return", pct(m.total_return, 2), signed(m.equity - m.starting_capital), cls(m.total_return)) +
     kpi("Realized P&L", signed(m.realized_net), `${o.trades} closed trades`, cls(m.realized_net)) +
     kpi("Open P&L", signed(m.unrealized), `${m.open.length} open tranches`, cls(m.unrealized)) +
-    kpi("Borrow fees", usd(m.borrow_fees, 2), `${S.settings.borrow_rate_pct}%/yr`) +
+    kpi("Borrow fees", usd(m.borrow_fees, 2), `default ${S.settings.borrow_rate_pct}%/yr · overnight limit ${S.settings.overnight_borrow_max_pct || "off"}${S.settings.overnight_borrow_max_pct ? "%" : ""}`) +
     kpi("Win rate", pct(o.win_rate, 0), `PF ${o.profit_factor == null ? "—" : num(o.profit_factor)} · avg ${o.avg_r == null ? "—" : num(o.avg_r) + "R"}`) +
     kpi("Max drawdown", pct(-m.max_drawdown, 1), "from equity snapshots", m.max_drawdown > 0 ? "neg" : "") +
     kpi("Exposure", usd(m.gross_long + m.gross_short), `L ${usd(m.gross_long)} · S ${usd(m.gross_short)}`);
@@ -350,7 +351,8 @@ function renderWatch(S) {
         <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
           ${["A+", "A", "B", "C"].map(g => `<option ${s.grade === g ? "selected" : ""}>${g}</option>`).join("")}
           ${s.grade ? "" : `<option selected value="">custom</option>`}
-        </select> ${s.risk_pct}%</td>
+        </select> ${s.risk_pct}%
+        <div class="hint" style="margin:2px 0 0">borrow <button class="small" data-act="borrow" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.borrow_pct ?? ""}" title="This symbol's borrow fee (%/yr). Blank = book default">${s.borrow_pct == null ? `${STATE.settings.borrow_rate_pct}% (default)` : `${s.borrow_pct}%`}</button>${(() => { const l = STATE.settings.overnight_borrow_max_pct; return l && s.borrow_pct != null && s.borrow_pct > l && !s.eod_close ? ` <span class="pill warn" title="Borrow above the overnight limit: its shorts are closed at 3:55 PM">shorts flat by 3:55</span>` : ""; })()}</div></td>
       <td>${num(s.last_price)}</td><td>${stack}</td>
       <td>${n.vwap == null ? "—" : `<span class="${below ? "neg" : ""}">${num(n.vwap)}</span>`}</td>
       <td class="l">${trancheCell(s.tranches.EMA5_10)}</td>
@@ -640,6 +642,12 @@ $("#watch").onclick = async e => {
     try { const r = await api(bk(`/api/symbols/${b.dataset.id}/rename`), {symbol: sym, ratio: Number(ratio)});
           alert(`${r.old} is now ${r.new} in the ${STATE.book.label} book (${r.moved} open tranche(s) moved). Rename it on the other book tabs too.`); }
     catch (err) { alert(err.message); }
+    return refresh();
+  }
+  if (b.dataset.act === "borrow") {
+    const v = prompt(`Borrow fee for ${b.dataset.sym} in % per year (IBKR / iBorrowDesk "fee"). Leave blank for the book default:`, b.dataset.v);
+    if (v === null) return;
+    try { await api(bk(`/api/symbols/${b.dataset.id}/borrow`), {pct: v.trim() === "" ? null : Number(v)}); } catch (err) { alert(err.message); }
     return refresh();
   }
   if (b.dataset.act === "eod") {

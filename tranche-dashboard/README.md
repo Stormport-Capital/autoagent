@@ -104,10 +104,17 @@ Each tranche gets one third of that budget.
   mark-to-market equity. Gross exposure is capped at `Max gross leverage × equity`
   (default 2×). An entry that works out to less than one share is skipped and
   logged.
-- **Borrow:** every short is assumed borrowable. Hard-to-borrow cost is
-  **10%/yr** (configurable), charged per calendar night held (so Friday → Monday
-  is 3 nights) on the prior close's notional ÷ 360 (or 365). A short covered the
-  same day pays no borrow.
+- **Borrow:** every short is assumed borrowable (the model does not check
+  availability). The fee is the symbol's own rate (Borrow button on its row, e.g.
+  the IBKR fee from iBorrowDesk) or the book default, **250%/yr** (configurable;
+  small caps that just ran were 46-634%/yr at IBKR in Oct 2026). It is charged per
+  calendar night held (Friday → Monday is 3 nights) on the prior close's notional
+  ÷ 360 (or 365). A short covered the same day pays no borrow, as at IBKR for
+  ordinary shorts opened and covered the same trading day.
+- **Overnight borrow limit (default 200%/yr):** a symbol whose own entered rate is
+  above it has its shorts closed at the 15:55 close and takes no new shorts from
+  15:55, like a close-by-end-of-day name. Symbols on the default rate are not
+  forced flat. 0 turns it off.
 - **Costs:** 5 bps slippage on each side by default. No commissions.
 - **Controls:** pause a symbol (open tranches are still managed, but no new
   entries), close by end of day (per symbol: trades all session, no new entries

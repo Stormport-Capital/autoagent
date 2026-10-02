@@ -290,6 +290,25 @@ class FmpTests(unittest.TestCase):
         self.assertNotIn("fmpsecret123", str(cm.exception))
 
 
+class BorrowDefaultMigrationTests(unittest.TestCase):
+    def test_old_ten_percent_default_moves_to_250_once(self):
+        fd, path = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            st = Store(path)
+            st.db.execute("DELETE FROM settings WHERE key='_borrow_default_v2'")
+            st.save_settings({"borrow_rate_pct": 10.0})
+            st.db.close()
+            st = Store(path)
+            self.assertEqual(st.settings()["borrow_rate_pct"], 250.0)
+            st.save_settings({"borrow_rate_pct": 10.0})   # a deliberate later choice sticks
+            st.db.close()
+            st = Store(path)
+            self.assertEqual(st.settings()["borrow_rate_pct"], 10.0)
+            st.db.close()
+        finally:
+            os.remove(path)
+
+
 class AuthTests(unittest.TestCase):
     def test_basic_auth(self):
         import base64
@@ -529,8 +548,48 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(t["borrow_fees"], 0)
         eng.tick(datetime.combine(mon, time(10, 35), tzinfo=ET))
         t = self.store.q("SELECT * FROM tranches WHERE id=?", (t["id"],))[0]
-        expected = 3 * t["qty"] * p * 0.10 / 360  # marked at Friday's close
+        expected = 3 * t["qty"] * p * 2.50 / 360  # book default 250%/yr, marked at Friday's close
         self.assertAlmostEqual(t["borrow_fees"], expected, places=6)
+
+    def test_symbol_borrow_rate_overrides_default(self):
+        fri, mon = date(2026, 9, 18), date(2026, 9, 21)
+        bars, p = [], 50.0
+        for d in weekdays(date(2026, 9, 1), 14):
+            if d > fri:
+                break
+            closes = [p + 0.1 * (k + 1) for k in range(7)]
+            if d == fri:
+                closes = [p - 1, p - 2, p - 3, p - 3.1, p - 3.2, p - 3.3, p - 3.4]
+            bars += day_from_closes(d, closes)
+            p = closes[-1]
+        bars += day_from_closes(mon, [p - 0.1] * 7)
+        eng = self.engine(bars)
+        eng.add_symbols("OWN", "short_only", 1.0, datetime.combine(fri, time(9), tzinfo=ET))
+        eng.set_borrow(1, 150, datetime.combine(fri, time(9), tzinfo=ET))   # under the 200% limit
+        eng.tick(datetime.combine(fri, time(16, 5), tzinfo=ET))
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA5_10'")[0]
+        self.assertEqual(t["status"], "open")                               # may hold overnight
+        eng.tick(datetime.combine(mon, time(10, 35), tzinfo=ET))
+        t = self.store.q("SELECT * FROM tranches WHERE id=?", (t["id"],))[0]
+        self.assertAlmostEqual(t["borrow_fees"], 3 * t["qty"] * p * 1.50 / 360, places=6)
+        with self.assertRaises(ValidationError):
+            eng.set_borrow(1, -5, datetime.combine(mon, time(11), tzinfo=ET))
+
+    def test_overnight_borrow_limit_forces_shorts_flat(self):
+        eng, d = self.eod_setup(False)
+        eng.set_borrow(1, 260, datetime.combine(d, time(9), tzinfo=ET))      # above the 200% limit
+        eng.tick(datetime.combine(d, time(15, 58), tzinfo=ET))
+        rows = self.store.q("SELECT * FROM tranches")
+        self.assertTrue(rows)
+        for t in rows:
+            self.assertEqual(t["status"], "closed")
+            self.assertIn("above the 200% overnight limit", t["exit_reason"])
+            self.assertEqual(t["borrow_fees"], 0)
+
+    def test_default_rate_never_forces_flat(self):
+        eng, d = self.eod_setup(False)                    # no own rate: default 250% > 200% limit
+        eng.tick(datetime.combine(d, time(15, 58), tzinfo=ET))
+        self.assertTrue(self.store.q("SELECT 1 FROM tranches WHERE status='open'"))
 
     def test_leverage_cap_limits_size(self):
         self.store.save_settings({"max_leverage": 0.1})
