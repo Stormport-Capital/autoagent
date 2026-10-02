@@ -135,7 +135,7 @@ class BrokerSync:
         self.venue = getattr(broker, "venue", "Alpaca paper")
         self.live = bool(getattr(broker, "live", False))
         self.short_notes: dict[str, tuple] = {}  # symbol -> (ET day, why no short)
-        self._watched = 0.0
+        self._watched: float | None = None  # monotonic time of the last loss check
         self.lock = threading.Lock()
         self.last_sync: datetime | None = None
         self.last_error: str | None = None
@@ -329,7 +329,8 @@ class BrokerSync:
     def watch(self, now: datetime) -> None:
         """Called every scheduler pass: re-checks the loss limit once a minute
         between bar checks, and flattens straight away if it trips."""
-        if not self.daily_loss_limit or _time.monotonic() - self._watched < WATCH_EVERY_S:
+        if not self.daily_loss_limit or (self._watched is not None
+                                         and _time.monotonic() - self._watched < WATCH_EVERY_S):
             return
         self._watched = _time.monotonic()
         try:

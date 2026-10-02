@@ -1887,11 +1887,11 @@ class LiveGuardTests(unittest.TestCase):
         sync.sync(self.NOW)  # day start 27,000
         self.assertEqual(sync.day_start(self.NOW), 27000.0)
         self.ib.netliq = 26950.0
-        sync._watched = 0
+        sync._watched = None
         sync.watch(self.NOW)
         self.assertIsNone(sync.stop_reason(self.NOW))
         self.ib.netliq = 26899.0  # down $101
-        sync._watched = 0
+        sync._watched = None
         sync.watch(self.NOW + timedelta(minutes=1))
         self.assertEqual(sync.stop_reason(self.NOW)[0], "flatten")
         self.assertEqual(self.ib.pos, {"MANUAL": 5})  # only managed symbols are closed
