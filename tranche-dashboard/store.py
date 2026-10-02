@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     snapshot TEXT,                          -- JSON: latest indicator readings
     error TEXT,
     grade TEXT,                             -- A+ / A / B / C, or NULL = custom risk %
-    renamed_from TEXT                       -- previous ticker after a symbol change
+    renamed_from TEXT,                      -- previous ticker after a symbol change
+    eod_close INTEGER NOT NULL DEFAULT 0    -- 1 = day trades only: flat by the 15:55 close
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
@@ -131,6 +132,8 @@ class Store:
             self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")
         if "renamed_from" not in scols:  # databases created before ticker renames
             self.db.execute("ALTER TABLE symbols ADD COLUMN renamed_from TEXT")
+        if "eod_close" not in scols:  # databases created before close-by-end-of-day
+            self.db.execute("ALTER TABLE symbols ADD COLUMN eod_close INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     # -- generic helpers -------------------------------------------------
