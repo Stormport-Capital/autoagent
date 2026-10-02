@@ -15,18 +15,26 @@ paper account's position in each watched symbol to the model's NET quantity
     open. Alpaca rejects a single order that crosses through zero.
   * Stops are the model's hourly stops, so the paper account exits at the same
     hourly checks as the model. There are no resting stop orders at Alpaca.
+  * A refusal is not retried blindly. "Cannot be sold short" / not shortable /
+    not easy to borrow stops new or larger shorts in that symbol until the next
+    session; "not found" / not tradable stops every order in it until the next
+    session; a trading halt pauses it for 10 minutes. Covers and long exits are
+    never held back by a short refusal. Each skip is logged once per day.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time as _time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
+
+from indicators import ET
 
 from data import redact
 
@@ -93,6 +101,12 @@ class AlpacaPaper:
             "time_in_force": "day", "client_order_id": client_order_id})
 
 
+NO_SHORT = re.compile(r"cannot be sold short|not shortable|not easy to borrow|no shares available", re.I)
+NO_TRADE = re.compile(r"not found|not tradable|not active", re.I)
+HALTED = re.compile(r"halt", re.I)
+HALT_PAUSE = timedelta(minutes=10)
+
+
 class BrokerSync:
     def __init__(self, store, broker, fill_wait_s: float = 20.0):
         self.store, self.broker = store, broker
@@ -140,12 +154,20 @@ class BrokerSync:
                     if sym in busy:
                         self.needs_followup = True
                         continue
+                    why = self._held_back(now, sym, opens_short=False)
+                    if why:
+                        self._log_skip(now, sym, why)
+                        continue
                     if cur and target and (cur > 0) != (target > 0):
                         order = self._submit(now, sym, -cur, f"close {cur:+d} before reversing")
                         if not order or not self._await_fill(order):
                             self.needs_followup = order is not None
                             continue  # opening leg goes out on a follow-up sync
                         cur = 0
+                    why = self._held_back(now, sym, opens_short=target < 0 and target < min(cur, 0))
+                    if why:
+                        self._log_skip(now, sym, why)
+                        continue
                     self._submit(now, sym, target - cur, f"model {target:+d}, paper {cur:+d}")
                 acct = self.broker.account()
                 self.store.x("INSERT OR REPLACE INTO broker_equity VALUES (?, ?)",
@@ -156,6 +178,48 @@ class BrokerSync:
                 self.store.log(now, "broker-error", self.last_error[:300])
             self.last_sync = now
             self.snapshot_at = 0.0  # force a fresh account read
+
+    def _held_back(self, now: datetime, sym: str, opens_short: bool) -> str | None:
+        """Why an order for `sym` should not be sent right now, from its latest
+        rejection (None = go ahead). A filled or working order after the
+        rejection clears it."""
+        rows = self.store.q("SELECT ts, side, status, message FROM orders WHERE symbol=? "
+                            "ORDER BY id DESC LIMIT 20", (sym,))
+        today = now.astimezone(ET).date()
+        for r in rows:
+            if r["status"] != "rejected":
+                if not (opens_short and r["side"] == "buy"):
+                    return None  # a later accepted order supersedes older refusals
+                continue  # a cover filling doesn't prove we can short again
+            msg = r["message"] or ""
+            when = datetime.fromisoformat(r["ts"])
+            if HALTED.search(msg) and now - when < HALT_PAUSE:
+                return f"trading halt - retrying after {(when + HALT_PAUSE).astimezone(ET):%H:%M}"
+            if when.astimezone(ET).date() != today:
+                return None
+            if NO_TRADE.search(msg):
+                return f"Alpaca won't trade it today ({msg[:80]})"
+            if opens_short and r["side"] == "sell" and NO_SHORT.search(msg):
+                return f"Alpaca paper can't short it today ({msg[:80]})"
+        return None
+
+    def _log_skip(self, now: datetime, sym: str, why: str) -> None:
+        day_start = datetime.combine(now.astimezone(ET).date(), datetime.min.time(), tzinfo=ET)
+        seen = self.store.q("SELECT ts FROM events WHERE kind='broker-skip' AND symbol=? "
+                            "ORDER BY id DESC LIMIT 1", (sym,))
+        if seen and datetime.fromisoformat(seen[0]["ts"]) >= day_start:
+            return
+        self.store.log(now, "broker-skip", f"not sent to paper: {why}. The model keeps trading "
+                       "it; the paper account stays as is.", sym)
+
+    def blocked(self, now: datetime) -> dict[str, str]:
+        """Symbols whose new shorts (or all orders) are held back right now."""
+        out = {}
+        for sym in self.managed():
+            why = self._held_back(now, sym, opens_short=True)
+            if why:
+                out[sym] = why
+        return out
 
     def _submit(self, now: datetime, sym: str, delta: int, reason: str) -> dict | None:
         side = "buy" if delta > 0 else "sell"
@@ -213,6 +277,7 @@ class BrokerSync:
             self.snapshot_at = _time.monotonic()
         want = self.desired()
         pos = self.snapshot["positions"]
+        held = self.blocked(self.last_sync or datetime.now(ET))
         recon = []
         for sym in sorted(self.managed() | set(want) | (set(pos) & self.managed())):
             p = pos.get(sym)
@@ -222,6 +287,7 @@ class BrokerSync:
                 "avg_entry": float(p["avg_entry_price"]) if p else None,
                 "unrealized": float(p["unrealized_pl"]) if p else None,
                 "match": paper == want.get(sym, 0),
+                "note": held.get(sym),
             })
         acct = self.snapshot["account"]
         return {

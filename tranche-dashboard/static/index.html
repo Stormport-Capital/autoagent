@@ -441,7 +441,7 @@ function renderBroker(B) {
     <div class="row" style="margin-top:8px"><button type="button" id="bkSync" ${on ? "" : "disabled"}>Sync now</button></div>`;
   if (a && !B.error && (B.reconciliation || []).length) {
     h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>Paper</th><th>Paper P&amp;L</th></tr></thead><tbody>` +
-      B.reconciliation.map(r => `<tr><td class="sym">${esc(r.symbol)}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
+      B.reconciliation.map(r => `<tr><td class="sym">${esc(r.symbol)}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}${r.note ? `<div class="err-text" style="max-width:220px">${esc(r.note)}</div>` : ""}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
       `</tbody></table></div>`;
   }
   $("#bkBody").innerHTML = h;
