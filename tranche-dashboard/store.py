@@ -10,7 +10,7 @@ from datetime import datetime
 
 DEFAULT_SETTINGS = {
     "starting_capital": 100_000.0,
-    "borrow_rate_pct": 10.0,       # annual hard-to-borrow fee on short notional
+    "borrow_rate_pct": 250.0,      # default annual borrow fee on short notional (per-symbol overrides)
     "borrow_day_count": 360,       # broker convention: rate / 360 per calendar night
     "stop_atr_mult": 2.0,          # EMA sizing fallback (x ATR) when < 5 past crosses; NOT a stop
     "atr_period": 14,
@@ -20,6 +20,7 @@ DEFAULT_SETTINGS = {
     "broker_sync_enabled": False,  # mirror the model into the Alpaca PAPER account
     "vwap_max_sessions": 10,       # VWAP short: cover at the last check of this session (0 = off)
     "vwap_scale_out_20": 1,        # VWAP short: half at the 10-day MA, rest at the 20-day (0 = all at 10)
+    "overnight_borrow_max_pct": 200.0,  # shorts whose borrow rate is above this are flat by 15:55 (0 = off)
 }
 
 SCHEMA = """
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     error TEXT,
     grade TEXT,                             -- A+ / A / B / C, or NULL = custom risk %
     renamed_from TEXT,                      -- previous ticker after a symbol change
-    eod_close INTEGER NOT NULL DEFAULT 0    -- 1 = day trades only: flat by the 15:55 close
+    eod_close INTEGER NOT NULL DEFAULT 0,   -- 1 = day trades only: flat by the 15:55 close
+    borrow_pct REAL                         -- this symbol's annual borrow fee %; NULL = book default
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
@@ -134,6 +136,14 @@ class Store:
             self.db.execute("ALTER TABLE symbols ADD COLUMN renamed_from TEXT")
         if "eod_close" not in scols:  # databases created before close-by-end-of-day
             self.db.execute("ALTER TABLE symbols ADD COLUMN eod_close INTEGER NOT NULL DEFAULT 0")
+        if "borrow_pct" not in scols:  # databases created before per-symbol borrow
+            self.db.execute("ALTER TABLE symbols ADD COLUMN borrow_pct REAL")
+        # One-time: the old flat 10%/yr default understated small-cap borrow (150-630%/yr
+        # observed at IBKR, Oct 2026). A book still on that untouched default moves to 250%.
+        if not self.db.execute("SELECT 1 FROM settings WHERE key='_borrow_default_v2'").fetchone():
+            self.db.execute("UPDATE settings SET value='250.0' WHERE key='borrow_rate_pct' "
+                            "AND CAST(value AS REAL)=10.0")
+            self.db.execute("INSERT INTO settings VALUES ('_borrow_default_v2', '1')")
         self.db.commit()
 
     # -- generic helpers -------------------------------------------------

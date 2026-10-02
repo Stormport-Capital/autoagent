@@ -541,6 +541,9 @@ def make_handler(books: dict, provider_name: str, demo, backups=None):
                                              body.get("ratio", 1))
                     threading.Thread(target=sched.run_tick, daemon=True).start()
                     return self._send(200, r)
+                elif m := re.fullmatch(r"/symbols/(\d+)/borrow", rest):
+                    engine.set_borrow(int(m.group(1)), body.get("pct"), now)
+                    return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/eod", rest):
                     engine.set_eod_close(int(m.group(1)), bool(body.get("on")), now)
                     threading.Thread(target=sched.run_tick, daemon=True).start()

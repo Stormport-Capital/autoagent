@@ -31,7 +31,9 @@ past crosses it falls back to stop_atr_mult x ATR. It is not an exit.
 Sizing: qty = (equity x risk_pct / 3) / stop distance, capped so gross exposure
 stays <= equity x max_leverage. Fills are simulated at the hourly close (entries,
 signal exits) or at the stop / gapped open (stops), with slippage_bps adverse.
-Short tranches pay borrow_rate_pct / borrow_day_count per calendar night held.
+Short tranches pay the symbol's borrow rate (its own, else the book's borrow_rate_pct)
+/ borrow_day_count per calendar night held; same-day shorts pay none. A short whose
+rate is above overnight_borrow_max_pct is flat by 15:55 like a close-by-end-of-day name.
 Only hourly bars that complete after the symbol was added are ever traded.
 """
 
@@ -74,7 +76,8 @@ SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
 SETTING_BOUNDS = {
     "starting_capital": (1_000.0, 1e9),
-    "borrow_rate_pct": (0.0, 200.0),
+    "borrow_rate_pct": (0.0, 2000.0),
+    "overnight_borrow_max_pct": (0.0, 2000.0),
     "borrow_day_count": (360, 365),
     "stop_atr_mult": (0.25, 10.0),   # EMA sizing unit (x ATR); not a stop
     "atr_period": (2, 50),
@@ -221,6 +224,44 @@ class Engine:
                      (grade, GRADES[grade], symbol_id))
         self.store.log(now, "grade", f"{sym['symbol']} grade {grade} -> risk "
                        f"{GRADES[grade]:g}% (new entries)", sym["symbol"])
+
+    def set_borrow(self, symbol_id: int, pct, now: datetime) -> None:
+        """This symbol's annual borrow fee (%), or None for the book default.
+        Applies to borrow charged from the next night on."""
+        sym = self._symbol(symbol_id)
+        if pct in (None, ""):
+            val = None
+        else:
+            try:
+                val = float(pct)
+            except (TypeError, ValueError):
+                raise ValidationError("borrow rate must be a number (% per year)")
+            if not 0 <= val <= 2000:
+                raise ValidationError("borrow rate must be between 0 and 2000 % per year")
+        self.store.x("UPDATE symbols SET borrow_pct=? WHERE id=?", (val, symbol_id))
+        s = self.store.settings()
+        txt = f"{val:g}%/yr" if val is not None else f"book default ({s['borrow_rate_pct']:g}%/yr)"
+        lim = s["overnight_borrow_max_pct"]
+        note = (f"; above the {lim:g}% overnight limit, so its shorts are flat by "
+                f"{EOD_CUTOFF:%H:%M}" if lim and val is not None and val > lim else "")
+        self.store.log(now, "borrow", f"{sym['symbol']} borrow rate {txt}{note}", sym["symbol"])
+
+    def borrow_pct(self, sym: dict, s: dict) -> float:
+        v = sym.get("borrow_pct")
+        return float(v) if v is not None else float(s["borrow_rate_pct"])
+
+    def day_only(self, sym: dict, side: str, s: dict) -> str | None:
+        """Why a position on this side must be flat by 15:55 (None = may hold overnight)."""
+        if sym.get("eod_close"):
+            return "close by end of day"
+        # Only a rate entered for this symbol can force it flat: the book default is
+        # a cost estimate, not an observed fee, so it never changes how a trade is held.
+        lim = float(s.get("overnight_borrow_max_pct") or 0)
+        if side == "short" and lim and sym.get("borrow_pct") is not None \
+                and float(sym["borrow_pct"]) > lim:
+            return (f"borrow {self.borrow_pct(sym, s):g}%/yr is above the {lim:g}% overnight "
+                    f"limit")
+        return None
 
     def set_eod_close(self, symbol_id: int, on: bool, now: datetime) -> None:
         """Day-trade mode: the symbol still trades all session, but takes no new
@@ -392,15 +433,13 @@ class Engine:
                     break  # before the next open: wait for the 9:30 check
             else:
                 fill = Fill(b.close, b.end, b.session, f"at the bar close {b.close:.4g}")
-            if sym.get("eod_close"):
-                self._eod_sweep(sym, five, s, before=b.end)  # an outage spanned a 15:55
+            self._eod_sweep(sym, five, s, before=b.end)  # an outage spanned a 15:55
             if fill.when > added:
                 self._process_bar(sym, bars, five, i, ind, s, fill)
             last = b.end
             self.store.x("UPDATE symbols SET last_bar_end=?, last_price=? WHERE id=?",
                          (last.isoformat(), fill.price, sym["id"]))
-        if sym.get("eod_close"):
-            self._eod_sweep(sym, five, s, now=now)
+        self._eod_sweep(sym, five, s, now=now)
         # live readings for the dashboard (latest 5-minute print, today's VWAP)
         latest = five[-1] if five else bars[-1]
         vwap_now = session_vwap(five, latest.session, latest.end)
@@ -423,6 +462,9 @@ class Engine:
         usual grace period, then the latest print up to 15:55 is used)."""
         delay = timedelta(minutes=s["bar_close_delay_min"])
         for t in self._open(sym["id"]):
+            why = self.day_only(sym, t["side"], s)
+            if not why:
+                continue
             opened = _dt(t["entry_time"])
             day = opened.astimezone(ET).date()
             cut = eod_cutoff(day)
@@ -439,7 +481,7 @@ class Engine:
             if x is None:
                 continue
             self._close(t, x.close, max(x.end, opened),
-                        f"close by end of day: flat at the {x.end.astimezone(ET):%b %d %H:%M} "
+                        f"{why}: flat at the {x.end.astimezone(ET):%b %d %H:%M} "
                         f"5-min close {x.close:.4g}", s)
 
     def _next_open(self, symbol: str, b: Bar, five: list[Bar], now: datetime) -> Fill | None:
@@ -665,8 +707,9 @@ class Engine:
         if sym["status"] != "active":
             self.store.log(f.when, "skip", f"{why}: symbol paused, no entry", name, sleeve)
             return
-        if sym.get("eod_close") and f.when >= eod_cutoff(f.session):
-            self.store.log(f.when, "skip", f"{why}: close by end of day - no new entries "
+        late = self.day_only(sym, side, s)
+        if late and f.when >= eod_cutoff(f.session):
+            self.store.log(f.when, "skip", f"{why}: {late} - no new entries "
                            f"from {EOD_CUTOFF:%H:%M}", name, sleeve)
             return
         slip = s["slippage_bps"] / 1e4
@@ -733,7 +776,8 @@ class Engine:
             return
         fee = 0.0
         if t["side"] == "short":
-            fee = nights * t["qty"] * mark * s["borrow_rate_pct"] / 100 / s["borrow_day_count"]
+            rate = self.borrow_pct(self._symbol(t["symbol_id"]), s)
+            fee = nights * t["qty"] * mark * rate / 100 / s["borrow_day_count"]
         self.store.x("UPDATE tranches SET borrow_fees=borrow_fees+?, fee_through=? WHERE id=?",
                      (fee, day.isoformat(), t["id"]))
         t["borrow_fees"] += fee
