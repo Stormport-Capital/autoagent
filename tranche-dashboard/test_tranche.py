@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from datetime import date, datetime, time, timedelta
 
-from broker import AlpacaPaper, BrokerError, BrokerSync
+from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync
 import app
 import review
 from app import bar_for_boundary, boundaries
@@ -1573,6 +1573,586 @@ class DotenvTest(unittest.TestCase):
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
+
+
+# --------------------------------------------------------------------- IBKR
+import ibkr
+from types import SimpleNamespace as NS
+
+
+class FakeApi:
+    """Stand-in for the ib_async module (contracts and order objects)."""
+    @staticmethod
+    def Stock(symbol, exchange, currency):
+        return NS(symbol=symbol, exchange=exchange, currency=currency, secType="STK")
+
+    @staticmethod
+    def LimitOrder(action, qty, price):
+        return NS(action=action, totalQuantity=qty, lmtPrice=price, orderType="LMT", orderId=0, orderRef="", account="")
+
+    @staticmethod
+    def MarketOrder(action, qty):
+        return NS(action=action, totalQuantity=qty, orderType="MKT", orderId=0, orderRef="", account="")
+
+
+class FakeIB:
+    """Just enough of ib_async.IB: orders fill at once unless `hold`, symbols in
+    `reject` are refused like IBKR's error 201."""
+
+    def __init__(self, accounts=("DU123",), pos=None, netliq=27000.0, hold=False, reject=(),
+                 shortable=3.0, shortable_shares=50000.0, bid=4.0, ask=4.02):
+        self.accounts, self.pos, self.netliq = list(accounts), dict(pos or {}), netliq
+        self.hold, self.reject = hold, set(reject)
+        self.connected, self.connects, self.placed, self._trades = False, 0, [], []
+        self.q = dict(shortable=shortable, shortableShares=shortable_shares, bid=bid, ask=ask)
+        self.daily = float("nan")
+        self.mdtype = None
+
+    def isConnected(self):
+        return self.connected
+
+    async def connectAsync(self, host, port, clientId, timeout, account):
+        self.connects += 1
+        self.connected = True
+
+    def managedAccounts(self):
+        return self.accounts
+
+    def disconnect(self):
+        self.connected = False
+
+    def reqMarketDataType(self, n):
+        self.mdtype = n
+
+    async def qualifyContractsAsync(self, c):
+        return [None] if c.symbol == "NOPE" else [c]
+
+    def accountValues(self, account):
+        return [NS(tag="NetLiquidation", value=str(self.netliq), currency="USD"),
+                NS(tag="TotalCashValue", value="27000", currency="USD"),
+                NS(tag="BuyingPower", value="54000", currency="USD")]
+
+    def positions(self, account):
+        return [NS(contract=FakeApi.Stock(s, "SMART", "USD"), position=q, avgCost=4.0)
+                for s, q in self.pos.items()]
+
+    def portfolio(self, account):
+        return [NS(contract=FakeApi.Stock(s, "SMART", "USD"), unrealizedPNL=-1.5)
+                for s in self.pos]
+
+    def reqMktData(self, c, ticks, snapshot, regulatory):
+        nan = float("nan")
+        return NS(bid=self.q["bid"], ask=self.q["ask"], last=nan, close=nan,
+                  shortable=self.q["shortable"], shortableShares=self.q["shortableShares"])
+
+    def cancelMktData(self, c):
+        return True
+
+    def placeOrder(self, c, order):
+        order.orderId = len(self._trades) + 1
+        self.placed.append((c.symbol, order))
+        t = NS(contract=c, order=order, fills=[], log=[],
+               orderStatus=NS(status="Submitted", filled=0, avgFillPrice=0.0))
+        self._trades.append(t)
+        if c.symbol in self.reject:
+            t.orderStatus.status = "Cancelled"
+            t.log.append(NS(message="Order rejected - reason:The contract is not available "
+                                    "for short sale.", errorCode=201))
+        elif not self.hold:
+            self.fill(t)
+        return t
+
+    def fill(self, t):
+        q = t.order.totalQuantity
+        t.orderStatus.status, t.orderStatus.filled, t.orderStatus.avgFillPrice = "Filled", q, 4.01
+        t.fills.append(NS(time=datetime(2026, 10, 6, 15, 0)))
+        sym = t.contract.symbol
+        self.pos[sym] = self.pos.get(sym, 0) + (q if t.order.action == "BUY" else -q)
+        if not self.pos[sym]:
+            del self.pos[sym]
+
+    def trades(self):
+        return list(self._trades)
+
+    def openTrades(self):
+        return [t for t in self._trades if t.orderStatus.status not in ibkr.DONE]
+
+    def cancelOrder(self, order):
+        for t in self._trades:
+            if t.order is order:
+                t.orderStatus.status = "Cancelled"
+
+    def reqPnL(self, account):
+        return None
+
+    def pnl(self, account):
+        return [NS(dailyPnL=self.daily)]
+
+
+def ib_cfg(**kw):
+    env = {"IBKR_ACCOUNT": "DU123", "IBKR_MODE": "paper"}
+    env.update(kw)
+    return ibkr.config_from_env(env)
+
+
+class IBKRConfigTests(unittest.TestCase):
+    def test_unset_means_not_linked(self):
+        self.assertIsNone(ibkr.config_from_env({}))
+
+    def test_defaults(self):
+        c = ib_cfg()
+        self.assertEqual((c.mode, c.port, c.max_shares, c.daily_loss_limit),
+                         ("paper", 4002, 1, 100.0))
+        live = ib_cfg(IBKR_ACCOUNT="U7654321", IBKR_MODE="live")
+        self.assertEqual(live.port, 4001)
+
+    def test_account_id_must_match_mode(self):
+        with self.assertRaisesRegex(BrokerError, "not a live account"):
+            ib_cfg(IBKR_MODE="live")  # DU = paper
+        with self.assertRaisesRegex(BrokerError, "not a paper account"):
+            ib_cfg(IBKR_ACCOUNT="U7654321")
+        with self.assertRaises(BrokerError):
+            ib_cfg(IBKR_MODE="real")
+
+    def test_book_and_numbers_validated(self):
+        with self.assertRaises(BrokerError):
+            ib_cfg(IBKR_MAX_SHARES="0")
+        with self.assertRaises(BrokerError):
+            ib_cfg(IBKR_MAX_SHARES="one")
+        with self.assertRaisesRegex(BrokerError, "above 0"):
+            ib_cfg(IBKR_ACCOUNT="U7654321", IBKR_MODE="live", IBKR_DAILY_LOSS_LIMIT="0")
+
+    def test_limit_price_rounds_through_the_market(self):
+        self.assertEqual(ibkr.limit_price("buy", 4.02, 3), 4.15)   # 4.1406 up
+        self.assertEqual(ibkr.limit_price("sell", 4.00, 3), 3.88)
+        self.assertEqual(ibkr.limit_price("buy", 0.5123, 3), 0.5277)  # 4 decimals below $1
+
+
+class IBKRBrokerTests(unittest.TestCase):
+    def mk(self, **kw):
+        cfg_kw = {k: v for k, v in kw.items() if k.startswith("IBKR_")}
+        ib_kw = {k: v for k, v in kw.items() if not k.startswith("IBKR_")}
+        self.ib = FakeIB(**ib_kw)
+        return ibkr.IBKRBroker(ib_cfg(**cfg_kw), ib=self.ib, api=FakeApi)
+
+    def test_connects_lazily_to_the_named_account_only(self):
+        b = self.mk(accounts=["DU999"])
+        self.assertEqual(self.ib.connects, 0)
+        with self.assertRaisesRegex(BrokerError, "not DU123"):
+            b.account()
+        self.assertFalse(self.ib.connected)
+        b2 = self.mk()
+        self.assertEqual(b2.account()["equity"], 27000.0)
+        self.assertEqual(self.ib.mdtype, 1)
+
+    def test_positions_and_orders_in_alpaca_shape(self):
+        b = self.mk(pos={"BRK B": 1, "AAA": -1})
+        self.assertEqual(b.positions(), {
+            "BRK.B": {"qty": "1", "avg_entry_price": "4.0", "unrealized_pl": "-1.5"},
+            "AAA": {"qty": "-1", "avg_entry_price": "4.0", "unrealized_pl": "-1.5"}})
+        o = b.submit("CCC", 1, "buy", "td-x")
+        self.assertEqual((o["status"], o["filled_qty"], o["client_order_id"]), ("filled", "1.0", "td-x"))
+        sym, order = self.ib.placed[0]
+        self.assertEqual((sym, order.orderType, order.lmtPrice, order.tif, order.account,
+                          order.outsideRth), ("CCC", "LMT", 4.15, "DAY", "DU123", False))
+        self.assertEqual(b.get_order(o["id"])["status"], "filled")
+        self.assertEqual(b.get_order("999")["status"], "expired")
+
+    def test_share_cap_blocks_growth_but_never_a_close(self):
+        b = self.mk(pos={"AAA": -1, "BIG": 300})
+        with self.assertRaisesRegex(BrokerError, "cap is 1"):
+            b.submit("AAA", 1, "sell", "c1")
+        with self.assertRaisesRegex(BrokerError, "cap is 1"):
+            b.submit("AAA", 3, "buy", "c2")  # -1 -> +2
+        b.submit("AAA", 2, "buy", "c3")      # -1 -> +1 is within the cap
+        self.assertEqual(self.ib.pos["AAA"], 1)
+
+    def test_closing_a_large_position_is_allowed(self):
+        b = self.mk(pos={"BIG": 3}, IBKR_MAX_ORDER_USD="100000")
+        b.submit("BIG", 3, "sell", "c")
+        self.assertNotIn("BIG", self.ib.pos)
+
+    def test_order_value_cap_and_missing_price(self):
+        b = self.mk(bid=900.0, ask=1200.0)
+        with self.assertRaisesRegex(BrokerError, "IBKR_MAX_ORDER_USD"):
+            b.submit("PRICY", 1, "buy", "c")
+        b = self.mk(bid=-1, ask=-1)
+        with self.assertRaisesRegex(BrokerError, "no price"):
+            b.submit("DARK", 1, "buy", "c")
+        b.submit("DARK", 1, "buy", "c", ref_price=3.0)  # the model's price is the fallback
+        self.assertEqual(self.ib.placed[-1][1].lmtPrice, 3.09)
+
+    def test_market_orders_when_configured(self):
+        b = self.mk(IBKR_ORDER_TYPE="market")
+        b.submit("AAA", 1, "sell", "c")
+        self.assertEqual(self.ib.placed[0][1].orderType, "MKT")
+        self.assertEqual(b.reprice_s, 0)
+
+    def test_rejection_raises_with_ibkr_message(self):
+        b = self.mk(reject={"HTB"})
+        with self.assertRaisesRegex(BrokerError, "not available for short sale"):
+            b.submit("HTB", 1, "sell", "c")
+
+    def test_unknown_symbol(self):
+        with self.assertRaisesRegex(BrokerError, "not found"):
+            self.mk().submit("NOPE", 1, "buy", "c")
+
+    def test_short_check(self):
+        self.assertIsNone(self.mk().short_check("AAA", 1))
+        self.assertIn("no shares", self.mk(shortable=1.0).short_check("AAA", 1))
+        self.assertIn("has 0 shares", self.mk(shortable=2.0, shortable_shares=0.0).short_check("AAA", 1))
+        b = self.mk(shortable=float("nan"), shortable_shares=float("nan"))
+        b.cfg.quote_wait_s = 0
+        self.assertIsNone(b.short_check("AAA", 1))  # no data: IBKR's own locate check decides
+
+    def test_cancel_and_day_pnl(self):
+        b = self.mk(hold=True)
+        o = b.submit("AAA", 1, "buy", "c")
+        self.assertEqual(o["status"], "accepted")
+        self.assertEqual(len(b.open_orders()), 1)
+        b.cancel(o["id"])
+        self.assertEqual(b.open_orders(), [])
+        self.assertIsNone(b.day_pnl())
+        self.ib.daily = -42.0
+        self.assertEqual(b.day_pnl(), -42.0)
+
+
+class LiveGuardTests(unittest.TestCase):
+    """BrokerSync with the IBKR broker: share cap, loss limit, kill switch."""
+    NOW = BrokerSyncTests.NOW
+    setUp, tearDown = BrokerSyncTests.setUp, BrokerSyncTests.tearDown
+    add, tranche = BrokerSyncTests.add, BrokerSyncTests.tranche
+
+    def ibsync(self, **kw):
+        self.ib = FakeIB(**kw)
+        self.b = ibkr.IBKRBroker(ib_cfg(), ib=self.ib, api=FakeApi)
+        return BrokerSync(self.store, self.b, fill_wait_s=0, max_shares=self.b.max_shares,
+                          daily_loss_limit=self.b.daily_loss_limit)
+
+    def test_mirrors_direction_capped_at_one_share(self):
+        self.add("AAA"); self.add("BBB")
+        self.tranche("AAA", "EMA5_10", "short", 150)
+        self.tranche("AAA", "VWAP", "short", 50)
+        self.tranche("BBB", "EMA10_20", "long", 80)
+        sync = self.ibsync()
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": 1})
+        sync.sync(self.NOW)
+        self.assertEqual(len(self.ib.placed), 2)
+        st = sync.status()
+        self.assertTrue(all(r["match"] for r in st["reconciliation"]))
+        self.assertEqual((st["venue"], st["live"], st["control"]["max_shares"]), ("IBKR paper", False, 1))
+
+    def test_reversal_at_one_share(self):
+        self.add("REV")
+        self.tranche("REV", "EMA5_10", "short", 80)
+        sync = self.ibsync(pos={"REV": 1})
+        sync.sync(self.NOW)
+        self.assertEqual([(s, o.action, o.totalQuantity) for s, o in self.ib.placed],
+                         [("REV", "SELL", 1), ("REV", "SELL", 1)])
+        self.assertEqual(self.ib.pos["REV"], -1)
+
+    def test_no_borrow_skips_the_short_but_not_the_cover(self):
+        self.add("HTB")
+        self.tranche("HTB", "VWAP", "short", 10)
+        sync = self.ibsync(shortable=1.0)
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.placed, [])
+        self.assertIn("no shares to borrow", sync.status()["reconciliation"][0]["note"])
+        skips = self.store.q("SELECT message FROM events WHERE kind='broker-skip'")
+        self.assertEqual(len(skips), 1)
+        sync.sync(self.NOW)
+        self.assertEqual(len(self.store.q("SELECT 1 FROM events WHERE kind='broker-skip'")), 1)
+        self.store.x("UPDATE tranches SET status='closed'")
+        self.ib.pos["HTB"] = -1  # a short opened earlier still gets covered
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.placed[-1][1].action, "BUY")
+
+    def test_ibkr_rejection_holds_back_new_shorts_for_the_day(self):
+        self.add("HTB")
+        self.tranche("HTB", "VWAP", "short", 10)
+        sync = self.ibsync(reject={"HTB"})
+        sync.sync(self.NOW)
+        sync.sync(self.NOW + timedelta(minutes=15))
+        self.assertEqual(len(self.ib.placed), 1)  # not resent
+        self.assertIn("can't short it today", sync.blocked(self.NOW)["HTB"])
+
+    def test_daily_loss_limit_flattens_and_halts_for_the_day(self):
+        self.add("AAA"); self.add("BBB")
+        self.tranche("AAA", "EMA5_10", "short", 100)
+        self.tranche("BBB", "EMA5_10", "long", 100)
+        sync = self.ibsync(pos={"MANUAL": 5})
+        sync.sync(self.NOW)  # day start 27,000
+        self.assertEqual(sync.day_start(self.NOW), 27000.0)
+        self.ib.netliq = 26950.0
+        sync._watched = None
+        sync.watch(self.NOW)
+        self.assertIsNone(sync.stop_reason(self.NOW))
+        self.ib.netliq = 26899.0  # down $101
+        sync._watched = None
+        sync.watch(self.NOW + timedelta(minutes=1))
+        self.assertEqual(sync.stop_reason(self.NOW)[0], "flatten")
+        self.assertEqual(self.ib.pos, {"MANUAL": 5})  # only managed symbols are closed
+        n = len(self.ib.placed)
+        sync.sync(self.NOW + timedelta(hours=1))
+        self.assertEqual(len(self.ib.placed), n)  # nothing more today
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE kind='broker-halt'"))
+        nxt = self.NOW + timedelta(days=1)
+        self.assertIsNone(sync.stop_reason(nxt))
+        sync.sync(nxt)  # new day, new start equity, back to mirroring the model
+        self.assertEqual(sync.day_start(nxt), 26899.0)
+        self.assertEqual(self.ib.pos, {"MANUAL": 5, "AAA": -1, "BBB": 1})
+
+    def test_ibkr_daily_pnl_counts_when_worse(self):
+        self.add("AAA")
+        sync = self.ibsync()
+        sync.sync(self.NOW)
+        self.ib.daily = -100.0  # e.g. the app started after the loss happened
+        sync.sync(self.NOW)
+        self.assertIn("daily loss limit", sync.stop_reason(self.NOW)[1])
+
+    def test_kill_switch_pause_and_flatten_persist(self):
+        self.add("AAA")
+        self.tranche("AAA", "EMA5_10", "short", 100)
+        sync = self.ibsync()
+        sync.set_kill("pause", self.NOW)
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.placed, [])
+        sync.set_kill(None, self.NOW)
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        sync.set_kill("flatten", self.NOW)
+        again = BrokerSync(self.store, self.b, fill_wait_s=0, max_shares=1, daily_loss_limit=100)
+        again.sync(self.NOW)  # a restart keeps the switch
+        self.assertEqual(self.ib.pos, {})
+        again.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {})
+        self.assertEqual(again.status()["control"]["kill"], "flatten")
+        with self.assertRaises(BrokerError):
+            again.set_kill("explode", self.NOW)
+
+    def test_flatten_cancels_working_orders_first(self):
+        self.add("AAA")
+        self.tranche("AAA", "EMA5_10", "long", 100)
+        sync = self.ibsync(hold=True)
+        sync.sync(self.NOW)
+        self.assertEqual(len(self.ib.openTrades()), 1)
+        sync.set_kill("flatten", self.NOW)
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.openTrades(), [])
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE message LIKE 'cancelled working%'"))
+
+    def test_unfilled_limit_is_cancelled_and_repriced(self):
+        self.add("AAA")
+        self.tranche("AAA", "EMA5_10", "long", 100)
+        sync = self.ibsync(hold=True)
+        sync.sync(self.NOW)
+        sync.sync(self.NOW + timedelta(seconds=10))
+        self.assertEqual(len(self.ib.openTrades()), 1)  # still young: left working
+        sync.sync(self.NOW + timedelta(seconds=50))
+        self.assertEqual(self.ib.openTrades(), [])      # cancelled
+        self.assertTrue(sync.needs_followup)
+        self.ib.hold = False
+        sync.sync(self.NOW + timedelta(seconds=120))    # the follow-up re-sends at a fresh quote
+        self.assertEqual(self.ib.pos, {"AAA": 1})
+        self.assertEqual(len(self.ib.placed), 2)
+
+    def test_never_cancels_orders_it_did_not_send(self):
+        self.add("AAA")
+        self.tranche("AAA", "EMA5_10", "long", 100)
+        sync = self.ibsync(hold=True)
+        order = FakeApi.LimitOrder("BUY", 1, 1.0)
+        order.account = "DU123"
+        manual = self.ib.placeOrder(FakeApi.Stock("AAA", "SMART", "USD"), order)
+        sync.set_kill("flatten", self.NOW)
+        sync.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(manual.orderStatus.status, "Submitted")
+
+    def test_alpaca_path_is_uncapped(self):
+        self.add("AAA")
+        self.tranche("AAA", "EMA5_10", "short", 100)
+        fb = FakeBroker()
+        BrokerSync(self.store, fb, fill_wait_s=0).sync(self.NOW)
+        self.assertEqual(fb.sent, [("AAA", "sell", 100)])
+
+    def test_link_live_from_env(self):
+        keys = ("IBKR_ACCOUNT", "IBKR_MODE")
+        old = {k: os.environ.get(k) for k in keys}
+        orig = ibkr.IBKRBroker.__init__
+        try:
+            ibkr.IBKRBroker.__init__ = lambda self, cfg, **kw: orig(self, cfg, ib=FakeIB(), api=FakeApi)
+            for k in keys:
+                os.environ.pop(k, None)
+            self.assertIsNone(app.link_live(False)[0])
+            os.environ.update({"IBKR_ACCOUNT": "DU123", "IBKR_MODE": "paper"})
+            self.assertIsInstance(app.link_live(False)[0], ibkr.IBKRBroker)
+            self.assertIsNone(app.link_live(True)[0])
+            os.environ["IBKR_MODE"] = "live"  # DU account with live mode: refused, not linked
+            ib, note = app.link_live(False)
+            self.assertIsNone(ib)
+            self.assertIn("not a live account", note)
+        finally:
+            ibkr.IBKRBroker.__init__ = orig
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+
+
+class LiveSelectionTests(unittest.TestCase):
+    """The shared IBKR link: per symbol, per tranche, from any one book."""
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
+        self.engines = {k: Engine(self.stores[k], ScriptedProvider([])) for k in ("1h", "15m", "5m")}
+        self.ib = FakeIB()
+        self.b = ibkr.IBKRBroker(ib_cfg(), ib=self.ib, api=FakeApi)
+        labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
+        self.live = LiveSync(self.stores["live"], self.b,
+                             {k: (labels[k], self.stores[k]) for k in labels},
+                             fill_wait_s=0, max_shares=1, daily_loss_limit=100)
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    def add(self, book, sym):
+        self.engines[book].add_symbols(sym, "long_short", 1.0, self.NOW)
+        return self.stores[book].q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+
+    def tranche(self, book, sym, sleeve, side, qty):
+        st = self.stores[book]
+        sid = st.q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+        st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                entry_price, stop_price, risk_dollars, fee_through)
+                VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21')""",
+             (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
+
+    def test_only_the_chosen_tranches_count(self):
+        sid = self.add("15m", "AAA")
+        self.tranche("15m", "AAA", "EMA5_10", "long", 100)
+        self.tranche("15m", "AAA", "VWAP", "short", 50)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.placed, [])  # nothing is live yet
+        self.engines["15m"].set_live(sid, ["VWAP"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.engines["15m"].set_live(sid, ["EMA5_10"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": 1})
+        self.engines["15m"].set_live(sid, ["EMA5_10", "VWAP"], self.NOW)  # net +50
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": 1})
+        self.engines["15m"].set_live(sid, [], self.NOW)  # switched off: closed, not abandoned
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {})
+
+    def test_symbols_from_different_books(self):
+        a = self.add("1h", "AAA")
+        b = self.add("5m", "BBB")
+        self.add("15m", "CCC")
+        self.tranche("1h", "AAA", "EMA10_20", "short", 30)
+        self.tranche("5m", "BBB", "VWAP", "short", 20)
+        self.tranche("15m", "CCC", "EMA5_10", "long", 99)  # not live: never sent
+        self.engines["1h"].set_live(a, ["EMA10_20"], self.NOW)
+        self.engines["5m"].set_live(b, ["VWAP", "EMA5_10"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": -1})
+        rows = {r["symbol"]: r for r in self.live.status()["reconciliation"]}
+        self.assertEqual((rows["AAA"]["book"], rows["AAA"]["sleeves"]), ("Hourly", ["EMA10_20"]))
+        self.assertEqual(rows["BBB"]["sleeves"], ["EMA5_10", "VWAP"])
+        self.assertNotIn("CCC", rows)
+
+    def test_live_selection_is_exclusive_per_ticker(self):
+        a = self.add("1h", "AAA")
+        self.add("15m", "AAA")
+        self.assertIsNone(self.live.live_in("AAA"))
+        self.engines["1h"].set_live(a, ["VWAP"], self.NOW)
+        self.assertEqual(self.live.live_in("AAA", except_book="15m"), "Hourly")
+        self.assertIsNone(self.live.live_in("AAA", except_book="1h"))
+
+    def test_removed_symbol_is_closed(self):
+        a = self.add("15m", "AAA")
+        self.tranche("15m", "AAA", "VWAP", "short", 10)
+        self.engines["15m"].set_live(a, ["VWAP"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.stores["15m"].x("UPDATE symbols SET last_price=10 WHERE id=?", (a,))
+        self.engines["15m"].set_status(a, "removed", self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {})
+
+    def test_set_live_validation(self):
+        a = self.add("15m", "AAA")
+        with self.assertRaises(ValidationError):
+            self.engines["15m"].set_live(a, ["MACD"], self.NOW)
+        self.assertEqual(self.engines["15m"].set_live(a, ["VWAP", "EMA5_10"], self.NOW),
+                         ["EMA5_10", "VWAP"])
+
+    def test_http_live_routes(self):
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        self.add("1h", "AAA")
+        b = self.add("15m", "AAA")
+        a1 = self.stores["1h"].q("SELECT id FROM symbols")[0]["id"]
+
+        class Clock:
+            demo = False
+
+            def now(s):
+                return self.NOW
+
+        class B:
+            def __init__(s, key, label, eng):
+                s.key, s.label, s.engine, s.minutes = key, label, eng, eng.minutes
+                s.sched = app.Scheduler(eng, Clock(), None, self.live)
+                s.link_note = "no paper keys"
+        books = {k: B(k, l, self.engines[k]) for k, l in (("1h", "Hourly"), ("15m", "15-min"), ("5m", "5-min"))}
+        old = os.environ.pop("TRANCHE_PASSWORD", None)
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(books, "demo", None, None, self.live))
+        finally:
+            if old is not None:
+                os.environ["TRANCHE_PASSWORD"] = old
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def call(path, body):
+            req = urllib.request.Request(base + path, method="POST", data=_json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, _json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, _json.loads(e.read())
+        try:
+            self.assertEqual(call(f"/api/1h/symbols/{a1}/live", {"sleeves": ["VWAP"]})[0], 200)
+            code, err = call(f"/api/15m/symbols/{b}/live", {"sleeves": ["EMA5_10"]})
+            self.assertEqual(code, 400)
+            self.assertIn("already live from the Hourly book", err["error"])
+            self.assertEqual(call(f"/api/15m/symbols/{b}/live", {"sleeves": []})[0], 200)  # off is fine
+            self.assertEqual(call("/api/live/settings", {"enabled": True})[0], 200)
+            self.assertTrue(self.live.enabled())
+            self.assertEqual(call("/api/live/kill", {"mode": "pause"})[0], 200)
+            self.assertEqual(self.live.stop_reason(self.NOW)[0], "pause")
+            self.assertEqual(call("/api/live/kill", {"mode": "nuke"})[0], 400)
+            self.assertEqual(call("/api/live/kill", {"mode": "off"})[0], 200)
+            with urllib.request.urlopen(base + "/api/1h/state") as r:
+                st = _json.loads(r.read())
+            self.assertTrue(st["live"]["configured"])
+            self.assertEqual(st["live"]["venue"], "IBKR paper")
+            with urllib.request.urlopen(base + "/api/15m/state") as r:
+                st = _json.loads(r.read())
+            self.assertEqual(st["symbols"][0]["live_elsewhere"], "Hourly")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

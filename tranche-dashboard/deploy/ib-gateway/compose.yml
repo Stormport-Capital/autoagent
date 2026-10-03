@@ -1,0 +1,23 @@
+# IB Gateway (headless, kept logged in by IBC) for the tranche dashboard's IBKR link.
+# Image: https://github.com/gnzsnz/ib-gateway-docker . See IBKR.md for the steps.
+# Credentials live in /opt/ibgateway/.env (chmod 600), never in this repo.
+name: ibgateway
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}      # paper | live
+      READ_ONLY_API: "no"                       # the dashboard places orders
+      TWOFA_TIMEOUT_ACTION: restart             # missed phone 2FA: try again
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:45 PM}  # daily restart, outside market hours
+      TIME_ZONE: America/New_York
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}  # optional, for looking at the gateway screen
+      JAVA_HEAP_SIZE: ${JAVA_HEAP_SIZE:-1024}
+    ports:                                      # localhost only: never on the public internet
+      - "127.0.0.1:4001:4003"                   # live API
+      - "127.0.0.1:4002:4004"                   # paper API
+      - "127.0.0.1:5900:5900"                   # VNC (only if a password is set)
