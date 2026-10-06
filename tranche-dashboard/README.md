@@ -18,9 +18,11 @@ position with market orders. Alpaca is paper only: the paper endpoint is hard-co
 **5-min book** (`IBKR_BOOK`) only. On that tab, a row's **Live** button sends
 that symbol's **5/10 EMA tranche, short only**:
 - 1 share; a long signal means flat;
-- covered on a 5-minute close above the day's high (market order), or on the
-  opposite cross;
-- flat by the 3:55 PM close.
+- enters at the 9:45 close if the 5 EMA is below the 10 (stop fixed at the
+  9:30-9:45 high), or on a later down-cross (stop fixed at the day's high at
+  entry); nothing before 9:45, at most 2 entries a day;
+- covered on a 5-minute close above that stop (market order), on the up-cross,
+  or at the 3:55 PM close.
 
 VWAP-fail and 10/20 can't trade live. Guards for real money:
 

@@ -337,7 +337,7 @@ function renderSettings(s) {
 
 function trancheCell(t, sleeve, mode) {
   if (!t) return `<span class="pill">flat</span>`;
-  return `<span class="pill ${t.side}" title="entry ${num(t.entry_price)} · ${t.sleeve === "VWAP" ? "stop " + num(t.stop_price) : "exits on the opposite cross"}${t.target_price == null ? "" : " · target " + num(t.target_price)} · ${t.qty} sh">${t.side === "short" ? "S" : "L"} ${t.qty}</span>` +
+  return `<span class="pill ${t.side}" title="entry ${num(t.entry_price)} · ${t.sleeve === "VWAP" || t.stop_dist != null ? "stop " + num(t.stop_price) : "exits on the opposite cross"}${t.target_price == null ? "" : " · target " + num(t.target_price)} · ${t.qty} sh">${t.side === "short" ? "S" : "L"} ${t.qty}</span>` +
          `<span class="${cls(t.unrealized)}">${signed(t.unrealized)}</span>`;
 }
 
@@ -354,7 +354,7 @@ function renderWatch(S) {
     const stack = n.ema5 == null ? "warming up" :
       `<span title="${n.ema5 < n.ema10 ? "5 below 10" : "5 above 10"}; ${n.ema10 < n.ema20 ? "10 below 20" : "10 above 20"}">${num(n.ema5)} / ${num(n.ema10)} / ${num(n.ema20)}</span>`;
     const below = n.vwap != null && s.last_price != null && s.last_price < n.vwap;
-    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="IBKR follows this symbol's 5/10 EMA short: one share, short only, 5-min high-of-day stop, flat by 3:55 PM">${STATE.live.live ? "LIVE" : "IBKR"} 5/10 short · flat 3:55</span>` : ""}
+    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="IBKR follows this symbol's 5/10 EMA short: one share, short only; enters at the 9:45 close if the 5 EMA is below the 10 (stop: opening-range high) or on a later down-cross (stop: day's high at entry); at most 2 entries a day; flat by 3:55 PM">${STATE.live.live ? "LIVE" : "IBKR"} 5/10 short · flat 3:55</span>` : ""}
         ${s.error ? `<div class="err-text">${esc(s.error)}</div>` : ""}</td>
       <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} ·
         <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
@@ -597,7 +597,7 @@ function renderTab() {
     h = `<table><thead><tr>${sh("symbol", "Symbol", "l")}${sh("sleeve", "Tranche", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}<th>Entry</th><th>Stop</th><th>Target</th><th>Mark</th>
       ${sh("notional", "Notional")}${sh("risk_dollars", "Risk")}<th>Borrow so far</th>${sh("pnl", "Open P&amp;L (net)")}${sh("entry_time", "Opened", "l")}</tr></thead><tbody>`;
     for (const t of rows) h += `<tr><td class="sym">${esc(t.symbol)}</td><td class="l">${L[t.sleeve]}</td><td class="l"><span class="pill ${t.side}">${t.side}</span></td>
-      <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${t.sleeve === "VWAP" ? num(t.stop_price) : "on cross"}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
+      <td>${t.qty}</td><td>${num(t.entry_price)}</td><td>${t.sleeve === "VWAP" || t.stop_dist != null ? num(t.stop_price) : "on cross"}</td><td>${num(t.target_price)}</td><td>${num(t.mark)}</td><td>${usd(t.notional)}</td>
       <td>${usd(t.risk_dollars)}</td><td>${usd(t.borrow_fees, 2)}</td><td class="${cls(t.unrealized - t.borrow_fees)}">${signed(t.unrealized - t.borrow_fees)}</td><td class="l">${fmtT(t.entry_time)}</td></tr>`;
   } else if (TAB === "closed") {
     h = `<table><thead><tr>${sh("symbol", "Symbol", "l")}${sh("sleeve", "Tranche", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}<th>Entry</th><th>Exit</th>
@@ -731,7 +731,7 @@ setInterval(refresh, 5000);
 <dialog id="liveDlg">
   <form method="dialog">
     <h3 style="margin:0 0 6px">IBKR live: <span id="liveSym"></span></h3>
-    <div class="hint" style="margin:0 0 8px">IBKR follows this symbol's 5/10 EMA tranche: short only (a long signal means flat), <span id="liveCap"></span> share(s), covered on a 5-minute close above the day's high or the opposite cross, and flat by the 3:55 PM close. Turning Live on also makes the symbol flat by 3:55 in the model. The VWAP-fail and 10/20 tranches can't trade live.</div>
+    <div class="hint" style="margin:0 0 8px">IBKR follows this symbol's 5/10 EMA tranche, short only (a long signal means flat), <span id="liveCap"></span> share(s). Entry: the 9:45 bar close if the 5 EMA is below the 10 (stop: the 9:30-9:45 high), or a later down-cross (stop: the day's high at entry); none before 9:45, at most 2 a day. Exit: a 5-minute close above the stop (market order), the up-cross, or the 3:55 PM close. Turning Live on applies these rules to the model's 5/10 tranche for this symbol and makes the symbol flat by 3:55. VWAP-fail and 10/20 can't trade live.</div>
     <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross (short)</label>
     <div class="row" style="margin-top:12px"><button value="save" class="primary">Save</button> <button value="off">Live off</button> <button value="cancel">Cancel</button></div>
   </form>

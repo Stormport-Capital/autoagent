@@ -2207,9 +2207,11 @@ class LiveSelectionTests(unittest.TestCase):
 
 
 class LiveRuleEngineTests(unittest.TestCase):
-    """What a Live mark changes in the model: forced 15:55 flat, no entry from
-    the 15:55-16:00 bar, and the 5/10 short's 5-minute high-of-day stop."""
+    """What a Live mark changes in the model's 5/10 tranche: the 9:45 state
+    entry, cross entries only after 9:45, two entries a day, fixed stops, the
+    forced 15:55 flat and no entry from the 15:55-16:00 bar."""
     D = date(2026, 9, 22)
+    UNIT = ("abs", 0.5, "test unit")
 
     def setUp(self):
         fd, self.path = tempfile.mkstemp(suffix=".db")
@@ -2221,78 +2223,187 @@ class LiveRuleEngineTests(unittest.TestCase):
         self.store.db.close()
         os.remove(self.path)
 
-    def five(self, spec):
-        """spec: [(close, high)] for consecutive 5-min bars from 9:30 on day D."""
+    def five(self, spec, day=None):
+        """spec: [(close, high)] for consecutive 5-min bars from 9:30."""
         out, prev = [], spec[0][0]
         for k, (c, h) in enumerate(spec):
-            t = datetime.combine(self.D, time(9, 30), tzinfo=ET) + k * FIVE
+            t = datetime.combine(day or self.D, time(9, 30), tzinfo=ET) + k * FIVE
             out.append(Bar(t, t + FIVE, prev, max(h, prev, c), min(prev, c) - 0.05, c, 1000.0))
             prev = c
         return out
 
-    def run_day(self, live: bool, spec, entry_k=6):
+    def live_engine(self, bars=(), mode="short_only"):
+        eng = Engine(self.store, ScriptedProvider(list(bars)), 5)
+        eng.add_symbols("LIV", mode, 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
+        eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
+        return eng
+
+    def sym(self):
+        return self.store.q("SELECT * FROM symbols WHERE id=1")[0]
+
+    def step(self, eng, bars, i, e5, e10):
+        from engine import Fill
+        b = bars[i]
+        t = next(iter(self.store.q("SELECT * FROM tranches WHERE status='open'")), None)
+        eng._live_510(self.sym(), t, Fill(b.close, b.end, b.session, "at the bar close"), bars,
+                      bars, i, e5, e10, self.store.settings(), "ctx", lambda: self.UNIT)
+
+    # ---- entries
+    BARS = [(10.0, 10.3), (9.9, 10.1), (9.8, 10.0), (9.7, 9.9), (9.75, 9.9), (9.6, 9.8), (9.5, 9.7)]
+
+    def test_state_entry_on_the_0945_bar_with_the_opening_range_high_stop(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        below = ([9.0] * 7, [9.5] * 7)                # 5 under 10 all along: no cross anywhere
+        for i in range(3):                             # bars ending 9:35, 9:40, 9:45
+            self.step(eng, bars, i, *below)
+        t = self.store.q("SELECT * FROM tranches")
+        self.assertEqual(len(t), 1)
+        t = t[0]
+        self.assertEqual((t["side"], t["trigger"], _dt(t["entry_time"])), ("short", "state_0945", bars[2].end))
+        self.assertEqual(t["stop_price"], 10.3)        # high of the 9:30-9:45 bars
+        fill = 9.8 * (1 - 5 / 1e4)
+        self.assertAlmostEqual(t["entry_price"], fill)
+        self.assertAlmostEqual(t["stop_dist"], 10.3 - fill)
+        self.assertAlmostEqual(t["risk_dollars"], t["qty"] * 0.5)  # still sized by the EMA unit
+
+    def test_no_state_entry_when_the_5_is_above_or_equal_at_0945(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        self.step(eng, bars, 2, [9.6] * 7, [9.5] * 7)
+        self.step(eng, bars, 2, [9.5] * 7, [9.5] * 7)
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
+
+    def test_cross_before_0945_is_blocked_after_0945_enters_with_the_days_high(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e5, e10 = [9.6, 9.4, 9.6, 9.6, 9.6, 9.4, 9.4], [9.5] * 7   # down-crosses on 9:40 and 10:00
+        self.step(eng, bars, 1, e5, e10)
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE message LIKE '%before the 9:45 bar%'"))
+        self.step(eng, bars, 2, e5, e10)                # 9:45: 5 above 10, no state entry
+        self.step(eng, bars, 5, e5, e10)                # 10:00 down-cross
+        t = self.store.q("SELECT * FROM tranches")[0]
+        self.assertEqual((t["trigger"], _dt(t["entry_time"])), ("cross", bars[5].end))
+        self.assertEqual(t["stop_price"], 10.3)         # day's high at entry (9:35 bar)
+
+    def test_two_entries_a_day_at_most(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e5, e10 = [9.6, 9.6, 9.4, 9.6, 9.4, 9.6, 9.4], [9.5] * 7   # down at 9:45, 9:55, 10:05
+        self.step(eng, bars, 2, e5, e10)                             # state entry
+        self.store.x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.4, "
+                     "exit_reason='stop: test', gross_pnl=-1", (bars[3].end.isoformat(),))
+        self.step(eng, bars, 4, e5, e10)                             # second: a fresh cross
+        self.store.x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.4, "
+                     "exit_reason='stop: test', gross_pnl=-1 WHERE status='open'",
+                     (bars[5].end.isoformat(),))
+        self.step(eng, bars, 6, e5, e10)                             # third: refused
+        rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
+        self.assertEqual([r["trigger"] for r in rows], ["state_0945", "cross"])
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE message LIKE '%already 2 entries today%'"))
+
+    def test_up_cross_covers_and_never_opens_a_live_long(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e5, e10 = [9.4, 9.4, 9.4, 9.6, 9.6, 9.6, 9.6], [9.5] * 7
+        self.step(eng, bars, 2, e5, e10)
+        self.step(eng, bars, 3, e5, e10)                 # up-cross at 9:50
+        t = self.store.q("SELECT * FROM tranches")
+        self.assertEqual(len(t), 1)
+        self.assertTrue(t[0]["exit_reason"].startswith("5/10 EMA crossed up"))
+
+    def test_non_live_symbol_keeps_cross_entries_before_0945_and_no_stop(self):
+        bars = self.five(self.BARS)
+        eng = Engine(self.store, ScriptedProvider([]), 5)
+        eng.add_symbols("OFF", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
+        from engine import Fill
+        b = bars[1]
+        eng._ema_sleeve(self.sym(), "EMA5_10", None, Fill(b.close, b.end, b.session, "c"),
+                        self.UNIT, self.store.settings(), True, False, "ctx")
+        t = self.store.q("SELECT * FROM tranches")[0]
+        self.assertEqual((t["trigger"], t["stop_dist"]), (None, None))
+
+    def test_vwap_entries_record_their_stop_distance(self):
+        from engine import Fill
+        eng = Engine(self.store, ScriptedProvider([]), 5)
+        eng.add_symbols("VW", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
+        b = self.five(self.BARS)[4]
+        eng._enter(self.sym(), "VWAP", "short", Fill(10.0, b.end, b.session, "c"), None,
+                   self.store.settings(), "test", stop_level=11.0)
+        t = self.store.q("SELECT * FROM tranches")[0]
+        self.assertAlmostEqual(t["stop_dist"], 11.0 - 10.0 * (1 - 5 / 1e4))
+
+    def test_state_entry_end_to_end_through_tick(self):
+        prev = self.D - timedelta(days=1)
+        down = lambda p0, n: [(round(p0 - 0.01 * k, 4), round(p0 - 0.01 * k + 0.02, 4)) for k in range(n)]
+        bars = self.five(down(12.0, 78), prev) + self.five(down(11.2, 12))
+        eng = self.live_engine(bars)
+        eng.tick(datetime.combine(self.D, time(10, 30), tzinfo=ET))
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA5_10'")  # (VWAP trades too, model only)
+        self.assertEqual(len(t), 1)
+        at945 = datetime.combine(self.D, time(9, 45), tzinfo=ET)
+        self.assertEqual((t[0]["trigger"], _dt(t[0]["entry_time"])), ("state_0945", at945))
+        self.assertEqual(t[0]["stop_price"], max(b.high for b in bars if b.session == self.D and b.end <= at945))
+
+    # ---- the fixed stop
+    def run_stop_day(self, spec, stop, trigger="cross", entry_k=6):
         bars = self.five(spec)
-        eng = Engine(self.store, ScriptedProvider(bars), 5)
-        eng.add_symbols("STP", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
-        if live:
-            eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
+        eng = self.live_engine(bars)
         entry = bars[entry_k].end
         self.store.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
-                        entry_price, stop_price, risk_dollars, fee_through)
-                        VALUES (1,'STP','EMA5_10','short',100,?,10,10.5,50,?)""",
-                     (entry.isoformat(), self.D.isoformat()))
+                        entry_price, stop_price, risk_dollars, fee_through, trigger, stop_dist)
+                        VALUES (1,'LIV','EMA5_10','short',100,?,10,?,50,?,?,?)""",
+                     (entry.isoformat(), stop, self.D.isoformat(), trigger, stop - 10))
         self.store.x("UPDATE symbols SET last_bar_end=? WHERE id=1", (entry.isoformat(),))
         eng.tick(bars[-1].end)
-        return eng, bars, self.store.q("SELECT * FROM tranches")[0]
+        return bars, self.store.q("SELECT * FROM tranches ORDER BY id")[0]
 
-    def test_stop_on_a_5min_close_above_the_days_high(self):
-        # HOD 10.2 set at 9:40. The 10:25 bar wicks to 10.4 but closes 10.15: no stop,
-        # and the day's high is now 10.4. A 10:35 close of 10.3 is below it: no stop.
-        # The 10:40 close of 10.45 is above it: stop, at that close.
+    def test_fixed_stop_does_not_rise_with_a_new_high(self):
+        # stop 10.2. The 10:25 bar wicks to 10.4 but closes 10.15: no stop, and the stop
+        # stays 10.2. The 10:35 close at 10.3 is below the new high but above 10.2: stop.
         spec = [(10.0, 10.1), (10.1, 10.2), (10.0, 10.1)] + [(9.9, 10.0)] * 8 + \
-               [(10.15, 10.4), (10.1, 10.15), (10.3, 10.35), (10.45, 10.5), (10.0, 10.1)]
-        _eng, bars, t = self.run_day(True, spec)
+               [(10.15, 10.4), (10.1, 10.15), (10.3, 10.35), (10.0, 10.1)]
+        bars, t = self.run_stop_day(spec, 10.2)
         self.assertEqual(t["status"], "closed")
-        self.assertTrue(t["exit_reason"].startswith("stop: 5-min close 10.45 above the day's high 10.4"),
+        self.assertTrue(t["exit_reason"].startswith("stop: 5-min close 10.3 above the fixed stop 10.2"),
                         t["exit_reason"])
-        self.assertEqual(_dt(t["exit_time"]), bars[14].end)
-        self.assertAlmostEqual(t["exit_price"], 10.45 * (1 + 5 / 1e4))
+        self.assertEqual(_dt(t["exit_time"]), bars[13].end)
+        self.assertAlmostEqual(t["exit_price"], 10.3 * (1 + 5 / 1e4))
 
-    def test_close_equal_to_the_high_is_not_a_stop(self):
+    def test_close_equal_to_the_stop_is_not_a_stop(self):
         spec = [(10.0, 10.2)] + [(9.9, 10.0)] * 8 + [(10.2, 10.2), (10.0, 10.1)]
-        _eng, _bars, t = self.run_day(True, spec)
+        _bars, t = self.run_stop_day(spec, 10.2)
         self.assertEqual(t["status"], "open")
 
-    def test_no_stop_when_not_live(self):
+    def test_no_fixed_stop_without_a_live_trigger(self):
         spec = [(10.0, 10.1), (10.1, 10.2)] + [(9.9, 10.0)] * 8 + [(10.5, 10.6), (10.4, 10.5)]
-        _eng, _bars, t = self.run_day(False, spec)
+        _bars, t = self.run_stop_day(spec, 10.2, trigger=None)
         self.assertFalse((t["exit_reason"] or "").startswith("stop"))
 
+    # ---- end of day
     def test_live_symbol_is_flat_at_1555_without_its_eod_switch(self):
         eng = Engine(self.store, ScriptedProvider([]), 5)
         eng.add_symbols("DAY", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
-        sym = self.store.q("SELECT * FROM symbols")[0]
         s = self.store.settings()
-        self.assertIsNone(eng.day_only(sym, "short", s))
+        self.assertIsNone(eng.day_only(self.sym(), "short", s))
         eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
-        sym = self.store.q("SELECT * FROM symbols")[0]
-        self.assertEqual(sym["eod_close"], 0)
-        self.assertIn("close by end of day", eng.day_only(sym, "short", s))
-        self.assertIn("close by end of day", eng.day_only(sym, "long", s))
+        self.assertEqual(self.sym()["eod_close"], 0)
+        self.assertIn("close by end of day", eng.day_only(self.sym(), "short", s))
 
     def test_live_no_entry_from_1555_or_from_the_last_bar_at_the_next_open(self):
         from engine import Fill
-        eng = Engine(self.store, ScriptedProvider([]), 5)
-        eng.add_symbols("LIV", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
-        eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
-        sym, s = self.store.q("SELECT * FROM symbols")[0], self.store.settings()
-        unit = ("abs", 0.5, "test")
+        eng = self.live_engine()
+        s = self.store.settings()
         at = lambda d, hh, mm: datetime.combine(d, time(hh, mm), tzinfo=ET)
-        eng._enter(sym, "EMA5_10", "short", Fill(10.0, at(self.D, 15, 55), self.D, "close"), unit, s, "x")
+        eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(self.D, 15, 55), self.D, "c"),
+                   self.UNIT, s, "x", fixed_stop=10.5)
         nxt = self.D + timedelta(days=1)
-        eng._enter(sym, "EMA5_10", "short", Fill(10.0, at(nxt, 9, 30), nxt, "open"), unit, s, "x")
+        eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(nxt, 9, 30), nxt, "open"),
+                   self.UNIT, s, "x", fixed_stop=10.5)
         self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
-        eng._enter(sym, "EMA5_10", "short", Fill(10.0, at(self.D, 15, 50), self.D, "close"), unit, s, "x")
+        eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(self.D, 15, 50), self.D, "c"),
+                   self.UNIT, s, "x", fixed_stop=10.5)
         self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)  # 15:50 is fine
 
 

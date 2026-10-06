@@ -203,6 +203,15 @@ def ema_cross(a: list, b: list, i: int, tick: float, lookback: int = 60) -> int:
     return 0
 
 
+def ema_side(a: list, b: list, i: int, tick: float) -> int:
+    """Where line a sits versus line b on bar i at the chart's price tick:
+    -1 below, +1 above, 0 equal (or not computed yet)."""
+    if a[i] is None or b[i] is None:
+        return 0
+    ra, rb = round(a[i] / tick), round(b[i] / tick)
+    return (ra > rb) - (ra < rb)
+
+
 def cross_adverse_moves(closes: list[float], a: list, b: list, upto: int) -> list[float]:
     """For every completed cross-to-cross trade of line a vs line b in bars
     [0, upto], the worst close-to-close move against the position before the

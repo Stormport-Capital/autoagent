@@ -11,7 +11,8 @@ One Interactive Brokers account, paper or live, trades **one book**:
 | **1 share** (`IBKR_MAX_SHARES`, the only size setting) | `BrokerSync.desired` and the adapter |
 | **Flat by 15:55**, whatever the symbol's own EOD switch | `Engine.day_only`: a Live symbol is close-by-end-of-day in the model |
 | **No new entry from 15:55**, and no entry at the next open from the 15:55-16:00 bar | `Engine._enter` |
-| **Hard stop:** cover on a 5-minute close above the day's high, as a **market** order | `Engine._live_stop`, `LiveSync._order_type` |
+| **Entries:** the 9:45 state entry or a later down-cross; none before 9:45; at most 2 a day | `Engine._live_510` |
+| **Hard stop, fixed at entry:** cover on a 5-minute close above it, as a **market** order | `Engine._live_stop`, `LiveSync._order_type` |
 | **$100 daily loss limit** | `BrokerSync._check_loss` |
 
 The Alpaca paper accounts are not affected; each book keeps its own.
@@ -19,40 +20,56 @@ The Alpaca paper accounts are not affected; each book keeps its own.
 ## The live 5/10 short, exactly
 
 All bars are regular-hours 5-minute bars (9:30-16:00 ET). The EMAs are the
-5- and 10-period EMAs of those bars' closes, continuing across days.
+5- and 10-period EMAs of those closes, continuous across days (no reset at the
+open). EMAs are compared at the chart's price tick (cents from $1, 4 decimals
+below), and equal is neither above nor below.
 
-- **Entry:** the 5-minute bar whose close puts the 5 EMA **below** the 10 EMA,
-  where the last earlier bar on which they differed had the 5 above the 10.
-  EMAs are compared at the chart's price tick (cents from $1, 4 decimals
-  below), and equal EMAs are never a signal.
-  - The model enters at that bar's close.
-  - The bar is checked `bar_close_delay_min` (2) minutes after it closes, once
-    the feed has printed past its end.
-  - The order (sell 1, marketable limit) goes out right after that check.
-  - No entry on bars ending 15:55 or later. A cross on the 15:55-16:00 bar is
-    not taken at the next open.
-  - Skipped when the symbol is paused, when IBKR shows no shares to borrow,
-    or after IBKR has refused a short in it that day.
-- **Exit:** whichever comes first:
-  1. **Stop:** a 5-minute bar after entry closes **above the day's high**.
-     The day's high is the highest high of that session's earlier
-     regular-hours 5-minute bars, including bars before entry. A wick above
-     the high that closes below it is not a stop, but it raises the high. The
-     cover is a **market** order.
-  2. **Reverse cross:** a 5-minute close puts the 5 EMA above the 10 EMA.
-     The model covers at that close. The account covers with a marketable
-     limit order and does not go long.
-  3. **15:55:** flat at the close of the 15:50-15:55 bar (marketable limit).
-  - Kill switch, loss limit, Live off and Remove also cover.
+**Entries** (short only, tagged in `tranches.trigger`):
+1. **`state_0945`:** on the 9:40-9:45 bar's close, if the 5 EMA is below the
+   10 EMA. No cross is needed.
+   - **Stop:** the opening-range high, meaning the highest high of the
+     9:30-9:45 bars.
+   - Checked at 9:47; the IBKR order goes out then.
+2. **`cross`:** on a later bar whose close puts the 5 EMA below the 10 EMA,
+   where the last earlier bar on which they differed had the 5 above.
+   - **Stop:** the day's high at that moment, entry bar included.
+- No short entry on bars ending before 9:45.
+- At most **2 entries a day** per symbol: the 9:45 entry plus one cross, or
+  two crosses. After a stop-out, only a fresh down-cross re-enters.
+- No entry from 15:55, and none at the next open from the 15:55-16:00 bar.
+- Size in the model: the existing EMA sizing unit. Live: 1 share
+  (`IBKR_MAX_SHARES`).
+- The stop is stored in `stop_price`. The per-share distance from entry to the
+  stop is stored in `stop_dist`, so R can be computed from it:
+  `(gross_pnl - borrow_fees) / (qty * stop_dist)`.
+- The model enters at the bar close (less 5 bps). IBKR gets a sell for 1
+  share, as a marketable limit order, right after that bar's check. Skipped
+  when:
+  - the symbol is paused;
+  - IBKR shows no shares to borrow;
+  - IBKR refused a short in that symbol that day;
+  - the kill switch or the loss limit is on.
+
+**Exits**, whichever comes first:
+1. **Stop:** a 5-minute bar after entry closes **above `stop_price`**.
+   - The level is fixed at entry and never moves, even if a later wick sets
+     a new high.
+   - A close equal to the stop is not a stop.
+   - The cover is a **market** order.
+2. **Up-cross:** a 5-minute close puts the 5 EMA above the 10 EMA. The cover
+   is a marketable limit order, and the account never goes long.
+3. **15:55:** flat at the close of the 15:50-15:55 bar (marketable limit).
+- Kill switch, loss limit, Live off and Remove also cover.
 
 ## Choosing what trades live
 
 - On the **5-min** tab, click **Live: off** on a row, tick **5/10 EMA cross
   (short)**, then click **Save**. The row shows `IBKR 5/10 short · flat 3:55`
   (`LIVE …` once the account is live).
-- Turning Live on also makes the symbol flat by 15:55 **in the model**, for
-  all its tranches. It also adds the 5-minute stop to its 5/10 short. The
-  model's other tranches keep trading, but nothing else is sent to IBKR.
+- Turning Live on applies these entry and stop rules to the model's 5/10
+  tranche for that symbol, and makes the symbol flat by 15:55 **in the
+  model**, for all its tranches. The model's other tranches keep trading, but
+  nothing else is sent to IBKR.
 - **Live off, Remove, or a book Reset** closes that ticker's IBKR position at
   the next sync. A ticker the link ever traded is never left behind.
 

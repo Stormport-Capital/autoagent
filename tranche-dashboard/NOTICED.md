@@ -37,3 +37,16 @@ changed. Each needs a decision before anyone works on it.
    time decides.
 10. **The loss-limit check between bars runs only while IBKR orders are
     switched on** (`Scheduler.run` → `LiveSync.watch`).
+
+Added with the 9:45 state entry (same PR):
+
+11. **Catch-up entries are late.** If the server is down at 9:47 and catches
+    up later, the model still books the 9:45 entry at the 9:45 close. The
+    IBKR sell goes out when the server is back, at that later price. This
+    already applies to every entry, not only the new one.
+12. **Trade Review shows neither `trigger` nor `stop_dist` for 5/10 trades.**
+    Comparing `state_0945` with `cross`, or R measured from the stop, takes
+    SQL for now.
+13. **A cross entry's stop can sit only a hair above the fill** when the entry
+    bar closes at its high. Any later close above it then stops the trade.
+    That is the rule as written; this is a note, not a fix.
