@@ -1,6 +1,8 @@
-"""Interactive Brokers link (paper or LIVE), shared by all books, through IB Gateway.
+"""Interactive Brokers link (paper or LIVE) for ONE book (IBKR_BOOK, default the
+5-minute book), through IB Gateway.
 
-Which symbols and tranches it trades is chosen per watchlist row (Live button);
+Scope: short only, the 5/10 EMA tranche only, flat by 15:55, one share. Which
+symbols trade is chosen per watchlist row in that book (Live button);
 broker.LiveSync turns those choices into one target position per ticker.
 
 IBKRBroker speaks the same small interface as broker.AlpacaPaper (account,
@@ -13,12 +15,14 @@ Safety, enforced here independently of BrokerSync:
     must be logged in to that exact account, or nothing is sent.
   * No order may take a symbol's position beyond IBKR_MAX_SHARES (default 1)
     in either direction. Orders that only reduce a position are always allowed.
+  * Short only: a buy that would leave any position above zero (a long) is
+    refused. Covering a short is always allowed.
   * No order worth more than IBKR_MAX_ORDER_USD (default 1,000). An order with
     no price to check against is refused.
   * Marketable limit orders by default: the ask (buy) or bid (sell) from IBKR,
     plus IBKR_LIMIT_COLLAR_PCT (default 3%). BrokerSync cancels one that hasn't
     filled after IBKR_REPRICE_S seconds (default 45) and re-prices it on the
-    next follow-up sync.
+    next follow-up sync. A stop cover is sent as a market order.
   * Regular hours only (outsideRth off). Day orders.
 
 ib_async is asyncio based, so all calls run on one private event-loop thread.
@@ -49,6 +53,7 @@ WARNING_CODES = {0, 399, 2104, 2106, 2107, 2108, 2158, 10167}  # informational, 
 class IBKRConfig:
     account: str
     mode: str                  # paper | live
+    book: str = "5m"           # the one book whose Live symbols trade here
     host: str = "127.0.0.1"
     port: int = 4002
     client_id: int = 17
@@ -89,6 +94,9 @@ def config_from_env(env=None) -> IBKRConfig | None:
         raise BrokerError(f"IBKR_MODE=paper but {account} is not a paper account ID (DU...)")
     if mode == "live" and not (account.startswith("U") and account[1:].isdigit()):
         raise BrokerError(f"IBKR_MODE=live but {account} is not a live account ID (U...)")
+    book = (env.get("IBKR_BOOK") or "5m").strip().lower()
+    if book not in ("1h", "15m", "5m"):
+        raise BrokerError("IBKR_BOOK must be 1h, 15m or 5m")
     order_type = (env.get("IBKR_ORDER_TYPE") or "limit").strip().lower()
     if order_type not in ("limit", "market"):
         raise BrokerError("IBKR_ORDER_TYPE must be limit or market")
@@ -96,7 +104,7 @@ def config_from_env(env=None) -> IBKRConfig | None:
     if mode == "live" and loss <= 0:
         raise BrokerError("IBKR_DAILY_LOSS_LIMIT must be above 0 for a live account")
     return IBKRConfig(
-        account=account, mode=mode,
+        account=account, mode=mode, book=book,
         host=(env.get("IBKR_HOST") or "127.0.0.1").strip(),
         port=_num(env, "IBKR_PORT", DEFAULT_PORTS[mode], int, 1),
         client_id=_num(env, "IBKR_CLIENT_ID", 17, int, 0),
@@ -336,7 +344,7 @@ class IBKRBroker:
         return None
 
     def submit(self, symbol: str, qty: int, side: str, client_order_id: str,
-               ref_price: float | None = None) -> dict:
+               ref_price: float | None = None, order_type: str | None = None) -> dict:
         self._ensure()
         cfg = self.cfg
         qty = int(qty)
@@ -347,6 +355,9 @@ class IBKRBroker:
         if abs(new) > cfg.max_shares and abs(new) > abs(cur):
             raise BrokerError(f"IBKR: refused, {symbol} would go from {cur:+d} to {new:+d} "
                               f"shares; the cap is {cfg.max_shares} (IBKR_MAX_SHARES)")
+        if new > 0:
+            raise BrokerError(f"IBKR: refused, a buy would take {symbol} from {cur:+d} to "
+                              f"{new:+d}; this link is short only")
         c = self._contract(symbol)
         q = self.quote(symbol)
         px = (q["ask"] if side == "buy" else q["bid"]) or q["last"] or ref_price or q["close"]
@@ -356,7 +367,7 @@ class IBKRBroker:
             raise BrokerError(f"IBKR: refused, order value ${px * qty:,.2f} is above "
                               f"IBKR_MAX_ORDER_USD ${cfg.max_order_usd:,.0f}")
         action = "BUY" if side == "buy" else "SELL"
-        if cfg.order_type == "market":
+        if (order_type or cfg.order_type) == "market":
             order = self.api.MarketOrder(action, qty)
         else:
             order = self.api.LimitOrder(action, qty, limit_price(side, px, cfg.collar_pct))

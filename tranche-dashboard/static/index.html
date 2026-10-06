@@ -354,7 +354,7 @@ function renderWatch(S) {
     const stack = n.ema5 == null ? "warming up" :
       `<span title="${n.ema5 < n.ema10 ? "5 below 10" : "5 above 10"}; ${n.ema10 < n.ema20 ? "10 below 20" : "10 above 20"}">${num(n.ema5)} / ${num(n.ema10)} / ${num(n.ema20)}</span>`;
     const below = n.vwap != null && s.last_price != null && s.last_price < n.vwap;
-    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="The IBKR account follows these tranches">${STATE.live.live ? "LIVE" : "IBKR"} ${s.live.split(",").map(x => SL_SHORT[x] || x).join("+")}</span>` : ""}
+    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="IBKR follows this symbol's 5/10 EMA short: one share, short only, 5-min high-of-day stop, flat by 3:55 PM">${STATE.live.live ? "LIVE" : "IBKR"} 5/10 short · flat 3:55</span>` : ""}
         ${s.error ? `<div class="err-text">${esc(s.error)}</div>` : ""}</td>
       <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} ·
         <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
@@ -371,7 +371,7 @@ function renderWatch(S) {
       <td><button class="small" data-act="bars" data-sym="${esc(s.symbol)}" title="Every bar the engine used, with EMAs, ATR, VWAP and signals">Bars</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
         <button class="small" data-act="eod" data-id="${s.id}" data-on="${s.eod_close ? 0 : 1}" title="${s.eod_close ? "Stop closing at end of day (positions may be held overnight again)" : "Trade all day, then be flat at the 3:55 PM close every session"}">${s.eod_close ? "EOD close: on" : "EOD close: off"}</button>
-        ${STATE.live.configured ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" data-else="${esc(s.live_elsewhere || "")}" title="Choose which tranches the IBKR account follows for this symbol">${s.live ? "Live: on" : s.live_elsewhere ? `Live in ${esc(s.live_elsewhere)}` : "Live: off"}</button>` : ""}
+        ${STATE.live.configured && STATE.live.book === BOOK ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" title="Trade this symbol's 5/10 EMA short at IBKR (one share, flat by 3:55 PM)">${s.live ? "Live: on" : "Live: off"}</button>` : ""}
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
         <button class="small" data-act="rename" data-id="${s.id}" data-sym="${esc(s.symbol)}" title="Ticker changed? Move this symbol and its open positions to the new ticker">Rename</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
@@ -447,9 +447,9 @@ function renderBroker(B, o) {
     (C.kill ? `<span class="pill warn">kill switch: ${esc(C.kill)}</span>` : on ? '<span class="pill long">orders on</span>' : '<span class="pill">orders off</span>');
   const mism = (B.reconciliation || []).filter(r => !r.match);
   let h = `<label class="switch"><input type="checkbox" id="${o.p}Toggle" ${on ? "checked" : ""}> Send ${o.shared ? "the Live symbols' trades" : "the model's trades"} to ${V}</label>
-    <div class="hint">${esc(B.endpoint)}. ${o.shared ? "Shared by all books: pick symbols and tranches with the <b>Live</b> button on each watchlist row. Orders go out after each check of the symbol's book." : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
+    <div class="hint">${esc(B.endpoint)}. ${o.shared ? `${esc(B.book_label)} book only: mark symbols with the <b>Live</b> button on that tab's watchlist. 5/10 EMA short only, flat by 3:55 PM. Orders go out after each ${esc(B.book_label)} check.` : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
   if (C.max_shares || C.daily_loss_limit)
-    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (the chosen tranches' direction, not their size)` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
+    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (${o.shared ? "short only: the 5/10 short's direction, not its size" : "the model's direction, not its size"})` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
   if (a) h += `<div class="bk-kpis">
       <div><span>${o.shared ? "Net liquidation" : "Equity"}</span>${usd(a.equity)}</div><div><span>Today${C.daily_loss_limit ? ` (limit −${usd(C.daily_loss_limit)})` : ""}</span><b class="${cls(a.day_pl)}">${a.day_pl == null ? "—" : signed(a.day_pl)}</b></div>
       <div><span>Buying power</span>${a.buying_power == null ? "—" : usd(a.buying_power)}</div><div><span>Cash</span>${a.cash == null ? "—" : usd(a.cash)}</div></div>`;
@@ -692,7 +692,6 @@ $("#watch").onclick = async e => {
     return refresh();
   }
   if (b.dataset.act === "live") {
-    if (b.dataset.else) { alert(`${b.dataset.sym} is live from the ${b.dataset.else} book. Turn it off there first: the IBKR account holds one position per ticker.`); return; }
     const dlg = $("#liveDlg"), cur = (b.dataset.v || "").split(",");
     $("#liveSym").textContent = `${b.dataset.sym} (${STATE.book.label} book)`;
     $("#liveCap").textContent = (STATE.live.control || {}).max_shares || "no";
@@ -732,10 +731,8 @@ setInterval(refresh, 5000);
 <dialog id="liveDlg">
   <form method="dialog">
     <h3 style="margin:0 0 6px">IBKR live: <span id="liveSym"></span></h3>
-    <div class="hint" style="margin:0 0 8px">The IBKR account follows the net position of the ticked tranches in this book, capped at <span id="liveCap"></span> share(s), in their direction. The model keeps trading all three either way.</div>
-    <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross</label><br>
-    <label class="switch"><input type="checkbox" value="EMA10_20"> 10/20 EMA cross</label><br>
-    <label class="switch"><input type="checkbox" value="VWAP"> VWAP fail (short)</label>
+    <div class="hint" style="margin:0 0 8px">IBKR follows this symbol's 5/10 EMA tranche: short only (a long signal means flat), <span id="liveCap"></span> share(s), covered on a 5-minute close above the day's high or the opposite cross, and flat by the 3:55 PM close. Turning Live on also makes the symbol flat by 3:55 in the model. The VWAP-fail and 10/20 tranches can't trade live.</div>
+    <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross (short)</label>
     <div class="row" style="margin-top:12px"><button value="save" class="primary">Save</button> <button value="off">Live off</button> <button value="cancel">Cancel</button></div>
   </form>
 </dialog>

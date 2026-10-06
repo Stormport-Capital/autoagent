@@ -59,6 +59,8 @@ SLEEVE_LABELS = {
     "VWAP": "VWAP fail (Russo)",
 }
 RISK_MIN, RISK_MAX = 0.5, 3.0
+# the only tranche the IBKR account may follow (short only, flat by 15:55, 5-min high-of-day stop)
+LIVE_SLEEVES = ("EMA5_10",)
 # trade grade -> risk % of equity for the symbol (split across its 3 tranches)
 GRADES = {"A+": 3.0, "A": 2.0, "B": 1.5, "C": 1.0}
 # EMA sizing: risk per share = this percentile of past cross-to-cross adverse moves
@@ -254,6 +256,8 @@ class Engine:
         """Why a position on this side must be flat by 15:55 (None = may hold overnight)."""
         if sym.get("eod_close"):
             return "close by end of day"
+        if sym.get("live"):
+            return "close by end of day (IBKR live symbol)"
         # Only a rate entered for this symbol can force it flat: the book default is
         # a cost estimate, not an observed fee, so it never changes how a trade is held.
         lim = float(s.get("overnight_borrow_max_pct") or 0)
@@ -265,11 +269,16 @@ class Engine:
 
     def set_live(self, symbol_id: int, sleeves, now: datetime) -> list[str]:
         """Which of this symbol's tranches the IBKR account follows (empty =
-        none). The model itself keeps trading all three either way."""
+        none). Only LIVE_SLEEVES may be chosen. A live symbol is flat by 15:55
+        (every tranche, whatever its own EOD switch) and its 5/10 short has a
+        5-minute high-of-day stop; see day_only and _live_stop."""
         sym = self._symbol(symbol_id)
         asked = set(sleeves or [])
         if asked - set(SLEEVE_LABELS):
             raise ValidationError("unknown tranche")
+        if asked - set(LIVE_SLEEVES):
+            raise ValidationError("only the 5/10 EMA tranche can trade live; the VWAP-fail "
+                                  "and 10/20 tranches are refused")
         sleeves = [s for s in SLEEVE_LABELS if s in asked]
         if sleeves and sym["status"] == "removed":
             raise ValidationError(f"{sym['symbol']} was removed")
@@ -557,7 +566,11 @@ class Engine:
                     open_tr[sleeve] = t
                     self.store.x("UPDATE tranches SET stop_price=? WHERE id=?", (stop, t["id"]))
                 continue
-            # EMA tranches have no stop: they only exit on the opposite cross (step 3)
+            # EMA tranches have no stop: they only exit on the opposite cross (step 3),
+            # except a live symbol's 5/10 short, which also stops on a 5-min close above HOD
+            if sleeve in LIVE_SLEEVES and t["side"] == "short" and sleeve in (sym.get("live") or ""):
+                if self._live_stop(t, five, b, s):
+                    del open_tr[sleeve]
 
         # held into the next session (final bar): charge that night's borrow
         if fill.session != b.session:
@@ -604,6 +617,24 @@ class Engine:
                         f"filled {fill.how}",
                         stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10),
                         trigger="open_fade" if fade else "fail")
+
+    def _live_stop(self, t: dict, five: list[Bar], b: Bar, s) -> bool:
+        """Live 5/10 short hard stop: the first 5-minute bar after entry, up to
+        the end of book bar b, whose CLOSE is above the session's high so far
+        (the highest high of that session's earlier regular-hours 5-minute
+        bars, entry bar and pre-entry bars included). Covers at that close."""
+        opened = _dt(t["entry_time"])
+        day = [x for x in five if x.session == b.session and in_rth(x.start)]
+        for k, x in enumerate(day):
+            if x.end <= opened or x.end <= b.start or x.end > b.end or k == 0:
+                continue
+            hod = max(y.high for y in day[:k])
+            if x.close > hod:
+                self._close(t, x.close, x.end,
+                            f"stop: 5-min close {x.close:.4g} above the day's high {hod:.4g} "
+                            f"({x.start.astimezone(ET):%b %d %H:%M}-{x.end.astimezone(ET):%H:%M} bar)", s)
+                return True
+        return False
 
     def _vwap_stop(self, t: dict, bars: list[Bar], i: int) -> float:
         """High-of-day stop, never widened: the session high at entry (or the
@@ -724,6 +755,11 @@ class Engine:
             self.store.log(f.when, "skip", f"{why}: symbol paused, no entry", name, sleeve)
             return
         late = self.day_only(sym, side, s)
+        if sym.get("live") and f.when.astimezone(ET).time() == RTH_OPEN:
+            self.store.log(f.when, "skip", f"{why}: IBKR live symbol - the signal came from the "
+                           f"15:55-16:00 bar, after the 15:55 cutoff; not entered at the next open",
+                           name, sleeve)
+            return
         if late and f.when >= eod_cutoff(f.session):
             self.store.log(f.when, "skip", f"{why}: {late} - no new entries "
                            f"from {EOD_CUTOFF:%H:%M}", name, sleeve)

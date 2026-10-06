@@ -12,7 +12,7 @@ from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync
 import app
 import review
 from app import bar_for_boundary, boundaries
-from engine import Engine, ValidationError, _dt, vwap_fail
+from engine import LIVE_SLEEVES, Engine, ValidationError, _dt, vwap_fail
 from indicators import (ET, Bar, atr, bar_bucket, cross_adverse_moves, crossed_below,
                         ema, ema_cross, percentile,
                         price_tick, resample,
@@ -1699,6 +1699,12 @@ class IBKRConfigTests(unittest.TestCase):
     def test_unset_means_not_linked(self):
         self.assertIsNone(ibkr.config_from_env({}))
 
+    def test_book_defaults_to_5m_and_is_validated(self):
+        self.assertEqual(ib_cfg().book, "5m")
+        self.assertEqual(ib_cfg(IBKR_BOOK="1h").book, "1h")
+        with self.assertRaisesRegex(BrokerError, "IBKR_BOOK"):
+            ib_cfg(IBKR_BOOK="2m")
+
     def test_defaults(self):
         c = ib_cfg()
         self.assertEqual((c.mode, c.port, c.max_shares, c.daily_loss_limit),
@@ -1750,22 +1756,36 @@ class IBKRBrokerTests(unittest.TestCase):
         self.assertEqual(b.positions(), {
             "BRK.B": {"qty": "1", "avg_entry_price": "4.0", "unrealized_pl": "-1.5"},
             "AAA": {"qty": "-1", "avg_entry_price": "4.0", "unrealized_pl": "-1.5"}})
-        o = b.submit("CCC", 1, "buy", "td-x")
+        o = b.submit("CCC", 1, "sell", "td-x")
         self.assertEqual((o["status"], o["filled_qty"], o["client_order_id"]), ("filled", "1.0", "td-x"))
         sym, order = self.ib.placed[0]
         self.assertEqual((sym, order.orderType, order.lmtPrice, order.tif, order.account,
-                          order.outsideRth), ("CCC", "LMT", 4.15, "DAY", "DU123", False))
+                          order.outsideRth), ("CCC", "LMT", 3.88, "DAY", "DU123", False))
         self.assertEqual(b.get_order(o["id"])["status"], "filled")
         self.assertEqual(b.get_order("999")["status"], "expired")
 
     def test_share_cap_blocks_growth_but_never_a_close(self):
-        b = self.mk(pos={"AAA": -1, "BIG": 300})
+        b = self.mk(pos={"AAA": -1})
         with self.assertRaisesRegex(BrokerError, "cap is 1"):
-            b.submit("AAA", 1, "sell", "c1")
-        with self.assertRaisesRegex(BrokerError, "cap is 1"):
-            b.submit("AAA", 3, "buy", "c2")  # -1 -> +2
-        b.submit("AAA", 2, "buy", "c3")      # -1 -> +1 is within the cap
-        self.assertEqual(self.ib.pos["AAA"], 1)
+            b.submit("AAA", 1, "sell", "c1")  # -1 -> -2
+        b.submit("AAA", 1, "buy", "c2")      # the cover is always allowed
+        self.assertNotIn("AAA", self.ib.pos)
+
+    def test_short_only_refuses_any_buy_that_opens_a_long(self):
+        b = self.mk(pos={"AAA": -1})
+        with self.assertRaisesRegex(BrokerError, "short only"):
+            b.submit("FLAT", 1, "buy", "c1")   # 0 -> +1
+        with self.assertRaisesRegex(BrokerError, "short only"):
+            b.submit("AAA", 2, "buy", "c2")    # -1 -> +1 (also within the 1-share cap)
+        self.assertEqual(self.ib.placed, [])
+        b.submit("AAA", 1, "buy", "c3")        # -1 -> 0
+        self.assertEqual(self.ib.pos, {})
+
+    def test_market_order_on_request(self):
+        b = self.mk()  # limit orders by default
+        b.submit("AAA", 1, "sell", "c1")
+        b.submit("AAA", 1, "buy", "c2", order_type="market")
+        self.assertEqual([o.orderType for _s, o in self.ib.placed], ["LMT", "MKT"])
 
     def test_closing_a_large_position_is_allowed(self):
         b = self.mk(pos={"BIG": 3}, IBKR_MAX_ORDER_USD="100000")
@@ -1773,14 +1793,14 @@ class IBKRBrokerTests(unittest.TestCase):
         self.assertNotIn("BIG", self.ib.pos)
 
     def test_order_value_cap_and_missing_price(self):
-        b = self.mk(bid=900.0, ask=1200.0)
+        b = self.mk(bid=1200.0, ask=1300.0)
         with self.assertRaisesRegex(BrokerError, "IBKR_MAX_ORDER_USD"):
-            b.submit("PRICY", 1, "buy", "c")
+            b.submit("PRICY", 1, "sell", "c")
         b = self.mk(bid=-1, ask=-1)
         with self.assertRaisesRegex(BrokerError, "no price"):
-            b.submit("DARK", 1, "buy", "c")
-        b.submit("DARK", 1, "buy", "c", ref_price=3.0)  # the model's price is the fallback
-        self.assertEqual(self.ib.placed[-1][1].lmtPrice, 3.09)
+            b.submit("DARK", 1, "sell", "c")
+        b.submit("DARK", 1, "sell", "c", ref_price=3.0)  # the model's price is the fallback
+        self.assertEqual(self.ib.placed[-1][1].lmtPrice, 2.91)
 
     def test_market_orders_when_configured(self):
         b = self.mk(IBKR_ORDER_TYPE="market")
@@ -1795,7 +1815,7 @@ class IBKRBrokerTests(unittest.TestCase):
 
     def test_unknown_symbol(self):
         with self.assertRaisesRegex(BrokerError, "not found"):
-            self.mk().submit("NOPE", 1, "buy", "c")
+            self.mk().submit("NOPE", 1, "sell", "c")
 
     def test_short_check(self):
         self.assertIsNone(self.mk().short_check("AAA", 1))
@@ -1807,7 +1827,7 @@ class IBKRBrokerTests(unittest.TestCase):
 
     def test_cancel_and_day_pnl(self):
         b = self.mk(hold=True)
-        o = b.submit("AAA", 1, "buy", "c")
+        o = b.submit("AAA", 1, "sell", "c")
         self.assertEqual(o["status"], "accepted")
         self.assertEqual(len(b.open_orders()), 1)
         b.cancel(o["id"])
@@ -1833,10 +1853,10 @@ class LiveGuardTests(unittest.TestCase):
         self.add("AAA"); self.add("BBB")
         self.tranche("AAA", "EMA5_10", "short", 150)
         self.tranche("AAA", "VWAP", "short", 50)
-        self.tranche("BBB", "EMA10_20", "long", 80)
+        self.tranche("BBB", "EMA10_20", "short", 80)
         sync = self.ibsync()
         sync.sync(self.NOW)
-        self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": 1})
+        self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": -1})
         sync.sync(self.NOW)
         self.assertEqual(len(self.ib.placed), 2)
         st = sync.status()
@@ -1880,7 +1900,7 @@ class LiveGuardTests(unittest.TestCase):
     def test_daily_loss_limit_flattens_and_halts_for_the_day(self):
         self.add("AAA"); self.add("BBB")
         self.tranche("AAA", "EMA5_10", "short", 100)
-        self.tranche("BBB", "EMA5_10", "long", 100)
+        self.tranche("BBB", "EMA5_10", "short", 100)
         sync = self.ibsync(pos={"MANUAL": 5})
         sync.sync(self.NOW)  # day start 27,000
         self.assertEqual(sync.day_start(self.NOW), 27000.0)
@@ -1901,7 +1921,7 @@ class LiveGuardTests(unittest.TestCase):
         self.assertIsNone(sync.stop_reason(nxt))
         sync.sync(nxt)  # new day, new start equity, back to mirroring the model
         self.assertEqual(sync.day_start(nxt), 26899.0)
-        self.assertEqual(self.ib.pos, {"MANUAL": 5, "AAA": -1, "BBB": 1})
+        self.assertEqual(self.ib.pos, {"MANUAL": 5, "AAA": -1, "BBB": -1})
 
     def test_ibkr_daily_pnl_counts_when_worse(self):
         self.add("AAA")
@@ -1933,7 +1953,7 @@ class LiveGuardTests(unittest.TestCase):
 
     def test_flatten_cancels_working_orders_first(self):
         self.add("AAA")
-        self.tranche("AAA", "EMA5_10", "long", 100)
+        self.tranche("AAA", "EMA5_10", "short", 100)
         sync = self.ibsync(hold=True)
         sync.sync(self.NOW)
         self.assertEqual(len(self.ib.openTrades()), 1)
@@ -1944,7 +1964,7 @@ class LiveGuardTests(unittest.TestCase):
 
     def test_unfilled_limit_is_cancelled_and_repriced(self):
         self.add("AAA")
-        self.tranche("AAA", "EMA5_10", "long", 100)
+        self.tranche("AAA", "EMA5_10", "short", 100)
         sync = self.ibsync(hold=True)
         sync.sync(self.NOW)
         sync.sync(self.NOW + timedelta(seconds=10))
@@ -1954,12 +1974,12 @@ class LiveGuardTests(unittest.TestCase):
         self.assertTrue(sync.needs_followup)
         self.ib.hold = False
         sync.sync(self.NOW + timedelta(seconds=120))    # the follow-up re-sends at a fresh quote
-        self.assertEqual(self.ib.pos, {"AAA": 1})
+        self.assertEqual(self.ib.pos, {"AAA": -1})
         self.assertEqual(len(self.ib.placed), 2)
 
     def test_never_cancels_orders_it_did_not_send(self):
         self.add("AAA")
-        self.tranche("AAA", "EMA5_10", "long", 100)
+        self.tranche("AAA", "EMA5_10", "short", 100)
         sync = self.ibsync(hold=True)
         order = FakeApi.LimitOrder("BUY", 1, 1.0)
         order.account = "DU123"
@@ -1967,6 +1987,16 @@ class LiveGuardTests(unittest.TestCase):
         sync.set_kill("flatten", self.NOW)
         sync.sync(self.NOW + timedelta(minutes=5))
         self.assertEqual(manual.orderStatus.status, "Submitted")
+
+    def test_adapter_refuses_a_long_even_if_the_sync_asks(self):
+        self.add("LNG")
+        self.tranche("LNG", "EMA5_10", "long", 100)
+        sync = self.ibsync()  # plain BrokerSync: no short-only clamp of its own
+        sync.sync(self.NOW)
+        self.assertEqual(self.ib.placed, [])
+        row = self.store.q("SELECT status, message FROM orders")[0]
+        self.assertEqual(row["status"], "rejected")
+        self.assertIn("short only", row["message"])
 
     def test_alpaca_path_is_uncapped(self):
         self.add("AAA")
@@ -2001,18 +2031,21 @@ class LiveGuardTests(unittest.TestCase):
 
 
 class LiveSelectionTests(unittest.TestCase):
-    """The shared IBKR link: per symbol, per tranche, from any one book."""
+    """The IBKR link's scope: the 5-min book only, the 5/10 EMA tranche only,
+    short only, one share, stop covers at market."""
     NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
-        self.engines = {k: Engine(self.stores[k], ScriptedProvider([])) for k in ("1h", "15m", "5m")}
+        self.engines = {k: Engine(self.stores[k], ScriptedProvider([]), m)
+                        for k, m in (("1h", 60), ("15m", 15), ("5m", 5))}
         self.ib = FakeIB()
         self.b = ibkr.IBKRBroker(ib_cfg(), ib=self.ib, api=FakeApi)
         labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
         self.live = LiveSync(self.stores["live"], self.b,
                              {k: (labels[k], self.stores[k]) for k in labels},
+                             live_book=self.b.cfg.book, sleeves=LIVE_SLEEVES,
                              fill_wait_s=0, max_shares=1, daily_loss_limit=100)
 
     def tearDown(self):
@@ -2027,80 +2060,97 @@ class LiveSelectionTests(unittest.TestCase):
     def tranche(self, book, sym, sleeve, side, qty):
         st = self.stores[book]
         sid = st.q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
-        st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
-                entry_price, stop_price, risk_dollars, fee_through)
-                VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21')""",
-             (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
+        return st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                       entry_price, stop_price, risk_dollars, fee_through)
+                       VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21')""",
+                    (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
 
-    def test_only_the_chosen_tranches_count(self):
-        sid = self.add("15m", "AAA")
-        self.tranche("15m", "AAA", "EMA5_10", "long", 100)
-        self.tranche("15m", "AAA", "VWAP", "short", 50)
+    def test_scope_constants(self):
+        self.assertEqual(LIVE_SLEEVES, ("EMA5_10",))
+        self.assertEqual((self.live.live_book, self.live.book_label), ("5m", "5-min"))
+
+    def test_only_the_5_10_tranche_of_the_live_book_counts(self):
+        sid = self.add("5m", "AAA")
+        self.tranche("5m", "AAA", "VWAP", "short", 50)
+        self.engines["5m"].set_live(sid, ["EMA5_10"], self.NOW)
         self.live.sync(self.NOW)
-        self.assertEqual(self.ib.placed, [])  # nothing is live yet
-        self.engines["15m"].set_live(sid, ["VWAP"], self.NOW)
+        self.assertEqual(self.ib.placed, [])  # VWAP short open, 5/10 flat: nothing live
+        self.tranche("5m", "AAA", "EMA5_10", "short", 100)
         self.live.sync(self.NOW)
         self.assertEqual(self.ib.pos, {"AAA": -1})
-        self.engines["15m"].set_live(sid, ["EMA5_10"], self.NOW)
+        # marked live in another book, or for another tranche, straight in the db: ignored
+        hid = self.add("1h", "HHH")
+        self.tranche("1h", "HHH", "EMA5_10", "short", 10)
+        self.stores["1h"].x("UPDATE symbols SET live='EMA5_10' WHERE id=?", (hid,))
+        vid = self.add("5m", "VVV")
+        self.tranche("5m", "VVV", "VWAP", "short", 10)
+        self.stores["5m"].x("UPDATE symbols SET live='VWAP' WHERE id=?", (vid,))
         self.live.sync(self.NOW)
-        self.assertEqual(self.ib.pos, {"AAA": 1})
-        self.engines["15m"].set_live(sid, ["EMA5_10", "VWAP"], self.NOW)  # net +50
-        self.live.sync(self.NOW)
-        self.assertEqual(self.ib.pos, {"AAA": 1})
-        self.engines["15m"].set_live(sid, [], self.NOW)  # switched off: closed, not abandoned
-        self.live.sync(self.NOW)
-        self.assertEqual(self.ib.pos, {})
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.assertEqual(set(self.live.selections()), {"AAA"})
 
-    def test_symbols_from_different_books(self):
-        a = self.add("1h", "AAA")
+    def test_short_only_a_long_signal_means_flat(self):
+        sid = self.add("5m", "AAA")
+        tid = self.tranche("5m", "AAA", "EMA5_10", "short", 100)
+        self.engines["5m"].set_live(sid, ["EMA5_10"], self.NOW)
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.stores["5m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10, "
+                            "exit_reason='5/10 EMA crossed up', gross_pnl=0 WHERE id=?",
+                            ((self.NOW + timedelta(minutes=5)).isoformat(), tid))
+        self.tranche("5m", "AAA", "EMA5_10", "long", 100)  # reversed long in the model
+        self.live.sync(self.NOW + timedelta(minutes=6))
+        self.assertEqual(self.ib.pos, {})                    # flat, never +1
+        self.assertEqual([o.action for _s, o in self.ib.placed], ["SELL", "BUY"])
+        self.assertEqual(self.live.desired(), {"AAA": 0})
+
+    def test_stop_cover_goes_out_at_market_other_covers_at_limit(self):
+        sid = self.add("5m", "AAA")
+        self.engines["5m"].set_live(sid, ["EMA5_10"], self.NOW)
+        for reason, kind in (("stop: 5-min close 10.5 above the day's high 10.2", "MKT"),
+                             ("close by end of day (IBKR live symbol): flat at 15:55", "LMT")):
+            tid = self.tranche("5m", "AAA", "EMA5_10", "short", 100)
+            t0 = self.NOW if kind == "MKT" else self.NOW + timedelta(hours=1)
+            self.live.sync(t0)
+            self.assertEqual(self.ib.placed[-1][1].orderType, "LMT")  # the entry
+            self.stores["5m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10, "
+                                "exit_reason=?, gross_pnl=0 WHERE id=?",
+                                ((t0 + timedelta(minutes=5)).isoformat(), reason, tid))
+            self.live.sync(t0 + timedelta(minutes=7))
+            self.assertEqual((self.ib.placed[-1][1].action, self.ib.placed[-1][1].orderType),
+                             ("BUY", kind))
+            self.assertEqual(self.ib.pos, {})
+
+    def test_switched_off_and_removed_symbols_are_closed(self):
+        a = self.add("5m", "AAA")
         b = self.add("5m", "BBB")
-        self.add("15m", "CCC")
-        self.tranche("1h", "AAA", "EMA10_20", "short", 30)
-        self.tranche("5m", "BBB", "VWAP", "short", 20)
-        self.tranche("15m", "CCC", "EMA5_10", "long", 99)  # not live: never sent
-        self.engines["1h"].set_live(a, ["EMA10_20"], self.NOW)
-        self.engines["5m"].set_live(b, ["VWAP", "EMA5_10"], self.NOW)
+        self.tranche("5m", "AAA", "EMA5_10", "short", 10)
+        self.tranche("5m", "BBB", "EMA5_10", "short", 10)
+        self.engines["5m"].set_live(a, ["EMA5_10"], self.NOW)
+        self.engines["5m"].set_live(b, ["EMA5_10"], self.NOW)
         self.live.sync(self.NOW)
         self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": -1})
-        rows = {r["symbol"]: r for r in self.live.status()["reconciliation"]}
-        self.assertEqual((rows["AAA"]["book"], rows["AAA"]["sleeves"]), ("Hourly", ["EMA10_20"]))
-        self.assertEqual(rows["BBB"]["sleeves"], ["EMA5_10", "VWAP"])
-        self.assertNotIn("CCC", rows)
-
-    def test_live_selection_is_exclusive_per_ticker(self):
-        a = self.add("1h", "AAA")
-        self.add("15m", "AAA")
-        self.assertIsNone(self.live.live_in("AAA"))
-        self.engines["1h"].set_live(a, ["VWAP"], self.NOW)
-        self.assertEqual(self.live.live_in("AAA", except_book="15m"), "Hourly")
-        self.assertIsNone(self.live.live_in("AAA", except_book="1h"))
-
-    def test_removed_symbol_is_closed(self):
-        a = self.add("15m", "AAA")
-        self.tranche("15m", "AAA", "VWAP", "short", 10)
-        self.engines["15m"].set_live(a, ["VWAP"], self.NOW)
-        self.live.sync(self.NOW)
-        self.assertEqual(self.ib.pos, {"AAA": -1})
-        self.stores["15m"].x("UPDATE symbols SET last_price=10 WHERE id=?", (a,))
-        self.engines["15m"].set_status(a, "removed", self.NOW)
+        self.engines["5m"].set_live(a, [], self.NOW)
+        self.stores["5m"].x("UPDATE symbols SET last_price=10 WHERE id=?", (b,))
+        self.engines["5m"].set_status(b, "removed", self.NOW)
         self.live.sync(self.NOW)
         self.assertEqual(self.ib.pos, {})
 
-    def test_set_live_validation(self):
-        a = self.add("15m", "AAA")
-        with self.assertRaises(ValidationError):
-            self.engines["15m"].set_live(a, ["MACD"], self.NOW)
-        self.assertEqual(self.engines["15m"].set_live(a, ["VWAP", "EMA5_10"], self.NOW),
-                         ["EMA5_10", "VWAP"])
+    def test_set_live_refuses_vwap_and_10_20(self):
+        a = self.add("5m", "AAA")
+        for bad in (["VWAP"], ["EMA10_20"], ["EMA5_10", "VWAP"], ["MACD"]):
+            with self.assertRaises(ValidationError):
+                self.engines["5m"].set_live(a, bad, self.NOW)
+        self.assertIsNone(self.stores["5m"].q("SELECT live FROM symbols")[0]["live"])
+        self.assertEqual(self.engines["5m"].set_live(a, ["EMA5_10"], self.NOW), ["EMA5_10"])
 
     def test_http_live_routes(self):
         import json as _json
         import threading
         import urllib.request
         from http.server import ThreadingHTTPServer
-        self.add("1h", "AAA")
-        b = self.add("15m", "AAA")
-        a1 = self.stores["1h"].q("SELECT id FROM symbols")[0]["id"]
+        h = self.add("1h", "AAA")
+        f = self.add("5m", "AAA")
 
         class Clock:
             demo = False
@@ -2132,27 +2182,118 @@ class LiveSelectionTests(unittest.TestCase):
             except urllib.error.HTTPError as e:
                 return e.code, _json.loads(e.read())
         try:
-            self.assertEqual(call(f"/api/1h/symbols/{a1}/live", {"sleeves": ["VWAP"]})[0], 200)
-            code, err = call(f"/api/15m/symbols/{b}/live", {"sleeves": ["EMA5_10"]})
+            code, err = call(f"/api/1h/symbols/{h}/live", {"sleeves": ["EMA5_10"]})
             self.assertEqual(code, 400)
-            self.assertIn("already live from the Hourly book", err["error"])
-            self.assertEqual(call(f"/api/15m/symbols/{b}/live", {"sleeves": []})[0], 200)  # off is fine
+            self.assertIn("only in the 5-min book", err["error"])
+            code, err = call(f"/api/5m/symbols/{f}/live", {"sleeves": ["VWAP"]})
+            self.assertEqual(code, 400)
+            self.assertIn("only the 5/10 EMA tranche", err["error"])
+            self.assertEqual(call(f"/api/5m/symbols/{f}/live", {"sleeves": ["EMA5_10"]})[0], 200)
+            self.assertEqual(self.stores["5m"].q("SELECT live FROM symbols")[0]["live"], "EMA5_10")
+            self.assertEqual(call(f"/api/1h/symbols/{h}/live", {"sleeves": []})[0], 200)  # off is fine
             self.assertEqual(call("/api/live/settings", {"enabled": True})[0], 200)
             self.assertTrue(self.live.enabled())
             self.assertEqual(call("/api/live/kill", {"mode": "pause"})[0], 200)
             self.assertEqual(self.live.stop_reason(self.NOW)[0], "pause")
             self.assertEqual(call("/api/live/kill", {"mode": "nuke"})[0], 400)
             self.assertEqual(call("/api/live/kill", {"mode": "off"})[0], 200)
-            with urllib.request.urlopen(base + "/api/1h/state") as r:
+            with urllib.request.urlopen(base + "/api/5m/state") as r:
                 st = _json.loads(r.read())
-            self.assertTrue(st["live"]["configured"])
-            self.assertEqual(st["live"]["venue"], "IBKR paper")
-            with urllib.request.urlopen(base + "/api/15m/state") as r:
-                st = _json.loads(r.read())
-            self.assertEqual(st["symbols"][0]["live_elsewhere"], "Hourly")
+            self.assertEqual((st["live"]["configured"], st["live"]["book"], st["live"]["venue"]),
+                             (True, "5m", "IBKR paper"))
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class LiveRuleEngineTests(unittest.TestCase):
+    """What a Live mark changes in the model: forced 15:55 flat, no entry from
+    the 15:55-16:00 bar, and the 5/10 short's 5-minute high-of-day stop."""
+    D = date(2026, 9, 22)
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = Store(self.path)
+        self.store.save_settings({"bar_close_delay_min": 0})
+
+    def tearDown(self):
+        self.store.db.close()
+        os.remove(self.path)
+
+    def five(self, spec):
+        """spec: [(close, high)] for consecutive 5-min bars from 9:30 on day D."""
+        out, prev = [], spec[0][0]
+        for k, (c, h) in enumerate(spec):
+            t = datetime.combine(self.D, time(9, 30), tzinfo=ET) + k * FIVE
+            out.append(Bar(t, t + FIVE, prev, max(h, prev, c), min(prev, c) - 0.05, c, 1000.0))
+            prev = c
+        return out
+
+    def run_day(self, live: bool, spec, entry_k=6):
+        bars = self.five(spec)
+        eng = Engine(self.store, ScriptedProvider(bars), 5)
+        eng.add_symbols("STP", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
+        if live:
+            eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
+        entry = bars[entry_k].end
+        self.store.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                        entry_price, stop_price, risk_dollars, fee_through)
+                        VALUES (1,'STP','EMA5_10','short',100,?,10,10.5,50,?)""",
+                     (entry.isoformat(), self.D.isoformat()))
+        self.store.x("UPDATE symbols SET last_bar_end=? WHERE id=1", (entry.isoformat(),))
+        eng.tick(bars[-1].end)
+        return eng, bars, self.store.q("SELECT * FROM tranches")[0]
+
+    def test_stop_on_a_5min_close_above_the_days_high(self):
+        # HOD 10.2 set at 9:40. The 10:25 bar wicks to 10.4 but closes 10.15: no stop,
+        # and the day's high is now 10.4. A 10:35 close of 10.3 is below it: no stop.
+        # The 10:40 close of 10.45 is above it: stop, at that close.
+        spec = [(10.0, 10.1), (10.1, 10.2), (10.0, 10.1)] + [(9.9, 10.0)] * 8 + \
+               [(10.15, 10.4), (10.1, 10.15), (10.3, 10.35), (10.45, 10.5), (10.0, 10.1)]
+        _eng, bars, t = self.run_day(True, spec)
+        self.assertEqual(t["status"], "closed")
+        self.assertTrue(t["exit_reason"].startswith("stop: 5-min close 10.45 above the day's high 10.4"),
+                        t["exit_reason"])
+        self.assertEqual(_dt(t["exit_time"]), bars[14].end)
+        self.assertAlmostEqual(t["exit_price"], 10.45 * (1 + 5 / 1e4))
+
+    def test_close_equal_to_the_high_is_not_a_stop(self):
+        spec = [(10.0, 10.2)] + [(9.9, 10.0)] * 8 + [(10.2, 10.2), (10.0, 10.1)]
+        _eng, _bars, t = self.run_day(True, spec)
+        self.assertEqual(t["status"], "open")
+
+    def test_no_stop_when_not_live(self):
+        spec = [(10.0, 10.1), (10.1, 10.2)] + [(9.9, 10.0)] * 8 + [(10.5, 10.6), (10.4, 10.5)]
+        _eng, _bars, t = self.run_day(False, spec)
+        self.assertFalse((t["exit_reason"] or "").startswith("stop"))
+
+    def test_live_symbol_is_flat_at_1555_without_its_eod_switch(self):
+        eng = Engine(self.store, ScriptedProvider([]), 5)
+        eng.add_symbols("DAY", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
+        sym = self.store.q("SELECT * FROM symbols")[0]
+        s = self.store.settings()
+        self.assertIsNone(eng.day_only(sym, "short", s))
+        eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
+        sym = self.store.q("SELECT * FROM symbols")[0]
+        self.assertEqual(sym["eod_close"], 0)
+        self.assertIn("close by end of day", eng.day_only(sym, "short", s))
+        self.assertIn("close by end of day", eng.day_only(sym, "long", s))
+
+    def test_live_no_entry_from_1555_or_from_the_last_bar_at_the_next_open(self):
+        from engine import Fill
+        eng = Engine(self.store, ScriptedProvider([]), 5)
+        eng.add_symbols("LIV", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
+        eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
+        sym, s = self.store.q("SELECT * FROM symbols")[0], self.store.settings()
+        unit = ("abs", 0.5, "test")
+        at = lambda d, hh, mm: datetime.combine(d, time(hh, mm), tzinfo=ET)
+        eng._enter(sym, "EMA5_10", "short", Fill(10.0, at(self.D, 15, 55), self.D, "close"), unit, s, "x")
+        nxt = self.D + timedelta(days=1)
+        eng._enter(sym, "EMA5_10", "short", Fill(10.0, at(nxt, 9, 30), nxt, "open"), unit, s, "x")
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
+        eng._enter(sym, "EMA5_10", "short", Fill(10.0, at(self.D, 15, 50), self.D, "close"), unit, s, "x")
+        self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)  # 15:50 is fine
 
 
 if __name__ == "__main__":

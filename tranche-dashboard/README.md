@@ -13,11 +13,16 @@ after each hourly check the paper account is brought to the model's net
 position with market orders. Alpaca is paper only: the paper endpoint is hard-coded.
 **Step-by-step keys and setup: [SETUP.md](SETUP.md).**
 
-**Interactive Brokers (paper or LIVE), per stock:** set `IBKR_ACCOUNT` and one
-IBKR account, shared by all books, trades through IB Gateway. Each watchlist
-row's **Live** button picks which tranches (5/10, 10/20, VWAP) the account
-follows for that symbol, from that book. A ticker is live from one book at a
-time. Guards for real money:
+**Interactive Brokers (paper or LIVE), one book, 5/10 short only:** set
+`IBKR_ACCOUNT` and one IBKR account trades through IB Gateway. It follows the
+**5-min book** (`IBKR_BOOK`) only. On that tab, a row's **Live** button sends
+that symbol's **5/10 EMA tranche, short only**:
+- 1 share; a long signal means flat;
+- covered on a 5-minute close above the day's high (market order), or on the
+  opposite cross;
+- flat by the 3:55 PM close.
+
+VWAP-fail and 10/20 can't trade live. Guards for real money:
 
 - Share cap (default **1 share per symbol**, in the model's direction).
 - **Daily loss limit** (default **$100**): flattens and halts for the day.

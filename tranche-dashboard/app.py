@@ -43,7 +43,7 @@ from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync
 import ibkr
 from data import make_provider, redact
-from engine import SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
+from engine import LIVE_SLEEVES, SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
 from indicators import ET, RTH_OPEN, session_bar_ends
 from review import ProfileCache, review_payload, save_day_note, save_journal
@@ -73,7 +73,7 @@ KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
 OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
                  "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",  # 15-min book's paper account
                  "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",  # 5-min book's paper account
-                 "IBKR_ACCOUNT", "IBKR_MODE")  # Interactive Brokers (IBKR.md)
+                 "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOK")  # Interactive Brokers (IBKR.md)
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -348,7 +348,8 @@ def live_check(live: "LiveSync | None", note: str | None) -> str:
         a = b.account()
         return (f"{b.venue}: OK - {a['account_id']} net liquidation ${float(a['equity']):,.2f}; "
                 f"cap {b.max_shares} share(s) per symbol, daily loss limit "
-                f"${b.daily_loss_limit:,.0f}; {len(live.selections())} live symbol(s)")
+                f"${b.daily_loss_limit:,.0f}; {live.book_label} book, 5/10 EMA short only, "
+                f"flat by 15:55; {len(live.selections())} live symbol(s)")
     except Exception as e:
         return f"{b.venue}: FAILED - {_short(e)}"
 
@@ -370,7 +371,6 @@ def build_state(book: Book, books: list, provider_name: str, demo, live=None) ->
         s["snapshot"] = json.loads(s["snapshot"]) if s["snapshot"] else None
         s["tranches"] = by_sym.get(s["id"], {})
         s["unrealized"] = sum(t["unrealized"] - t["borrow_fees"] for t in s["tranches"].values())
-        s["live_elsewhere"] = live.live_in(s["symbol"], book.key) if live else None
     return {
         "book": {"key": book.key, "label": book.label, "minutes": book.minutes},
         "books": [{"key": b.key, "label": b.label, "equity": b.engine.equity(),
@@ -413,6 +413,7 @@ def live_state(live, demo=False) -> dict:
     if live is None:
         return {"configured": False, "reason": LIVE_NOTE}
     return {"configured": True, "endpoint": live.broker.endpoint, "enabled": live.enabled(),
+            "book": live.live_book, "book_label": live.book_label,
             **live.status(),
             "events": live.store.q("SELECT * FROM events ORDER BY id DESC LIMIT 12")}
 
@@ -589,17 +590,13 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                 elif m := re.fullmatch(r"/symbols/(\d+)/live", rest):
                     if live is None:
                         raise ValidationError(f"IBKR is not linked: {LIVE_NOTE}")
-                    sid = int(m.group(1))
                     sleeves = body.get("sleeves") or []
-                    sym = engine.store.q("SELECT symbol FROM symbols WHERE id=?", (sid,))
-                    other = sym and sleeves and live.live_in(sym[0]["symbol"], book.key)
-                    if other:
-                        raise ValidationError(f"{sym[0]['symbol']} is already live from the {other} "
-                                              f"book. Turn it off there first: the IBKR account "
-                                              f"holds one position per ticker.")
-                    engine.set_live(sid, sleeves, now)
-                    if live.enabled():
-                        threading.Thread(target=live.sync, args=(now,), daemon=True).start()
+                    if sleeves and book.key != live.live_book:
+                        raise ValidationError(f"Live trading is only in the {live.book_label} book "
+                                              f"(IBKR_BOOK)")
+                    engine.set_live(int(m.group(1)), sleeves, now)
+                    # forced end-of-day close and the live stop take effect at the next check
+                    threading.Thread(target=sched.run_tick, daemon=True).start()
                     return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/eod", rest):
                     engine.set_eod_close(int(m.group(1)), bool(body.get("on")), now)
@@ -787,6 +784,7 @@ def main() -> None:
     if ib is not None:
         live = LiveSync(Store(str(HERE / "tranche_live.db")), ib,
                         {k: (label, stores[k]) for k, _m, label, _p, _db in BOOKS},
+                        live_book=ib.cfg.book, sleeves=LIVE_SLEEVES,
                         max_shares=ib.max_shares, daily_loss_limit=ib.daily_loss_limit)
 
     books: dict[str, Book] = {}
