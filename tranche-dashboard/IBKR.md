@@ -11,7 +11,7 @@ One Interactive Brokers account, paper or live, trades **one book**:
 | **1 share** (`IBKR_MAX_SHARES`, the only size setting) | `BrokerSync.desired` and the adapter |
 | **Flat by 15:55**, whatever the symbol's own EOD switch | `Engine.day_only`: a Live symbol is close-by-end-of-day in the model |
 | **No new entry from 15:55**, and no entry at the next open from the 15:55-16:00 bar | `Engine._enter` |
-| **Entries:** the 9:45 state entry or a later down-cross; none before 9:45; at most 2 a day | `Engine._live_510` |
+| **Entries:** a down-cross on any bar, or the 9:45 state entry if nothing was entered yet that day; at most 2 a day | `Engine._live_510` |
 | **Hard stop, fixed at entry:** cover on a 5-minute close above it, as a **market** order | `Engine._live_stop`, `LiveSync._order_type` |
 | **$100 daily loss limit** | `BrokerSync._check_loss` |
 
@@ -25,17 +25,20 @@ open). EMAs are compared at the chart's price tick (cents from $1, 4 decimals
 below), and equal is neither above nor below.
 
 **Entries** (short only, tagged in `tranches.trigger`):
-1. **`state_0945`:** on the 9:40-9:45 bar's close, if the 5 EMA is below the
-   10 EMA. No cross is needed.
+1. **`cross`:** on any bar whose close puts the 5 EMA below the 10 EMA, where
+   the last earlier bar on which they differed had the 5 above. This includes
+   the 9:30-9:35 and 9:35-9:40 bars.
+   - **Stop:** the day's high at that moment, entry bar included.
+2. **`state_0945`:** on the 9:40-9:45 bar's close, if the 5 EMA is below the
+   10 EMA (no cross needed), **only if no entry has been taken that day**.
    - **Stop:** the opening-range high, meaning the highest high of the
      9:30-9:45 bars.
    - Checked at 9:47; the IBKR order goes out then.
-2. **`cross`:** on a later bar whose close puts the 5 EMA below the 10 EMA,
-   where the last earlier bar on which they differed had the 5 above.
-   - **Stop:** the day's high at that moment, entry bar included.
-- No short entry on bars ending before 9:45.
-- At most **2 entries a day** per symbol: the 9:45 entry plus one cross, or
-  two crosses. After a stop-out, only a fresh down-cross re-enters.
+   - A down-cross on the 9:45 bar itself counts as a `cross`. Its stop is
+     the same level, because the day's high at 9:45 is the opening-range high.
+- At most **2 entries a day** per symbol, for example a cross plus one more
+  cross, or the 9:45 entry plus one cross. After a stop-out, only a fresh
+  down-cross re-enters.
 - No entry from 15:55, and none at the next open from the 15:55-16:00 bar.
 - Size in the model: the existing EMA sizing unit. Live: 1 share
   (`IBKR_MAX_SHARES`).

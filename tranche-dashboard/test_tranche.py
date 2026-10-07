@@ -2207,9 +2207,9 @@ class LiveSelectionTests(unittest.TestCase):
 
 
 class LiveRuleEngineTests(unittest.TestCase):
-    """What a Live mark changes in the model's 5/10 tranche: the 9:45 state
-    entry, cross entries only after 9:45, two entries a day, fixed stops, the
-    forced 15:55 flat and no entry from the 15:55-16:00 bar."""
+    """What a Live mark changes in the model's 5/10 tranche: cross entries
+    (any bar), the 9:45 state entry when nothing was entered yet, two entries a
+    day, fixed stops, the forced 15:55 flat and no entry from the 15:55-16:00 bar."""
     D = date(2026, 9, 22)
     UNIT = ("abs", 0.5, "test unit")
 
@@ -2274,24 +2274,37 @@ class LiveRuleEngineTests(unittest.TestCase):
         self.step(eng, bars, 2, [9.5] * 7, [9.5] * 7)
         self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
 
-    def test_cross_before_0945_is_blocked_after_0945_enters_with_the_days_high(self):
+    def test_cross_before_0945_enters_with_the_days_high(self):
         bars = self.five(self.BARS)
         eng = self.live_engine()
-        e5, e10 = [9.6, 9.4, 9.6, 9.6, 9.6, 9.4, 9.4], [9.5] * 7   # down-crosses on 9:40 and 10:00
+        e5, e10 = [9.6, 9.4, 9.4, 9.4, 9.4, 9.4, 9.4], [9.5] * 7   # down-cross on the 9:40 bar
         self.step(eng, bars, 1, e5, e10)
-        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
-        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE message LIKE '%before the 9:45 bar%'"))
-        self.step(eng, bars, 2, e5, e10)                # 9:45: 5 above 10, no state entry
-        self.step(eng, bars, 5, e5, e10)                # 10:00 down-cross
         t = self.store.q("SELECT * FROM tranches")[0]
-        self.assertEqual((t["trigger"], _dt(t["entry_time"])), ("cross", bars[5].end))
-        self.assertEqual(t["stop_price"], 10.3)         # day's high at entry (9:35 bar)
+        self.assertEqual((t["trigger"], _dt(t["entry_time"])), ("cross", bars[1].end))
+        self.assertEqual(t["stop_price"], 10.3)          # day's high at entry (9:35 bar)
+        self.assertAlmostEqual(t["stop_dist"], 10.3 - 9.9 * (1 - 5 / 1e4))
+
+    def test_no_state_entry_at_0945_once_an_entry_was_taken(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e5, e10 = [9.6] + [9.4] * 6, [9.5] * 7            # down-cross on the 9:40 bar
+        self.step(eng, bars, 1, e5, e10)
+        self.store.x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.4, "
+                     "exit_reason='stop: test', gross_pnl=-1", (bars[1].end.isoformat(),))
+        self.step(eng, bars, 2, e5, e10)                  # 9:45: 5 still below 10, no cross
+        rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
+        self.assertEqual([r["trigger"] for r in rows], ["cross"])
+        e5[5], e5[6] = 9.6, 9.4                           # up at 10:00, fresh down-cross at 10:05
+        self.step(eng, bars, 6, e5, e10)                  # the day's second (last) entry
+        rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
+        self.assertEqual([r["trigger"] for r in rows], ["cross", "cross"])
 
     def test_two_entries_a_day_at_most(self):
         bars = self.five(self.BARS)
         eng = self.live_engine()
-        e5, e10 = [9.6, 9.6, 9.4, 9.6, 9.4, 9.6, 9.4], [9.5] * 7   # down at 9:45, 9:55, 10:05
-        self.step(eng, bars, 2, e5, e10)                             # state entry
+        # below from the open (no cross), up at 9:50, down at 9:55, up 10:00, down 10:05
+        e5, e10 = [9.4, 9.4, 9.4, 9.6, 9.4, 9.6, 9.4], [9.5] * 7
+        self.step(eng, bars, 2, e5, e10)                             # 9:45 state entry
         self.store.x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.4, "
                      "exit_reason='stop: test', gross_pnl=-1", (bars[3].end.isoformat(),))
         self.step(eng, bars, 4, e5, e10)                             # second: a fresh cross

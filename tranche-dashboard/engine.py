@@ -646,10 +646,12 @@ class Engine:
                   e5: list, e10: list, s, ctx: str, unit) -> None:
         """The 5/10 tranche of a Live symbol. Exits are as usual (opposite cross).
         Short entries, at most LIVE_MAX_ENTRIES_PER_DAY a session:
-          * state_0945: on the bar ending 9:45, if the 5 EMA is below the 10 EMA
-            (no cross needed); stop = the opening-range high (9:30-9:45 bars);
-          * cross: a down-cross on a later bar; stop = the day's high at entry.
-        No short entry on bars ending before 9:45. Stops are fixed at entry."""
+          * cross: a down-cross on any bar (9:35 and 9:40 included);
+            stop = the day's high at entry;
+          * state_0945: on the bar ending 9:45, only if no entry has been taken
+            that day, if the 5 EMA is below the 10 EMA (no cross needed);
+            stop = the opening-range high (9:30-9:45 bars).
+        Stops are fixed at entry."""
         b, name = bars[i], sym["symbol"]
         tick = price_tick(b.close)
         c1 = ema_cross(e5, e10, i, tick)
@@ -668,27 +670,20 @@ class Engine:
             return
         end = b.end.astimezone(ET).time()
         day = [x for x in five if x.session == b.session and in_rth(x.start) and x.end <= b.end]
-        if end < LIVE_STATE_BAR_END:
-            if c1 < 0:
-                self.store.log(f.when, "skip", f"{label % 'down'}: live 5/10 - no short entry "
-                               f"before the 9:45 bar", name, "EMA5_10")
-            return
-        if end == LIVE_STATE_BAR_END:
-            if ema_side(e5, e10, i, tick) >= 0:
-                return
-            trig, stop = "state_0945", max(x.high for x in day)
-            why = (f"5/10 EMA state at 9:45: EMA5 {e5[i]:.4g} below EMA10 {e10[i]:.4g} on the "
-                   f"{b.start.astimezone(ET):%b %d %H:%M}-{end:%H:%M} bar; stop = opening-range "
-                   f"high {stop:.4g}; filled {f.how}")
-        elif c1 < 0:
-            trig, stop = "cross", max(x.high for x in day)
-            why = f"{label % 'down'}; stop = day's high at entry {stop:.4g}"
-        else:
-            return
         today = [r for r in self.store.q(
             "SELECT entry_time FROM tranches WHERE symbol_id=? AND sleeve='EMA5_10' AND side='short' "
             "AND trigger IN (?, ?)", (sym["id"], *LIVE_TRIGGERS))
             if _dt(r["entry_time"]).astimezone(ET).date() == b.session]
+        if c1 < 0:
+            trig, stop = "cross", max(x.high for x in day)
+            why = f"{label % 'down'}; stop = day's high at entry {stop:.4g}"
+        elif end == LIVE_STATE_BAR_END and not today and ema_side(e5, e10, i, tick) < 0:
+            trig, stop = "state_0945", max(x.high for x in day)
+            why = (f"5/10 EMA state at 9:45: EMA5 {e5[i]:.4g} below EMA10 {e10[i]:.4g} on the "
+                   f"{b.start.astimezone(ET):%b %d %H:%M}-{end:%H:%M} bar; stop = opening-range "
+                   f"high {stop:.4g}; filled {f.how}")
+        else:
+            return
         if len(today) >= LIVE_MAX_ENTRIES_PER_DAY:
             self.store.log(f.when, "skip", f"{why}: live 5/10 - already "
                            f"{LIVE_MAX_ENTRIES_PER_DAY} entries today", name, "EMA5_10")
