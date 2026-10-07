@@ -372,10 +372,14 @@ class Engine:
             self.store.log(now, "reset", "portfolio reset")
 
     # ------------------------------------------------------------------ tick
-    def tick(self, now: datetime) -> None:
+    def tick(self, now: datetime, only_behind: tuple | None = None) -> None:
+        """only_behind=(bar_end, acts_at): a retry - process only the symbols
+        still missing that bar, so one lagging symbol doesn't re-fetch them all."""
         with self.store.lock:
             s = self.store.settings()
             for sym in self.store.q("SELECT * FROM symbols WHERE status!='removed' ORDER BY id"):
+                if only_behind and not self._is_behind(sym, *only_behind):
+                    continue
                 try:
                     self._process_symbol(sym, now, s)
                 except Exception as e:  # one bad symbol must not stop the rest
@@ -389,12 +393,14 @@ class Engine:
         ending at `bar_end` (e.g. a delayed feed had not printed it yet).
         `acts_at` is when that bar's signals execute (the next open for the
         final bar); symbols added after that don't need it."""
-        for r in self.store.q("SELECT added_at, last_bar_end FROM symbols WHERE status!='removed'"):
-            if _dt(r["added_at"]) >= (acts_at or bar_end):
-                continue
-            if r["last_bar_end"] is None or _dt(r["last_bar_end"]) < bar_end:
-                return True
-        return False
+        return any(self._is_behind(r, bar_end, acts_at) for r in self.store.q(
+            "SELECT added_at, last_bar_end FROM symbols WHERE status!='removed'"))
+
+    @staticmethod
+    def _is_behind(r: dict, bar_end: datetime, acts_at: datetime | None = None) -> bool:
+        if _dt(r["added_at"]) >= (acts_at or bar_end):
+            return False
+        return r["last_bar_end"] is None or _dt(r["last_bar_end"]) < bar_end
 
     def _load(self, symbol: str, now: datetime, s: dict):
         """5-minute data -> completed bars of this book's size + indicators."""

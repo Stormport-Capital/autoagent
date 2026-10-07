@@ -209,10 +209,10 @@ class Scheduler(threading.Thread):
     def delay(self) -> timedelta:
         return timedelta(minutes=self.engine.store.settings()["bar_close_delay_min"])
 
-    def run_tick(self) -> None:
+    def run_tick(self, only_behind: tuple | None = None) -> None:
         now = self.clock.now()
         try:
-            self.engine.tick(now)
+            self.engine.tick(now, only_behind)
             self.last_error = None
         except Exception as e:  # keep the loop alive; surface on the dashboard
             self.last_error = redact(e)
@@ -248,7 +248,8 @@ class Scheduler(threading.Thread):
             if due and (self.last_tick is None or self.last_tick < due[-1]):
                 self.run_tick()
             elif due and self.retry_due(now, due[-1]):
-                self.run_tick()  # the feed hadn't finished that hour yet: look again
+                # the feed hadn't finished that bar yet: look again, lagging symbols only
+                self.run_tick(only_behind=bar_for_boundary(due[-1], self.delay()))
             elif any(s and s.needs_followup and s.last_sync
                      and (now - s.last_sync).total_seconds() >= 60 for s in (self.sync, self.live)):
                 self.run_sync()  # an order was still working: finish the job

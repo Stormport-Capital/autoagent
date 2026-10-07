@@ -216,15 +216,15 @@ class FakeResp:
 
 
 class FakeFmp:
-    """Records calls; answers the stable endpoint unless told it's legacy-only."""
+    """Records calls; answers the stable endpoint, or `fail` = (status, body)."""
 
-    def __init__(self, rows, legacy_only=False):
-        self.rows, self.legacy_only, self.calls = rows, legacy_only, []
+    def __init__(self, rows, fail=None):
+        self.rows, self.fail, self.calls = rows, fail, []
 
     def get(self, url, params=None, timeout=None):
         self.calls.append((url, dict(params)))
-        if self.legacy_only and "/stable/" in url:
-            return FakeResp(200, {"Error Message": "Legacy endpoint only"})
+        if self.fail:
+            return FakeResp(*self.fail)
         lo, hi = params["from"], params["to"]
         return FakeResp(200, [r for r in self.rows if lo <= r["date"][:10] <= hi][::-1])
 
@@ -254,11 +254,38 @@ class FmpTests(unittest.TestCase):
         self.assertEqual(bars[0].open, 10)                       # oldest first
         self.assertTrue(all("/stable/" in u for u, _ in fake.calls))
 
-    def test_falls_back_to_legacy_endpoint(self):
-        fake = FakeFmp(self.ROWS, legacy_only=True)
-        bars = self.provider(fake).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
-        self.assertEqual(len(bars), 4)
-        self.assertTrue(any("/api/v3/historical-chart/5min/AIXC" in u for u, _ in fake.calls))
+    def test_never_calls_the_legacy_endpoint(self):
+        fake = FakeFmp(self.ROWS)
+        self.provider(fake).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+        self.assertTrue(fake.calls)
+        self.assertTrue(all(u.startswith("https://financialmodelingprep.com/stable/") for u, _ in fake.calls))
+
+    def test_reports_fmps_real_error(self):
+        cases = [((429, {"Error Message": "Limit Reach . Please upgrade your plan"}),
+                  "usage or rate limit reached (HTTP 429): Limit Reach"),
+                 ((401, {"Error Message": "Invalid API KEY."}), "rejected the API key (HTTP 401)"),
+                 ((403, {"Error Message": "Restricted Endpoint"}), "plan, usage or permission (HTTP 403)"),
+                 ((200, {"Error Message": "odd"}), "FMP returned")]
+        for fail, want in cases:
+            fake = FakeFmp(self.ROWS, fail=fail)
+            with self.assertRaises(Exception) as cm:
+                self.provider(fake).five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+            self.assertIn(want, str(cm.exception))
+            self.assertNotIn("Legacy", str(cm.exception))
+            self.assertEqual(len(fake.calls), 1)               # stops at the first failure
+
+    def test_counts_requests_bytes_and_errors(self):
+        fake = FakeFmp(self.ROWS)
+        prov = self.provider(fake)
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, tzinfo=ET))
+        self.assertEqual(prov.usage["calls"], len(fake.calls))
+        self.assertGreater(prov.usage["bytes"], 0)
+        self.assertEqual(prov.usage["errors"], 0)
+        fake.fail = (429, {"Error Message": "Limit Reach"})
+        with self.assertRaises(Exception):
+            prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 5, tzinfo=ET))
+        self.assertEqual(prov.usage["errors"], 1)
+        self.assertRegex(prov.usage_line(), r"FMP usage \S+ so far: \d+ requests, [\d.]+ MB, 1 errors")
 
     def test_bar_time_end_setting_shifts_back(self):
         os.environ["FMP_BAR_TIME"] = "end"
@@ -272,7 +299,23 @@ class FmpTests(unittest.TestCase):
         first = len(fake.calls)
         prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 5, tzinfo=ET))
         self.assertGreater(first, 1)                             # ~35 days in weekly chunks
-        self.assertEqual(len(fake.calls) - first, 1)             # then only the last days
+        self.assertEqual(len(fake.calls) - first, 1)             # then one request...
+        self.assertEqual((fake.calls[-1][1]["from"], fake.calls[-1][1]["to"]),
+                         ("2026-09-24", "2026-09-24"))           # ...from the last day held
+        prov.five_min_bars("AIXC", datetime(2026, 9, 28, 10, tzinfo=ET))   # Monday
+        self.assertEqual((fake.calls[-1][1]["from"], fake.calls[-1][1]["to"]),
+                         ("2026-09-24", "2026-09-28"))
+
+    def test_books_share_one_fetch_per_5_minute_window(self):
+        from data import CachedProvider
+        fake = FakeFmp(self.ROWS)
+        prov = CachedProvider(self.provider(fake))
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 2, 50, tzinfo=ET))
+        n = len(fake.calls)
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 3, 5, tzinfo=ET))   # next minute, same window
+        self.assertEqual(len(fake.calls), n)
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 5, 1, tzinfo=ET))   # new window
+        self.assertEqual(len(fake.calls), n + 1)
 
     def test_session_open_is_the_930_minute(self):
         rows = [{"date": "2026-09-24 09:29:00", "open": 9.0, "high": 9, "low": 9, "close": 9, "volume": 1},
@@ -1080,6 +1123,24 @@ class EngineTests(unittest.TestCase):
         sched.last_tick = datetime(2026, 9, 21, 15, 57, tzinfo=ET)
         b = datetime(2026, 9, 21, 15, 55, tzinfo=ET)  # delay 0 in these tests
         self.assertFalse(sched.retry_due(datetime(2026, 9, 21, 16, 2, tzinfo=ET), b))
+
+    def test_retry_fetches_only_the_symbols_still_behind(self):
+        asked = []
+
+        class Counting(ScriptedProvider):
+            def five_min_bars(s, symbol, now):
+                asked.append(symbol)
+                return []
+        eng = Engine(self.store, Counting([]))
+        t0 = datetime(2026, 9, 21, 9, tzinfo=ET)
+        eng.add_symbols("UPD LAG", "short_only", 1.0, t0)
+        bar_end = datetime(2026, 9, 21, 11, tzinfo=ET)
+        self.store.x("UPDATE symbols SET last_bar_end=? WHERE symbol='UPD'", (bar_end.isoformat(),))
+        eng.tick(datetime(2026, 9, 21, 11, 5, tzinfo=ET), only_behind=(bar_end, bar_end))
+        self.assertEqual(asked, ["LAG"])
+        asked.clear()
+        eng.tick(datetime(2026, 9, 21, 11, 5, tzinfo=ET))       # a normal check: all symbols
+        self.assertEqual(sorted(asked), ["LAG", "UPD"])
 
     def test_eod_toggle(self):
         eng = self.engine([])

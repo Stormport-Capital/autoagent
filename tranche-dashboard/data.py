@@ -154,16 +154,18 @@ class PolygonProvider:
 class FmpProvider:
     """Financial Modeling Prep intraday bars (FMP_API_KEY).
 
-    Uses the current "stable" API and falls back to the legacy v3 path.
+    Uses the "stable" API only. (The legacy v3 path answers every account
+    opened after Aug 31, 2025 with a 403 that hid the real error.)
     FMP stamps intraday bars in exchange (New York) time; by default the stamp
     is taken as the bar START. If the Bars table shows every bar shifted by
     5 minutes against your charts, set FMP_BAR_TIME=end in .env.
-    Keeps a per-symbol cache and only re-fetches the last couple of days.
+    Keeps a per-symbol cache and only re-fetches from the last day it holds.
+    Counts requests and bytes per ET day and prints them to the log once an
+    hour and at the end of each day, so FMP's data allowance can be checked.
     """
 
     name = "fmp"
     STABLE = "https://financialmodelingprep.com/stable/historical-chart/{tf}"
-    LEGACY = "https://financialmodelingprep.com/api/v3/historical-chart/{tf}/{sym}"
 
     def __init__(self, session=None):
         self.key = os.environ.get("FMP_API_KEY")
@@ -173,28 +175,62 @@ class FmpProvider:
         self.http = session or requests
         self._bars: dict[str, dict[datetime, Bar]] = {}
         self._lock = threading.Lock()
+        self.usage = {"day": None, "hour": None, "calls": 0, "bytes": 0, "errors": 0}
+
+    def _count(self, nbytes: int, error: bool) -> None:
+        """Per-ET-day request and byte totals, printed hourly and at day end."""
+        now = datetime.now(ET)
+        with self._lock:
+            u = self.usage
+            if u["day"] is not None and u["day"] != now.date():
+                print(self.usage_line(final=True), flush=True)
+                u.update(calls=0, bytes=0, errors=0, hour=None)
+            u["day"] = now.date()
+            u["calls"] += 1
+            u["bytes"] += nbytes
+            u["errors"] += int(error)
+            if u["hour"] != now.hour:
+                if u["hour"] is not None:
+                    print(self.usage_line(), flush=True)
+                u["hour"] = now.hour
+
+    def usage_line(self, final: bool = False) -> str:
+        u = self.usage
+        return (f"FMP usage {u['day']}{'' if final else ' so far'}: {u['calls']} requests, "
+                f"{u['bytes'] / 1e6:.1f} MB, {u['errors']} errors")
+
+    @staticmethod
+    def _reason(status: int, body) -> str:
+        msg = body.get("Error Message") or body.get("message") if isinstance(body, dict) else None
+        msg = str(msg or body)[:200]
+        if status == 429:
+            return f"FMP usage or rate limit reached (HTTP 429): {msg}"
+        if status == 401:
+            return f"FMP rejected the API key (HTTP 401): {msg}"
+        if status in (402, 403):
+            return f"FMP refused: plan, usage or permission (HTTP {status}): {msg}"
+        return f"FMP HTTP {status}: {msg}"
 
     def _rows(self, tf: str, symbol: str, start: date, end: date) -> list[dict]:
-        attempts = [
-            (self.STABLE.format(tf=tf), {"symbol": symbol}),
-            (self.LEGACY.format(tf=tf, sym=symbol), {}),
-        ]
-        last = "no response"
-        for url, extra in attempts:
-            params = {**extra, "from": start.isoformat(), "to": end.isoformat(), "apikey": self.key}
-            try:
-                r = self.http.get(url, params=params, timeout=20)
-            except requests.RequestException as e:
-                last = f"can't reach FMP ({type(e).__name__})"
-                continue
-            if r.status_code == 200:
-                body = r.json()
-                if isinstance(body, list):
-                    return body
-                last = f"FMP returned {str(body)[:200]}"
-            else:
-                last = f"FMP HTTP {r.status_code}: {r.text[:200]}"
-        raise DataError(redact(f"{last} for {symbol}"))
+        params = {"symbol": symbol, "from": start.isoformat(), "to": end.isoformat(),
+                  "apikey": self.key}
+        try:
+            r = self.http.get(self.STABLE.format(tf=tf), params=params, timeout=20)
+        except requests.RequestException as e:
+            self._count(0, True)
+            raise DataError(f"can't reach FMP ({type(e).__name__}) for {symbol}")
+        size = len(getattr(r, "content", b"") or b"") or len(getattr(r, "text", "") or "")
+        try:
+            body = r.json()
+        except ValueError:
+            body = (getattr(r, "text", "") or "")[:200]
+        if r.status_code == 200 and isinstance(body, list):
+            self._count(size, False)
+            return body
+        self._count(size, True)
+        if r.status_code == 200:
+            raise DataError(redact(f"FMP returned {str(body)[:200]} for {symbol}"))
+        raise DataError(redact(f"{self._reason(r.status_code, body)} for {symbol}"))
 
     def _to_bar(self, r: dict, step: timedelta) -> Bar | None:
         try:
@@ -209,7 +245,9 @@ class FmpProvider:
         today = now.astimezone(ET).date()
         with self._lock:
             have = self._bars.setdefault(symbol, {})
-            first = today - timedelta(days=35) if not have else today - timedelta(days=2)
+            # first fetch: ~35 days; after that, only from the last day already held
+            first = today - timedelta(days=35) if not have else \
+                min(today, max(b.start for b in have.values()).astimezone(ET).date())
         chunks, d = [], first
         while d <= today:
             e = min(d + timedelta(days=6), today)
@@ -349,8 +387,9 @@ class DemoProvider:
 
 
 class CachedProvider:
-    """Shares one fetch per symbol between the books when they check at the
-    same moment (at every hour all three run within seconds)."""
+    """Shares one fetch per symbol between the books: a fetch is reused for
+    up to ttl_s seconds while the clock is still in the same 5-minute window
+    (no new 5-minute bar can have completed in between)."""
 
     def __init__(self, inner, ttl_s: float = 60.0):
         self.inner, self.ttl_s = inner, ttl_s
@@ -359,11 +398,12 @@ class CachedProvider:
         self._lock = threading.Lock()
 
     def five_min_bars(self, symbol: str, now: datetime) -> list[Bar]:
-        key = (symbol, now.replace(second=0, microsecond=0))
+        window = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+        key = (symbol, window)
         with self._lock:
             hit = self._cache.get(key)
             if hit and _time.monotonic() - hit[0] < self.ttl_s:
-                return hit[1]
+                return [b for b in hit[1] if b.end <= now]
         bars = self.inner.five_min_bars(symbol, now)
         with self._lock:
             if len(self._cache) > 500:
