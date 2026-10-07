@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS tranches (
     note TEXT,                              -- Trade Review journal: free-text note
     tags TEXT,                              -- Trade Review journal: comma-separated tags
     risk_dollars REAL NOT NULL,
+    stop_dist REAL,                         -- entry fill to the stop level, per share (NULL = no stop)
     fee_through TEXT NOT NULL,              -- last date borrow fee was charged
     borrow_fees REAL NOT NULL DEFAULT 0,
     exit_time TEXT,
@@ -134,6 +135,8 @@ class Store:
         for col in ("grade", "note", "tags"):  # databases created before the Trade Review page
             if col not in cols:
                 self.db.execute(f"ALTER TABLE tranches ADD COLUMN {col} TEXT")
+        if "stop_dist" not in cols:  # databases created before stop distances were recorded
+            self.db.execute("ALTER TABLE tranches ADD COLUMN stop_dist REAL")
         scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
         if "grade" not in scols:  # databases created before trade grades
             self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")

@@ -236,7 +236,12 @@ class BrokerSync:
                 continue
             self._submit(now, sym, target - cur,
                          "kill switch / loss limit: close" if flatten
-                         else f"model {target:+d}, {self.venue} {cur:+d}")
+                         else f"model {target:+d}, {self.venue} {cur:+d}",
+                         order_type=None if flatten else self._order_type(sym, target, cur))
+
+    def _order_type(self, sym: str, target: int, cur: int) -> str | None:
+        """Order type for this order, or None for the broker's default."""
+        return None
 
     def _short_check(self, now: datetime, sym: str, qty: int) -> str | None:
         check = getattr(self.broker, "short_check", None)
@@ -397,14 +402,15 @@ class BrokerSync:
                 out[sym] = why
         return out
 
-    def _submit(self, now: datetime, sym: str, delta: int, reason: str) -> dict | None:
+    def _submit(self, now: datetime, sym: str, delta: int, reason: str,
+                order_type: str | None = None) -> dict | None:
         side = "buy" if delta > 0 else "sell"
         cid = f"td-{sym}-{uuid.uuid4().hex[:12]}"
         row = self.store.x(
             """INSERT INTO orders (ts, symbol, side, qty, reason, client_order_id, status)
                VALUES (?,?,?,?,?,?, 'submitting')""",
             (now.isoformat(), sym, side, abs(delta), reason, cid))
-        kw = {}
+        kw = {"order_type": order_type} if order_type else {}
         if hasattr(self.broker, "quote"):  # IBKR: the model's last price as a fallback reference
             r = self.store.q("SELECT last_price FROM symbols WHERE symbol=? AND last_price IS NOT "
                              "NULL ORDER BY id DESC LIMIT 1", (sym,))
@@ -506,48 +512,50 @@ class BrokerSync:
 
 
 class LiveSync(BrokerSync):
-    """The IBKR account, shared by all books. Each watchlist symbol picks which
-    of its tranches the account follows (symbols.live, e.g. 'EMA5_10,VWAP');
-    the account holds the sign of those tranches' net position, capped at
-    max_shares. A ticker is live from one book at a time (books may disagree on
-    direction, and the account holds one position per ticker). Orders, events,
-    the kill switch and the loss-limit latch live in this sync's own store."""
+    """The IBKR account, fed by ONE book (live_book, IBKR_BOOK). In that book a
+    watchlist symbol can be marked Live for the 5/10 EMA tranche only
+    (`sleeves`; symbols.live). The account holds the sign of that tranche's
+    position, capped at max_shares, and never above zero: short only, a long
+    signal means flat. A cover after the model's stop goes out as a market
+    order. Orders, events, the kill switch and the loss-limit latch live in
+    this sync's own store."""
 
-    def __init__(self, store, broker, books: dict, **kw):
+    def __init__(self, store, broker, books: dict, live_book: str = "5m",
+                 sleeves: tuple = ("EMA5_10",), **kw):
         super().__init__(store, broker, **kw)
         self.books = books  # key -> (label, Store)
+        self.live_book, self.sleeves = live_book, tuple(sleeves)
+        self.book_label, self.book_store = books[live_book]
 
     def enabled(self) -> bool:
         return bool(self.store.settings()["broker_sync_enabled"])
 
     def selections(self) -> dict[str, dict]:
-        """ticker -> {book, label, sleeves} for every live symbol."""
+        """ticker -> {id, label, sleeves} for every live symbol of the live book.
+        Other books and other tranches are ignored even if marked."""
         out = {}
-        for key, (label, st) in self.books.items():
-            for r in st.q("SELECT id, symbol, live FROM symbols WHERE live IS NOT NULL "
-                          "AND status != 'removed'"):
-                out.setdefault(r["symbol"], {"book": key, "label": label, "id": r["id"],
-                                             "sleeves": r["live"].split(",")})
+        for r in self.book_store.q("SELECT id, symbol, live FROM symbols WHERE live IS NOT NULL "
+                                   "AND status != 'removed' ORDER BY id"):
+            sleeves = [x for x in r["live"].split(",") if x in self.sleeves]
+            if sleeves:
+                out.setdefault(r["symbol"], {"id": r["id"], "label": self.book_label,
+                                             "sleeves": sleeves})
         return out
-
-    def live_in(self, ticker: str, except_book: str | None = None) -> str | None:
-        """Label of the book where `ticker` is already live (None = nowhere)."""
-        for key, (label, st) in self.books.items():
-            if key != except_book and st.q("SELECT 1 FROM symbols WHERE symbol=? AND live IS NOT "
-                                           "NULL AND status != 'removed'", (ticker,)):
-                return label
-        return None
 
     def _net(self) -> dict[str, int]:
         want: dict[str, int] = {}
         for sym, sel in self.selections().items():
-            st = self.books[sel["book"]][1]
             marks = ",".join("?" * len(sel["sleeves"]))
-            for t in st.q(f"SELECT side, qty FROM tranches WHERE status='open' AND symbol_id=? "
-                          f"AND sleeve IN ({marks})", (sel["id"], *sel["sleeves"])):
+            for t in self.book_store.q(f"SELECT side, qty FROM tranches WHERE status='open' "
+                                       f"AND symbol_id=? AND sleeve IN ({marks})",
+                                       (sel["id"], *sel["sleeves"])):
                 want[sym] = want.get(sym, 0) + (t["qty"] if t["side"] == "long" else -t["qty"])
             want.setdefault(sym, 0)
         return want
+
+    def desired(self) -> dict[str, int]:
+        """Short only: never above zero; a long in the model means flat here."""
+        return {s: min(q, 0) for s, q in super().desired().items()}
 
     def managed(self) -> set[str]:
         """Live symbols, plus anything this link ever traded: a symbol switched
@@ -556,12 +564,26 @@ class LiveSync(BrokerSync):
         return set(self.selections()) | traded
 
     def _renamed(self) -> dict[str, str]:
-        out = {}
-        for _label, st in self.books.values():
-            out.update({r["symbol"]: r["renamed_from"] for r in st.q(
-                "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL "
-                "AND live IS NOT NULL")})
-        return out
+        return {r["symbol"]: r["renamed_from"] for r in self.book_store.q(
+            "SELECT symbol, renamed_from FROM symbols WHERE renamed_from IS NOT NULL "
+            "AND live IS NOT NULL")}
+
+    def _order_type(self, sym: str, target: int, cur: int) -> str | None:
+        """Market for the cover of a short the model just stopped out: its most
+        recent closed live tranche exited on the stop after this link's last fill."""
+        if not (cur < 0 and target == 0):
+            return None
+        marks = ",".join("?" * len(self.sleeves))
+        last = self.book_store.q(f"SELECT exit_time, exit_reason FROM tranches WHERE symbol=? AND "
+                                 f"status='closed' AND sleeve IN ({marks}) ORDER BY exit_time DESC "
+                                 f"LIMIT 1", (sym, *self.sleeves))
+        if not last or not (last[0]["exit_reason"] or "").startswith("stop"):
+            return None
+        fill = self.store.q("SELECT ts FROM orders WHERE symbol=? AND status='filled' "
+                            "ORDER BY id DESC LIMIT 1", (sym,))
+        if fill and datetime.fromisoformat(fill[0]["ts"]) >= datetime.fromisoformat(last[0]["exit_time"]):
+            return None
+        return "market"
 
     def _recon_extra(self, sym: str) -> dict:
         sel = self.selections().get(sym)

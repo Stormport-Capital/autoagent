@@ -1,46 +1,88 @@
 # Interactive Brokers link (paper or LIVE)
 
-One Interactive Brokers account, paper or live, is shared by all three books.
-**You choose per stock what it trades:** each watchlist row has a **Live**
-button where you tick which tranches the IBKR account follows for that symbol:
+One Interactive Brokers account, paper or live, trades **one book**:
+`IBKR_BOOK`, the **5-minute book** by default. The scope is fixed in code:
 
-- 5/10 EMA cross
-- 10/20 EMA cross
-- VWAP fail
+| Rule | Where it is enforced |
+|---|---|
+| Only the 5-min book's symbols can be Live; the Live button exists only on that tab, and the server refuses it elsewhere | `app.py` live route, `LiveSync.selections` |
+| Only the **5/10 EMA tranche** can be Live. VWAP-fail and 10/20 are refused | `Engine.set_live` (`LIVE_SLEEVES`), `LiveSync.selections` |
+| **Short only.** The account never goes above 0 shares; a long signal in the model means flat | `LiveSync.desired`; the adapter refuses any buy that would open a long |
+| **1 share** (`IBKR_MAX_SHARES`, the only size setting) | `BrokerSync.desired` and the adapter |
+| **Flat by 15:55**, whatever the symbol's own EOD switch | `Engine.day_only`: a Live symbol is close-by-end-of-day in the model |
+| **No new entry from 15:55**, and no entry at the next open from the 15:55-16:00 bar | `Engine._enter` |
+| **Entries:** a down-cross on any bar, or the 9:45 state entry if nothing was entered yet that day; at most 2 a day | `Engine._live_510` |
+| **Hard stop, fixed at entry:** cover on a 5-minute close above it, as a **market** order | `Engine._live_stop`, `LiveSync._order_type` |
+| **$100 daily loss limit** | `BrokerSync._check_loss` |
 
-Any combination works, from any book. The Alpaca paper accounts are not
-affected; each book keeps its own.
+The Alpaca paper accounts are not affected; each book keeps its own.
+
+## The live 5/10 short, exactly
+
+All bars are regular-hours 5-minute bars (9:30-16:00 ET). The EMAs are the
+5- and 10-period EMAs of those closes, continuous across days (no reset at the
+open). EMAs are compared at the chart's price tick (cents from $1, 4 decimals
+below), and equal is neither above nor below.
+
+**Entries** (short only, tagged in `tranches.trigger`):
+1. **`cross`:** on any bar whose close puts the 5 EMA below the 10 EMA, where
+   the last earlier bar on which they differed had the 5 above. This includes
+   the 9:30-9:35 and 9:35-9:40 bars.
+   - **Stop:** the day's high at that moment, entry bar included.
+2. **`state_0945`:** on the 9:40-9:45 bar's close, if the 5 EMA is below the
+   10 EMA (no cross needed), **only if no entry has been taken that day**.
+   - **Stop:** the opening-range high, meaning the highest high of the
+     9:30-9:45 bars.
+   - Checked at 9:47; the IBKR order goes out then.
+   - A down-cross on the 9:45 bar itself counts as a `cross`. Its stop is
+     the same level, because the day's high at 9:45 is the opening-range high.
+- At most **2 entries a day** per symbol, for example a cross plus one more
+  cross, or the 9:45 entry plus one cross. After a stop-out, only a fresh
+  down-cross re-enters.
+- No entry from 15:55, and none at the next open from the 15:55-16:00 bar.
+- Size in the model: the existing EMA sizing unit. Live: 1 share
+  (`IBKR_MAX_SHARES`).
+- The stop is stored in `stop_price`. The per-share distance from entry to the
+  stop is stored in `stop_dist`, so R can be computed from it:
+  `(gross_pnl - borrow_fees) / (qty * stop_dist)`.
+- The model enters at the bar close (less 5 bps). IBKR gets a sell for 1
+  share, as a marketable limit order, right after that bar's check. Skipped
+  when:
+  - the symbol is paused;
+  - IBKR shows no shares to borrow;
+  - IBKR refused a short in that symbol that day;
+  - the kill switch or the loss limit is on.
+
+**Exits**, whichever comes first:
+1. **Stop:** a 5-minute bar after entry closes **above `stop_price`**.
+   - The level is fixed at entry and never moves, even if a later wick sets
+     a new high.
+   - A close equal to the stop is not a stop.
+   - The cover is a **market** order.
+2. **Up-cross:** a 5-minute close puts the 5 EMA above the 10 EMA. The cover
+   is a marketable limit order, and the account never goes long.
+3. **15:55:** flat at the close of the 15:50-15:55 bar (marketable limit).
+- Kill switch, loss limit, Live off and Remove also cover.
 
 ## Choosing what trades live
 
-- **Per symbol, per tranche, per book.** Example:
-  - GRML: 15-min book, VWAP only.
-  - USDE: Hourly book, 10/20 only.
-  - KNRX: 5-min book, 5/10 + 10/20.
-- **A ticker is live from one book at a time.** The IBKR account holds one
-  position per ticker. If the Hourly and 15-min books disagreed on GRML's
-  direction, they would fight. The dashboard refuses the second book and says
-  which book has it.
-  - To move a ticker to another book: **Live off** in the first book, then
-    tick the tranches in the second.
-- **Several tranches ticked:** the account follows their combined net
-  position. For example, 5/10 long 120 sh + VWAP short 40 sh = net long, so
-  +1 share.
+- On the **5-min** tab, click **Live: off** on a row, tick **5/10 EMA cross
+  (short)**, then click **Save**. The row shows `IBKR 5/10 short · flat 3:55`
+  (`LIVE …` once the account is live).
+- Turning Live on applies these entry and stop rules to the model's 5/10
+  tranche for that symbol, and makes the symbol flat by 15:55 **in the
+  model**, for all its tranches. The model's other tranches keep trading, but
+  nothing else is sent to IBKR.
 - **Live off, Remove, or a book Reset** closes that ticker's IBKR position at
   the next sync. A ticker the link ever traded is never left behind.
-- **The model is not changed.** It keeps trading all three tranches and
-  reporting their performance. Live only decides what the IBKR account
-  follows.
 
 ## What it does
 
-- **It follows the direction, not the size.** With the default `IBKR_MAX_SHARES=1`,
-  the account holds **−1, 0 or +1 share** of each Live symbol: short when the
-  chosen tranches are net short, long when net long, flat when flat. So the
-  live P&L is **not** the model's P&L. It tests the plumbing: signals, orders,
-  borrow, fills and fees.
-- **When orders go out:** after each check of the symbol's book. A 5-min-book
-  symbol syncs every 5 minutes; an Hourly one, hourly.
+- **It follows the direction, not the size.** The account holds **−1 or 0
+  shares** of each Live symbol: −1 while the model's 5/10 tranche is short,
+  0 otherwise. So the live P&L is **not** the model's P&L. It tests the
+  plumbing: signals, orders, borrow, fills and fees.
+- **When orders go out:** after each 5-min book check, every 5 minutes.
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.
@@ -53,7 +95,8 @@ affected; each book keeps its own.
     value, and IBKR's own daily P&L.
   - Commissions and fees count toward the loss.
   - The halt clears by itself the next day. The next sync then brings the
-    account back to the model's positions.
+    account back to the model's position. Since Live symbols are flat by
+    15:55, that means a new short only on a new signal.
 - **Kill switch** (broker card on the dashboard). Both settings survive restarts
   until you press **Resume**.
   - **Pause orders**: sends nothing at all, neither entries nor exits.
@@ -169,9 +212,9 @@ IBKR paper: OK - DU1234567 net liquidation $1,000,000.00; cap 1 share(s) per sym
 
 On the dashboard, the **IBKR paper account** card shows on every book tab.
 
-1. On each watchlist row you want traded, click **Live: off**, tick the
-   tranches, then click **Save**. The row shows a red pill such as
-   `IBKR VWAP`.
+1. On the **5-min** tab, on each row you want traded, click **Live: off**,
+   tick **5/10 EMA cross (short)**, then click **Save**. The row shows a red
+   pill: `IBKR 5/10 short · flat 3:55`.
 2. Turn on **Send the Live symbols' trades to IBKR paper** in the IBKR card.
 
 ### 4. Paper test, then live
@@ -216,7 +259,8 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 |---|---|---|
 | `IBKR_ACCOUNT` | (off) | `DU…` paper or `U…` live account ID |
 | `IBKR_MODE` | `paper` | `paper` or `live`; must match the account ID |
-| `IBKR_MAX_SHARES` | 1 | Max shares per symbol, either direction |
+| `IBKR_BOOK` | `5m` | The one book whose Live symbols trade at IBKR: `1h`, `15m` or `5m` |
+| `IBKR_MAX_SHARES` | 1 | Shares per symbol. The only size setting. Short only, so −1 by default |
 | `IBKR_DAILY_LOSS_LIMIT` | 100 | $ loss in a day that halts and flattens (live: must be > 0) |
 | `IBKR_MAX_ORDER_USD` | 1000 | Max value of one order |
 | `IBKR_ORDER_TYPE` | `limit` | `limit` (marketable, collared) or `market` |
@@ -228,9 +272,10 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 
 ## Not covered
 
-- **No resting stop orders at IBKR.** Exits happen at the symbol's book's bar checks,
-  as in the model. A gap between checks is not protected. The loss limit is
-  checked once a minute and acts at market.
+- **No resting stop orders at IBKR.** Exits happen at the 5-min book's checks
+  (every 5 minutes, 2 minutes after each bar closes), as in the model. A move
+  between checks is not protected. The loss limit is checked once a minute;
+  its covers, like every cover except the stop, are marketable limit orders.
 - **No pre-borrow and no locate purchase.** If IBKR can't borrow a stock, that
   short is skipped.
 - **No outside-hours orders.** A flatten after 16:00 ET waits for the next open.

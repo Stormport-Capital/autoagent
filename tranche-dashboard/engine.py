@@ -45,7 +45,7 @@ from dataclasses import dataclass
 import re
 from datetime import date, datetime, time, timedelta
 
-from indicators import (ET, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, percentile,
+from indicators import (ET, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, ema_side, percentile,
                         price_tick,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
                         resample, session_bar_ends, session_vwap)
@@ -59,6 +59,13 @@ SLEEVE_LABELS = {
     "VWAP": "VWAP fail (Russo)",
 }
 RISK_MIN, RISK_MAX = 0.5, 3.0
+# the only tranche the IBKR account may follow (short only, flat by 15:55, fixed stop)
+LIVE_SLEEVES = ("EMA5_10",)
+# live 5/10 short: the state entry is judged on the bar ending 9:45; the opening
+# range is the regular-hours 5-min bars ending by then; at most this many entries a day
+LIVE_STATE_BAR_END = time(9, 45)
+LIVE_MAX_ENTRIES_PER_DAY = 2
+LIVE_TRIGGERS = ("state_0945", "cross")
 # trade grade -> risk % of equity for the symbol (split across its 3 tranches)
 GRADES = {"A+": 3.0, "A": 2.0, "B": 1.5, "C": 1.0}
 # EMA sizing: risk per share = this percentile of past cross-to-cross adverse moves
@@ -254,6 +261,8 @@ class Engine:
         """Why a position on this side must be flat by 15:55 (None = may hold overnight)."""
         if sym.get("eod_close"):
             return "close by end of day"
+        if sym.get("live"):
+            return "close by end of day (IBKR live symbol)"
         # Only a rate entered for this symbol can force it flat: the book default is
         # a cost estimate, not an observed fee, so it never changes how a trade is held.
         lim = float(s.get("overnight_borrow_max_pct") or 0)
@@ -265,11 +274,16 @@ class Engine:
 
     def set_live(self, symbol_id: int, sleeves, now: datetime) -> list[str]:
         """Which of this symbol's tranches the IBKR account follows (empty =
-        none). The model itself keeps trading all three either way."""
+        none). Only LIVE_SLEEVES may be chosen. A live symbol is flat by 15:55
+        (every tranche, whatever its own EOD switch) and its 5/10 short has a
+        5-minute high-of-day stop; see day_only and _live_stop."""
         sym = self._symbol(symbol_id)
         asked = set(sleeves or [])
         if asked - set(SLEEVE_LABELS):
             raise ValidationError("unknown tranche")
+        if asked - set(LIVE_SLEEVES):
+            raise ValidationError("only the 5/10 EMA tranche can trade live; the VWAP-fail "
+                                  "and 10/20 tranches are refused")
         sleeves = [s for s in SLEEVE_LABELS if s in asked]
         if sleeves and sym["status"] == "removed":
             raise ValidationError(f"{sym['symbol']} was removed")
@@ -317,9 +331,9 @@ class Engine:
                 qty = max(1, round(t["qty"] / ratio))
                 scale = lambda v: None if v is None else v * ratio
                 self.store.x("""UPDATE tranches SET symbol=?, qty=?, entry_price=?, stop_price=?,
-                                target_price=? WHERE id=?""",
+                                target_price=?, stop_dist=? WHERE id=?""",
                              (new, qty, scale(t["entry_price"]), scale(t["stop_price"]),
-                              scale(t["target_price"]), t["id"]))
+                              scale(t["target_price"]), scale(t.get("stop_dist")), t["id"]))
                 moved.append(f"{SLEEVE_LABELS[t['sleeve']]} {t['side']} {t['qty']}->{qty}")
             self.store.x("""UPDATE symbols SET symbol=?, renamed_from=?, snapshot=NULL, error=NULL,
                             last_price=CASE WHEN last_price IS NULL THEN NULL ELSE last_price*? END
@@ -557,7 +571,11 @@ class Engine:
                     open_tr[sleeve] = t
                     self.store.x("UPDATE tranches SET stop_price=? WHERE id=?", (stop, t["id"]))
                 continue
-            # EMA tranches have no stop: they only exit on the opposite cross (step 3)
+            # EMA tranches have no stop: they only exit on the opposite cross (step 3),
+            # except a live 5/10 short, which also stops on a 5-min close above its fixed stop
+            if t["side"] == "short" and t.get("trigger") in LIVE_TRIGGERS:
+                if self._live_stop(t, five, b, s):
+                    del open_tr[sleeve]
 
         # held into the next session (final bar): charge that night's borrow
         if fill.session != b.session:
@@ -575,10 +593,14 @@ class Engine:
                    f"{e10[i]:.4g}, EMA20 {e20[j]:.4g}->{e20[i]:.4g}; filled {fill.how}")
             tick = price_tick(b.close)
             c1, c2 = ema_cross(e5, e10, i, tick), ema_cross(e10, e20, i, tick)
-            u1 = self._ema_unit(bars, e5, e10, i, a, s) if c1 else None
             u2 = self._ema_unit(bars, e10, e20, i, a, s) if c2 else None
-            self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, u1, s,
-                             c1 < 0, c1 > 0, ctx)
+            if "EMA5_10" in (sym.get("live") or ""):
+                self._live_510(sym, open_tr.get("EMA5_10"), fill, bars, five, i, e5, e10, s, ctx,
+                               lambda: self._ema_unit(bars, e5, e10, i, a, s))
+            else:
+                u1 = self._ema_unit(bars, e5, e10, i, a, s) if c1 else None
+                self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, u1, s,
+                                 c1 < 0, c1 > 0, ctx)
             self._ema_sleeve(sym, "EMA10_20", open_tr.get("EMA10_20"), fill, u2, s,
                              c2 < 0, c2 > 0, ctx)
 
@@ -604,6 +626,69 @@ class Engine:
                         f"filled {fill.how}",
                         stop_level=hod, target=daily_sma(ind["daily"], fill.session, 10),
                         trigger="open_fade" if fade else "fail")
+
+    def _live_stop(self, t: dict, five: list[Bar], b: Bar, s) -> bool:
+        """Live 5/10 short hard stop: the first regular-hours 5-minute bar after
+        entry, up to the end of book bar b, whose CLOSE is above the tranche's
+        stop_price, which is fixed at entry and never moves. Covers at that close."""
+        opened, stop = _dt(t["entry_time"]), t["stop_price"]
+        for x in five:
+            if x.end <= opened or x.end <= b.start or x.end > b.end or not in_rth(x.start):
+                continue
+            if x.close > stop:
+                self._close(t, x.close, x.end,
+                            f"stop: 5-min close {x.close:.4g} above the fixed stop {stop:.4g} "
+                            f"({x.start.astimezone(ET):%b %d %H:%M}-{x.end.astimezone(ET):%H:%M} bar)", s)
+                return True
+        return False
+
+    def _live_510(self, sym, t, f: "Fill", bars: list[Bar], five: list[Bar], i: int,
+                  e5: list, e10: list, s, ctx: str, unit) -> None:
+        """The 5/10 tranche of a Live symbol. Exits are as usual (opposite cross).
+        Short entries, at most LIVE_MAX_ENTRIES_PER_DAY a session:
+          * cross: a down-cross on any bar (9:35 and 9:40 included);
+            stop = the day's high at entry;
+          * state_0945: on the bar ending 9:45, only if no entry has been taken
+            that day, if the 5 EMA is below the 10 EMA (no cross needed);
+            stop = the opening-range high (9:30-9:45 bars).
+        Stops are fixed at entry."""
+        b, name = bars[i], sym["symbol"]
+        tick = price_tick(b.close)
+        c1 = ema_cross(e5, e10, i, tick)
+        label = f"5/10 EMA crossed %s {ctx}"
+        if c1 > 0:  # up: cover a short; long only in the model, never live
+            if t is not None and t["side"] == "short":
+                self._close(t, f.price, f.when, label % "up", s)
+                t = None
+            if t is None and sym["mode"] == "long_short":
+                self._enter(sym, "EMA5_10", "long", f, unit(), s, label % "up")
+            return
+        if c1 < 0 and t is not None and t["side"] == "long":
+            self._close(t, f.price, f.when, label % "down", s)
+            t = None
+        if t is not None:
+            return
+        end = b.end.astimezone(ET).time()
+        day = [x for x in five if x.session == b.session and in_rth(x.start) and x.end <= b.end]
+        today = [r for r in self.store.q(
+            "SELECT entry_time FROM tranches WHERE symbol_id=? AND sleeve='EMA5_10' AND side='short' "
+            "AND trigger IN (?, ?)", (sym["id"], *LIVE_TRIGGERS))
+            if _dt(r["entry_time"]).astimezone(ET).date() == b.session]
+        if c1 < 0:
+            trig, stop = "cross", max(x.high for x in day)
+            why = f"{label % 'down'}; stop = day's high at entry {stop:.4g}"
+        elif end == LIVE_STATE_BAR_END and not today and ema_side(e5, e10, i, tick) < 0:
+            trig, stop = "state_0945", max(x.high for x in day)
+            why = (f"5/10 EMA state at 9:45: EMA5 {e5[i]:.4g} below EMA10 {e10[i]:.4g} on the "
+                   f"{b.start.astimezone(ET):%b %d %H:%M}-{end:%H:%M} bar; stop = opening-range "
+                   f"high {stop:.4g}; filled {f.how}")
+        else:
+            return
+        if len(today) >= LIVE_MAX_ENTRIES_PER_DAY:
+            self.store.log(f.when, "skip", f"{why}: live 5/10 - already "
+                           f"{LIVE_MAX_ENTRIES_PER_DAY} entries today", name, "EMA5_10")
+            return
+        self._enter(sym, "EMA5_10", "short", f, unit(), s, why, trigger=trig, fixed_stop=stop)
 
     def _vwap_stop(self, t: dict, bars: list[Bar], i: int) -> float:
         """High-of-day stop, never widened: the session high at entry (or the
@@ -669,11 +754,12 @@ class Engine:
         part_id = self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
                entry_price, stop_price, target_price, risk_dollars, fee_through, borrow_fees,
-               scaled, trigger, grade, note, tags) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)""",
+               scaled, trigger, grade, note, tags, stop_dist)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)""",
             (t["symbol_id"], t["symbol"], t["sleeve"], t["side"], qty, t["entry_time"],
              t["entry_price"], t["stop_price"], t["target_price"], t["risk_dollars"] * frac,
              t["fee_through"], fees, t.get("trigger"), t.get("grade"), t.get("note"),
-             t.get("tags")))
+             t.get("tags"), t.get("stop_dist")))
         self._close({**t, "id": part_id, "qty": qty}, price, when, reason, s)
         rest = {**t, "qty": t["qty"] - qty, "risk_dollars": t["risk_dollars"] * (1 - frac),
                 "borrow_fees": t["borrow_fees"] - fees, "scaled": 1}
@@ -718,12 +804,20 @@ class Engine:
     # ------------------------------------------------------------ fills
     def _enter(self, sym, sleeve, side, f: Fill, unit: tuple | None, s, why: str,
                stop_level: float | None = None, target: float | None = None,
-               trigger: str | None = None) -> None:
+               trigger: str | None = None, fixed_stop: float | None = None) -> None:
+        """stop_level: structural stop that also sizes the trade (VWAP).
+        fixed_stop: a stop level for an EMA trade still sized by its EMA unit
+        (live 5/10). stop_dist records entry-to-stop per share either way."""
         name = sym["symbol"]
         if sym["status"] != "active":
             self.store.log(f.when, "skip", f"{why}: symbol paused, no entry", name, sleeve)
             return
         late = self.day_only(sym, side, s)
+        if sym.get("live") and f.when.astimezone(ET).time() == RTH_OPEN:
+            self.store.log(f.when, "skip", f"{why}: IBKR live symbol - the signal came from the "
+                           f"15:55-16:00 bar, after the 15:55 cutoff; not entered at the next open",
+                           name, sleeve)
+            return
         if late and f.when >= eod_cutoff(f.session):
             self.store.log(f.when, "skip", f"{why}: {late} - no new entries "
                            f"from {EOD_CUTOFF:%H:%M}", name, sleeve)
@@ -739,6 +833,11 @@ class Engine:
             dist = val * fill if kind == "pct" else val
             stop = fill - dist if side == "long" else fill + dist
             math_txt = f"no stop - exits only on the opposite cross; {unit_txt} = {dist:.4g}/share"
+            if fixed_stop is not None:
+                stop = fixed_stop
+                math_txt = (f"fixed stop {stop:.4g} ({abs(stop - fill):.4g}/share); sized by "
+                            f"{unit_txt} = {dist:.4g}/share")
+        stop_dist = abs(stop - fill) if (stop_level is not None or fixed_stop is not None) else None
         if dist <= 0 or stop <= 0:
             self.store.log(f.when, "skip", f"{why}: invalid stop distance", name, sleeve)
             return
@@ -756,15 +855,16 @@ class Engine:
             return
         self.store.x(
             """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
-               entry_price, stop_price, target_price, risk_dollars, fee_through, trigger, grade)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               entry_price, stop_price, target_price, risk_dollars, fee_through, trigger, grade,
+               stop_dist)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sym["id"], name, sleeve, side, qty, f.when.isoformat(), fill, stop, target,
-             qty * dist, f.session.isoformat(), trigger, sym.get("grade")))
+             qty * dist, f.session.isoformat(), trigger, sym.get("grade"), stop_dist))
         note = " (capped by max leverage)" if capped else ""
         tgt = f", target {target:.2f}" if target is not None else ""
         self.store.log(f.when, "entry",
                        f"{why} -> {side.upper()} {qty} @ {fill:.2f}, "
-                       f"{'stop ' + format(stop, '.2f') if sleeve == 'VWAP' else 'no stop'}{tgt}, "
+                       f"{'stop ' + format(stop, '.4g') if stop_dist is not None else 'no stop'}{tgt}, "
                        f"risk ${qty * dist:,.0f}{note} [{math_txt}; size = "
                        f"${budget:,.0f} budget / {dist:.4g} per share]", name, sleeve)
 
