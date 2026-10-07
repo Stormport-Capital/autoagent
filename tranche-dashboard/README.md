@@ -180,6 +180,7 @@ closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&
 | Provider | Key | Caveat |
 |---|---|---|
 | `polygon` (recommended) | `POLYGON_API_KEY` | Consolidated all-exchange volume, so VWAP is accurate. Plans without real-time data are 15 minutes delayed, and checks then land about 15 minutes after each hour |
+| `fmp` | `FMP_API_KEY` | Real-time 5-minute bars (stable API only). FMP plans have a rolling 30-day data allowance; when it runs out FMP refuses requests and each symbol shows FMP's error on its row. The log prints `FMP usage <day>: N requests, X MB` every hour and at day end (`journalctl -u tranche \| grep "FMP usage"`) |
 | `yahoo` (fallback without a Polygon key) | none | Unofficial endpoint. It can rate-limit or change without notice |
 | `alpaca` | `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` | The free plan's IEX feed carries only a small slice of total volume, so VWAP is approximate. Set `ALPACA_DATA_FEED=sip` if your plan includes consolidated data |
 | `demo` | none | Synthetic regime-switching prices. **Demo P&L means nothing**: the generator trends, and trend-following does well on it |
