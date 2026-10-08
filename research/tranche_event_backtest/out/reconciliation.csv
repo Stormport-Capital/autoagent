@@ -1,0 +1,15 @@
+event_type,bucket,reason,events,symbols
+INTRADAY_100,CANDIDATES,,3698,969
+INTRADAY_100,EXCLUDED,"avg volume prior 20 sessions < 10,000",100,69
+INTRADAY_100,EXCLUDED,data error,34,31
+INTRADAY_100,EXCLUDED,duplicate row,5,1
+INTRADAY_100,EXCLUDED,event date is not a trading session,4,2
+INTRADAY_100,EXCLUDED,price < $1,2653,488
+INTRADAY_100,PENDING,,902,551
+CLOSE_100,CANDIDATES,,2083,621
+CLOSE_100,EXCLUDED,"avg volume prior 20 sessions < 10,000",80,45
+CLOSE_100,EXCLUDED,data error,21,20
+CLOSE_100,EXCLUDED,duplicate row,2,1
+CLOSE_100,EXCLUDED,event date is not a trading session,2,1
+CLOSE_100,EXCLUDED,price < $1,1508,261
+CLOSE_100,PENDING,,470,349
