@@ -14,6 +14,7 @@ services:
       TWOFA_TIMEOUT_ACTION: restart             # missed phone 2FA: try again
       RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
       AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:45 PM}  # daily restart, outside market hours
+      TWS_COLD_RESTART: ${TWS_COLD_RESTART:-18:00}  # Sundays (ET): full restart + 2FA, renews the weekly login
       TIME_ZONE: America/New_York
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}  # optional, for looking at the gateway screen
       JAVA_HEAP_SIZE: ${JAVA_HEAP_SIZE:-1024}
