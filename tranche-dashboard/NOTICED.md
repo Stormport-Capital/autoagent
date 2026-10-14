@@ -50,3 +50,12 @@ Added with the 9:45 state entry (same PR):
 13. **A cross entry's stop can sit only a hair above the fill** when the entry
     bar closes at its high. Any later close above it then stops the trade.
     That is the rule as written; this is a note, not a fix.
+
+Added with the weekly cold restart:
+
+14. **Switching a book to a new Alpaca account can stop its syncs.**
+    `BrokerSync._refresh_orders` (broker.py) looks up every order still open
+    in the book's `orders` table before each sync. The Alpaca adapter raises
+    on an order the new account doesn't know, so every sync for that book
+    fails until those rows are closed. The IBKR adapter treats an unknown
+    order as expired (`ibkr.get_order`); the Alpaca one doesn't.

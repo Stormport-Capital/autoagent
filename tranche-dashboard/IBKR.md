@@ -181,8 +181,15 @@ TRADING_MODE=paper
 - When the gateway logs in to a live account, approve the IBKR Mobile
   notification on your phone.
 - The gateway restarts each night at 11:45 PM ET without a new login.
-  Expect to approve 2FA again about once a week, after IBKR's weekly
-  re-authentication.
+- **Every Sunday at 6:00 PM ET it does a full restart** (`TWS_COLD_RESTART`,
+  IBC's Cold Restart). Approve that 2FA notification. IBKR lets the nightly
+  restart reuse a login for one week only. Without the Sunday restart, the
+  Sunday-night restart stops at the login screen and the gateway stays
+  logged out until someone restarts it (this happened on 2026-10-11).
+  - Change the time with `TWS_COLD_RESTART=hh:mm` (24-hour, ET) in
+    `/opt/ibgateway/.env`. It must be after 01:00 ET.
+  - At start-up the gateway log shows
+    `Gateway will be cold restarted at <date> 18:00`.
 - If a 2FA prompt is missed, the gateway retries.
 - The dashboard shows "can't connect to IB Gateway" while it is logged out,
   and sends nothing during that time.
