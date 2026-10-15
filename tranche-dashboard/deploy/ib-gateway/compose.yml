@@ -16,6 +16,7 @@ services:
       AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:45 PM}  # daily restart, outside market hours
       TWS_COLD_RESTART: ${TWS_COLD_RESTART:-18:00}  # Sundays (ET): full restart + 2FA, renews the weekly login
       TIME_ZONE: America/New_York
+      TZ: America/New_York                      # container clock; IBC reads TWS_COLD_RESTART in it
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}  # optional, for looking at the gateway screen
       JAVA_HEAP_SIZE: ${JAVA_HEAP_SIZE:-1024}
     ports:                                      # localhost only: never on the public internet

@@ -189,7 +189,9 @@ TRADING_MODE=paper
   - Change the time with `TWS_COLD_RESTART=hh:mm` (24-hour, ET) in
     `/opt/ibgateway/.env`. It must be after 01:00 ET.
   - At start-up the gateway log shows
-    `Gateway will be cold restarted at <date> 18:00`.
+    `Gateway will be cold restarted at <date> 18:00`. That line's own
+    timestamp must be ET, like the lines after it. `TZ` in `compose.yml` sets
+    this. Without it, the container clock is UTC and 18:00 means 18:00 UTC.
 - If a 2FA prompt is missed, the gateway retries.
 - The dashboard shows "can't connect to IB Gateway" while it is logged out,
   and sends nothing during that time.
