@@ -178,7 +178,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
             <div><label for="slippage_bps">Slippage (bps)</label><input id="slippage_bps" type="number" step="1" min="0"></div>
           </div>
           <div class="row">
-            <div><label for="bar_close_delay_min">Check delay (min)</label><input id="bar_close_delay_min" type="number" step="1" min="0"></div>
+            <div><label for="bar_close_delay_s" title="Seconds after a bar closes before this book checks it and sends orders. Set it just above the data feed's lag in publishing a finished bar. If the bar isn't there yet, the check retries every 5 s for a minute, then every 3 min">Check delay (s)</label><input id="bar_close_delay_s" type="number" step="1" min="0" max="1800"></div>
             <div><label for="overnight_borrow_max_pct" title="Shorts in a symbol whose own borrow rate (set with its Borrow button) is above this are closed at the 3:55 PM close instead of held overnight. Symbols on the default rate are not forced flat. Longs are not affected. 0 = off">Overnight borrow limit (%/yr)</label><input id="overnight_borrow_max_pct" type="number" step="1" min="0"></div>
           </div>
           <div class="row">
@@ -333,6 +333,7 @@ let settingsDirty = false;
 function renderSettings(s) {
   if (settingsDirty) return;
   for (const [k, v] of Object.entries(s)) { const el = document.getElementById(k); if (el) el.value = String(v); }
+  if ("bar_close_delay_min" in s) $("#bar_close_delay_s").value = String(Math.round(s.bar_close_delay_min * 60));
 }
 
 function trancheCell(t, sleeve, mode) {
@@ -660,6 +661,7 @@ $("#setForm").onsubmit = async e => {
   e.preventDefault(); const msg = $("#setMsg"), body = {};
   for (const el of document.querySelectorAll("#setForm input, #setForm select"))
     body[el.id] = Number(el.value);
+  body.bar_close_delay_min = body.bar_close_delay_s / 60; delete body.bar_close_delay_s;  // stored in minutes
   try { await api(bk("/api/settings"), body); settingsDirty = false; msg.className = "msg ok"; msg.textContent = "Saved."; }
   catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
   refresh();

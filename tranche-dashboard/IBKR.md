@@ -33,7 +33,8 @@ below), and equal is neither above nor below.
    10 EMA (no cross needed), **only if no entry has been taken that day**.
    - **Stop:** the opening-range high, meaning the highest high of the
      9:30-9:45 bars.
-   - Checked at 9:47; the IBKR order goes out then.
+   - Checked when the book's check delay has passed after the 9:45 close
+     (Portfolio settings, in seconds); the IBKR order goes out right after.
    - A down-cross on the 9:45 bar itself counts as a `cross`. Its stop is
      the same level, because the day's high at 9:45 is the opening-range high.
 - At most **2 entries a day** per symbol, for example a cross plus one more
@@ -82,7 +83,12 @@ below), and equal is neither above nor below.
   shares** of each Live symbol: −1 while the model's 5/10 tranche is short,
   0 otherwise. So the live P&L is **not** the model's P&L. It tests the
   plumbing: signals, orders, borrow, fills and fees.
-- **When orders go out:** after each 5-min book check, every 5 minutes.
+- **When orders go out:** after each 5-min book check, every 5 minutes. The
+  check runs the book's **check delay** after the bar closes (Portfolio
+  settings, in seconds); set it just above the data feed's lag in publishing
+  a finished bar. The scheduler wakes within a second of that time, and if
+  the bar is not there yet it retries every 5 s for a minute. IBKR's fill of
+  the 1-share marketable limit then takes a second or two.
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.

@@ -52,6 +52,9 @@ from store import Store
 HERE = Path(__file__).parent
 RETRY_EVERY = timedelta(minutes=3)
 RETRY_WINDOW = timedelta(minutes=40)
+FAST_RETRY_EVERY = timedelta(seconds=5)   # right after a bar closes, while the feed
+FAST_RETRY_WINDOW = timedelta(seconds=60)  # may still be printing it
+POLL_S = 20.0                              # between bars
 
 # (key, bar minutes, label, env prefix for its Alpaca paper keys, db file)
 BOOKS = (
@@ -226,15 +229,29 @@ class Scheduler(threading.Thread):
             self.live.sync(self.clock.now())
 
     def retry_due(self, now: datetime, boundary: datetime) -> bool:
-        """Re-check every 3 min for up to 40 min after a boundary while some
-        symbol is still missing that hour (15-minute-delayed data plans)."""
+        """Re-check while some symbol is still missing that bar: every 5 s for
+        the first minute after a boundary (the feed is printing the bar), then
+        every 3 min for up to 40 min (15-minute-delayed data plans)."""
         t = boundary - self.delay()
         if t.time() != RTH_OPEN and t not in session_bar_ends(t.date(), self.minutes):
             return False  # the extra 15:55 check closes no bar of this book
         window = min(RETRY_WINDOW, timedelta(minutes=self.minutes))
+        every = FAST_RETRY_EVERY if now - boundary <= FAST_RETRY_WINDOW else RETRY_EVERY
         return (now - boundary <= window
-                and self.last_tick is not None and now - self.last_tick >= RETRY_EVERY
+                and self.last_tick is not None and now - self.last_tick >= every
                 and self.engine.behind(*bar_for_boundary(boundary, self.delay())))
+
+    def pause(self, now: datetime) -> float:
+        """Seconds until the next look: POLL_S between bars, down to 1 s as a
+        check time approaches, and FAST_RETRY_EVERY for the minute after one.
+        With a fixed 20 s poll, bar close to IBKR order was 2 min 7-15 s on
+        2026-10-16 (a 2-minute check delay plus the poll); the delay is now
+        set in seconds and the check lands within a second of it."""
+        due = [b for b in boundaries(now.date(), self.delay(), self.minutes) if b <= now]
+        if due and now - due[-1] <= FAST_RETRY_WINDOW:
+            return FAST_RETRY_EVERY.total_seconds()
+        until = (next_boundary(now, self.delay(), self.minutes) - now).total_seconds()
+        return max(1.0, min(POLL_S, until))
 
     def next_tick(self) -> datetime:
         return next_boundary(self.clock.now(), self.delay(), self.minutes)
@@ -242,7 +259,7 @@ class Scheduler(threading.Thread):
     def run(self) -> None:
         self.run_tick()  # catch up on bars completed while the app was down
         while True:
-            _time.sleep(20)
+            _time.sleep(self.pause(self.clock.now()))
             now = self.clock.now()
             due = [b for b in boundaries(now.date(), self.delay(), self.minutes) if b <= now]
             if due and (self.last_tick is None or self.last_tick < due[-1]):

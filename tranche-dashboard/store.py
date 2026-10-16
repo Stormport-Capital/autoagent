@@ -16,7 +16,8 @@ DEFAULT_SETTINGS = {
     "atr_period": 14,
     "max_leverage": 2.0,           # gross exposure cap as a multiple of equity
     "slippage_bps": 5.0,           # adverse fill vs bar close / stop, each side
-    "bar_close_delay_min": 2,      # wait this long after an hourly bar closes
+    "bar_close_delay_min": 2,      # wait this long after a bar closes (fractions allowed;
+                                   # the dashboard shows and edits it in seconds)
     "broker_sync_enabled": False,  # mirror the model into the Alpaca PAPER account
     "vwap_max_sessions": 10,       # VWAP short: cover at the last check of this session (0 = off)
     "vwap_scale_out_20": 1,        # VWAP short: half at the 10-day MA, rest at the 20-day (0 = all at 10)
