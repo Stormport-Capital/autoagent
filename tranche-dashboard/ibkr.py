@@ -158,8 +158,27 @@ class IBKRBroker:
         self._next_try = 0.0
         self._pnl_on = False
         self._lock = threading.RLock()
+        self._errors: dict[int, str] = {}  # orderId -> IBKR's latest refusal of it
+        if hasattr(self.ib, "errorEvent"):
+            self.ib.errorEvent += self._on_error
 
     # ------------------------------------------------------------ plumbing
+    def _on_error(self, req_id, code, msg, *_rest) -> None:
+        """IBKR's refusal of an order arrives as an error for its order id,
+        often just after the order's status went Inactive. ib_async then keeps
+        the reason out of the trade log (the trade is already done), so it is
+        kept here for _order(): without it a refused short was recorded as
+        'order Inactive' and re-sent every check (2026-10-16)."""
+        try:
+            req_id, code = int(req_id), int(code)
+        except (TypeError, ValueError):
+            return
+        if req_id < 0 or code in WARNING_CODES or 2100 <= code < 2200:
+            return
+        self._errors[req_id] = str(msg)
+        while len(self._errors) > 200:
+            del self._errors[next(iter(self._errors))]
+
     def _run(self, fn, timeout: float = 30.0):
         """Run fn() on the IB event loop (awaiting it if it is a coroutine)."""
         async def go():
@@ -222,13 +241,14 @@ class IBKRBroker:
         status = STATUS.get(st.status) or ("partially_filled" if filled else "accepted")
         msgs = [e.message for e in t.log if e.message and e.errorCode not in WARNING_CODES]
         fill_times = [f.time for f in t.fills if getattr(f, "time", None)]
+        err = self._errors.get(int(t.order.orderId or 0))
         return {
             "id": str(t.order.orderId), "client_order_id": t.order.orderRef,
             "symbol": self._sym(t.contract), "status": status, "ib_status": st.status,
             "filled_qty": str(filled),
             "filled_avg_price": str(st.avgFillPrice) if filled and st.avgFillPrice else None,
             "filled_at": fill_times[-1].isoformat() if fill_times else None,
-            "message": msgs[-1] if msgs else None,
+            "message": msgs[-1] if msgs else err,
         }
 
     def _trade(self, order_id: str):
@@ -382,6 +402,10 @@ class IBKRBroker:
             _time.sleep(0.2)
         o = self._run(lambda: self._order(trade))
         if o["status"] in ("rejected", "canceled") and not float(o["filled_qty"]):
+            deadline = _time.monotonic() + 2  # IBKR's reason can land just after the status
+            while not o["message"] and _time.monotonic() < deadline:
+                _time.sleep(0.2)
+                o = self._run(lambda: self._order(trade))
             raise BrokerError(f"IBKR: {o['message'] or 'order ' + o['ib_status']}")
         return o
 

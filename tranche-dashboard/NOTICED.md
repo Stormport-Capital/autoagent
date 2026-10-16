@@ -59,3 +59,19 @@ Added with the weekly cold restart:
     on an order the new account doesn't know, so every sync for that book
     fails until those rows are closed. The IBKR adapter treats an unknown
     order as expired (`ibkr.get_order`); the Alpaca one doesn't.
+
+
+Added after the first live refusals (2026-10-16, XLAB):
+
+15. **Only some refusals hold a short back for the day.** `_held_back`
+    (broker.py) recognises a halt, "not tradable" and the not-shortable
+    wordings. A short IBKR refuses for any other reason (its $2,000 minimum,
+    a margin check) is re-sent at every 5-minute check that day. Holding back
+    any opening short refused that day would stop it; not built.
+16. **Unknown: why the borrow pre-check did not stop XLAB.** The tick-236
+    check ran before each XLAB order and let it through; IBKR then refused
+    every order with "The contract is not available for short sale". Either
+    no shortable tick arrived within `quote_wait_s` (3 s), or IBKR reported
+    shares its order-time check did not honour. The adapter does not record
+    the borrow reading it acted on; logging it with each short would settle
+    this.
