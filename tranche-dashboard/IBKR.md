@@ -110,7 +110,8 @@ below), and equal is neither above nor below.
     once a day and shown in the broker card. The model keeps the trade.
   - If IBKR sends no short data, the order goes out and IBKR's own locate check
     accepts or rejects it.
-  - Rejected shorts are not re-sent that day. Covers are never blocked.
+  - A short IBKR refuses as not shortable is not re-sent that day; the
+    refusal is recorded with IBKR's reason. Covers are never blocked.
 - **Order limits enforced inside the IBKR adapter.** These are independent of
   the rest of the app:
   - No order may take a symbol past the share cap.

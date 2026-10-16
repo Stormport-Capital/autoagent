@@ -202,7 +202,7 @@ class Scheduler(threading.Thread):
         self.engine, self.clock = engine, clock
         self.minutes = engine.minutes
         self.sync = sync  # this book's Alpaca paper link; never set in demo mode
-        self.live = live  # the shared IBKR link; never set in demo mode
+        self.live = live  # the IBKR link, on the live book's scheduler only (live_link)
         self.last_tick: datetime | None = None
         self.last_error: str | None = None
 
@@ -283,6 +283,14 @@ class Book:
         self.key, self.minutes, self.label = key, minutes, label
         self.engine, self.sched = engine, sched
         self.link_note = link_note  # why the paper link is off, if it is
+
+
+def live_link(key: str, live: "LiveSync | None") -> "LiveSync | None":
+    """The IBKR link rides the live book's scheduler only, so it syncs once per
+    5-minute check. On every book's scheduler it synced three times at a shared
+    bar boundary (12:00 closes an hourly, a 15-min and a 5-min bar) and re-sent
+    a refused order three times within seconds (2026-10-16)."""
+    return live if live is not None and key == live.live_book else None
 
 
 def _short(e: Exception) -> str:
@@ -799,7 +807,8 @@ def main() -> None:
         if args.demo:
             engine.add_symbols("DEMOA DEMOB", "long_short", 1.0, clock.now())
             engine.add_symbols("DEMOC", "short_only", 2.0, clock.now())
-        books[key] = Book(key, minutes, label, engine, Scheduler(engine, clock, sync, live), note)
+        books[key] = Book(key, minutes, label, engine,
+                          Scheduler(engine, clock, sync, live_link(key, live)), note)
 
     if not args.demo:
         print("Checking connections...")

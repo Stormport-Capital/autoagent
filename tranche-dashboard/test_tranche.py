@@ -1656,14 +1656,32 @@ class FakeApi:
         return NS(action=action, totalQuantity=qty, orderType="MKT", orderId=0, orderRef="", account="")
 
 
+class FakeEvent:
+    """ib_async's errorEvent: handlers added with +=, called by emit()."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, fn):
+        self.handlers.append(fn)
+        return self
+
+    def emit(self, *args):
+        for fn in self.handlers:
+            fn(*args)
+
+
 class FakeIB:
     """Just enough of ib_async.IB: orders fill at once unless `hold`, symbols in
-    `reject` are refused like IBKR's error 201."""
+    `reject` are refused like IBKR's error 201. `reject_late` refuses the way
+    IB Gateway was seen to: status Inactive first, the reason only via
+    errorEvent a moment later, and nothing in the trade log."""
 
     def __init__(self, accounts=("DU123",), pos=None, netliq=27000.0, hold=False, reject=(),
-                 shortable=3.0, shortable_shares=50000.0, bid=4.0, ask=4.02):
+                 shortable=3.0, shortable_shares=50000.0, bid=4.0, ask=4.02, reject_late=False):
         self.accounts, self.pos, self.netliq = list(accounts), dict(pos or {}), netliq
-        self.hold, self.reject = hold, set(reject)
+        self.hold, self.reject, self.reject_late = hold, set(reject), reject_late
+        self.errorEvent = FakeEvent()
         self.connected, self.connects, self.placed, self._trades = False, 0, [], []
         self.q = dict(shortable=shortable, shortableShares=shortable_shares, bid=bid, ask=ask)
         self.daily = float("nan")
@@ -1716,9 +1734,14 @@ class FakeIB:
                orderStatus=NS(status="Submitted", filled=0, avgFillPrice=0.0))
         self._trades.append(t)
         if c.symbol in self.reject:
-            t.orderStatus.status = "Cancelled"
-            t.log.append(NS(message="Order rejected - reason:The contract is not available "
-                                    "for short sale.", errorCode=201))
+            msg = "Order rejected - reason:The contract is not available for short sale."
+            if self.reject_late:
+                t.orderStatus.status = "Inactive"
+                import threading
+                threading.Timer(0.3, self.errorEvent.emit, (order.orderId, 201, msg, c)).start()
+            else:
+                t.orderStatus.status = "Cancelled"
+                t.log.append(NS(message=msg, errorCode=201))
         elif not self.hold:
             self.fill(t)
         return t
@@ -1874,6 +1897,18 @@ class IBKRBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(BrokerError, "not available for short sale"):
             b.submit("HTB", 1, "sell", "c")
 
+    def test_rejection_reason_that_arrives_after_the_inactive_status(self):
+        """IB Gateway marked a refused short Inactive before sending the reason;
+        ib_async then kept the reason out of the trade log (2026-10-16)."""
+        b = self.mk(reject={"HTB"}, reject_late=True)
+        with self.assertRaisesRegex(BrokerError, "not available for short sale"):
+            b.submit("HTB", 1, "sell", "c")
+        o = b.get_order("1")
+        self.assertEqual(o["status"], "rejected")
+        self.assertIn("not available for short sale", o["message"])
+        b._on_error(-1, 2104, "Market data farm connection is OK")  # informational: ignored
+        self.assertEqual(list(b._errors), [1])
+
     def test_unknown_symbol(self):
         with self.assertRaisesRegex(BrokerError, "not found"):
             self.mk().submit("NOPE", 1, "sell", "c")
@@ -1956,6 +1991,20 @@ class LiveGuardTests(unittest.TestCase):
         sync.sync(self.NOW)
         sync.sync(self.NOW + timedelta(minutes=15))
         self.assertEqual(len(self.ib.placed), 1)  # not resent
+        self.assertIn("can't short it today", sync.blocked(self.NOW)["HTB"])
+
+    def test_late_rejection_reason_is_recorded_and_holds_back(self):
+        """The XLAB case: six submissions in 15 minutes because the refusal was
+        recorded as 'order Inactive', which _held_back does not recognise."""
+        self.add("HTB")
+        self.tranche("HTB", "VWAP", "short", 10)
+        sync = self.ibsync(reject={"HTB"}, reject_late=True)
+        for m in (0, 5, 10):
+            sync.sync(self.NOW + timedelta(minutes=m))
+        self.assertEqual(len(self.ib.placed), 1)  # refused once, then held back
+        row = self.store.q("SELECT status, message FROM orders")[0]
+        self.assertEqual(row["status"], "rejected")
+        self.assertIn("not available for short sale", row["message"])
         self.assertIn("can't short it today", sync.blocked(self.NOW)["HTB"])
 
     def test_daily_loss_limit_flattens_and_halts_for_the_day(self):
@@ -2265,6 +2314,15 @@ class LiveSelectionTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+    def test_live_link_rides_only_the_live_book(self):
+        """One IBKR sync per 5-minute check: the link is handed to the live
+        book's scheduler only, not to every book's."""
+        self.assertIs(app.live_link("5m", self.live), self.live)
+        self.assertIsNone(app.live_link("1h", self.live))
+        self.assertIsNone(app.live_link("15m", self.live))
+        self.assertIsNone(app.live_link("5m", None))
 
 
 class LiveRuleEngineTests(unittest.TestCase):
