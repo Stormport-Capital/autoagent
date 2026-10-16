@@ -1124,6 +1124,31 @@ class EngineTests(unittest.TestCase):
         b = datetime(2026, 9, 21, 15, 55, tzinfo=ET)  # delay 0 in these tests
         self.assertFalse(sched.retry_due(datetime(2026, 9, 21, 16, 2, tzinfo=ET), b))
 
+    def test_retry_is_every_5s_for_a_minute_then_every_3min(self):
+        eng = self.engine([])
+        eng.add_symbols("RTR", "short_only", 1.0, datetime(2026, 9, 21, 9, tzinfo=ET))
+        b = datetime(2026, 9, 21, 10, 0, tzinfo=ET)  # an hourly close; delay 0 in these tests
+        sched = app.Scheduler(eng, type("C", (), {"now": lambda self: b})())
+        sched.last_tick = b
+        self.assertFalse(sched.retry_due(b + timedelta(seconds=4), b))
+        self.assertTrue(sched.retry_due(b + timedelta(seconds=5), b))  # RTR still has no bar
+        sched.last_tick = b + timedelta(seconds=55)
+        self.assertFalse(sched.retry_due(b + timedelta(seconds=65), b))  # fast minute is over
+        self.assertTrue(sched.retry_due(b + timedelta(minutes=3, seconds=55), b))
+
+    def test_pause_lands_within_a_second_of_the_check(self):
+        eng = self.engine([])
+        sched = app.Scheduler(eng, None)
+        d = datetime(2026, 9, 21, tzinfo=ET)
+        self.assertEqual(sched.pause(d.replace(hour=9, minute=40)), 20.0)   # 10:00 is far
+        self.assertEqual(sched.pause(d.replace(hour=9, minute=59, second=57)), 3.0)
+        self.assertEqual(sched.pause(d.replace(hour=9, minute=59, second=59, microsecond=800000)), 1.0)
+        self.assertEqual(sched.pause(d.replace(hour=10, minute=0, second=20)), 5.0)  # fast-retry minute
+        self.assertEqual(sched.pause(d.replace(hour=10, minute=2)), 20.0)
+        self.store.save_settings({"bar_close_delay_min": 0.25})  # 15 s, as the dashboard sets it
+        self.assertEqual(sched.delay(), timedelta(seconds=15))
+        self.assertEqual(sched.pause(d.replace(hour=10, minute=0, second=12)), 3.0)
+
     def test_retry_fetches_only_the_symbols_still_behind(self):
         asked = []
 
