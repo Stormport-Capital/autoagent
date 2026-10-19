@@ -2052,6 +2052,30 @@ class LiveGuardTests(unittest.TestCase):
         self.assertIn("won't trade it today", sync.blocked(self.NOW)["PMI"])
         self.assertIsNone(sync._held_back(self.NOW + timedelta(days=1), "PMI", True))
 
+    def test_a_refused_opening_short_goes_out_once_per_bar_check(self):
+        """2026-10-19: with a symbol's bar late, the scheduler re-checked every
+        5 s for a minute and ran the link each time, so one refused PMI short
+        went out 12 times a minute, 38 times in 25 minutes. A refusal no rule
+        recognises is now tried again only at the next bar's check."""
+        self.add("HTB")
+        self.tranche("HTB", "EMA5_10", "short", 10)
+        sync = self.ibsync(reject={"HTB"}, reject_late=True,
+                           reject_msg="Order rejected - reason:Insufficient buying power.")
+        for s in (0, 5, 11, 55, 180):  # the check, three 5 s re-checks, the 3-min re-check
+            sync.sync(self.NOW + timedelta(seconds=s))
+        self.assertEqual(len(self.ib.placed), 1)
+        self.assertIn("one attempt per bar check", sync.blocked(self.NOW + timedelta(seconds=5))["HTB"])
+        sync.sync(self.NOW + timedelta(minutes=5))  # the next bar's check may try again
+        self.assertEqual(len(self.ib.placed), 2)
+
+    def test_a_refused_cover_is_retried_at_once(self):
+        self.add("HTB")  # model flat, account short one: a cover is wanted
+        sync = self.ibsync(pos={"HTB": -1}, reject={"HTB"},
+                           reject_msg="Order rejected - reason:Insufficient buying power.")
+        sync.sync(self.NOW)
+        sync.sync(self.NOW + timedelta(seconds=5))
+        self.assertEqual([o.action for _, o in self.ib.placed], ["BUY", "BUY"])
+
     def test_daily_loss_limit_flattens_and_halts_for_the_day(self):
         self.add("AAA"); self.add("BBB")
         self.tranche("AAA", "EMA5_10", "short", 100)

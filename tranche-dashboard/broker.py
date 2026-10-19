@@ -121,6 +121,12 @@ NO_SHORT = re.compile(r"cannot be sold short|not shortable|not easy to borrow|no
 NO_TRADE = re.compile(r"not found|not tradable|not active|closing-only|no trading permission", re.I)
 HALTED = re.compile(r"halt", re.I)
 HALT_PAUSE = timedelta(minutes=10)
+# An opening short the broker refused for any other reason is tried once per bar
+# check, not on every re-check: when a symbol's bar is late the scheduler re-checks
+# every 5 s for a minute and runs the link each time, which on 2026-10-19 re-sent
+# one refused PMI short 12 times a minute (38 in 25 minutes). Just under the 5-min
+# book's bar, so the next bar's check may try again.
+REJECT_PAUSE = timedelta(minutes=4)
 
 
 KILL_MODES = ("pause", "flatten")
@@ -381,6 +387,10 @@ class BrokerSync:
                 return f"{self.venue} won't trade it today ({msg[:80]})"
             if opens_short and r["side"] == "sell" and NO_SHORT.search(msg):
                 return f"{self.venue} can't short it today ({msg[:80]})"
+            if opens_short and r["side"] == "sell" and now - when < REJECT_PAUSE:
+                return (f"{self.venue} refused the short at {when.astimezone(ET):%H:%M:%S} "
+                        f"({msg[:60]}); one attempt per bar check - next after "
+                        f"{(when + REJECT_PAUSE).astimezone(ET):%H:%M}")
         return None
 
     def _log_skip(self, now: datetime, sym: str | None, why: str) -> None:
