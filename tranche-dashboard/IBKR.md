@@ -134,7 +134,12 @@ below), and equal is neither above nor below.
     refusal is recorded with IBKR's reason. The same holds for a product IBKR
     will not open at all ("closing-only status", "No Trading Permission" -
     PMI on 2026-10-19; borrow read easy, the order itself was refused).
-    Covers are never blocked.
+  - Any other refusal of an opening short is not re-sent within the same bar.
+    When a symbol's bar is late the scheduler re-checks every 5 s for a
+    minute and runs the link each time; before this rule that re-sent one
+    refused PMI short 12 times a minute. One attempt per bar check; the next
+    bar's check may try again.
+  - Covers are never blocked or paused.
 - **Order limits enforced inside the IBKR adapter.** These are independent of
   the rest of the app:
   - No order may take a symbol past the share cap.

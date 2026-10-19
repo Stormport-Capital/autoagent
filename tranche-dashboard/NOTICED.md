@@ -64,10 +64,12 @@ Added with the weekly cold restart:
 Added after the first live refusals (2026-10-16, XLAB):
 
 15. **Only some refusals hold a short back for the day.** `_held_back`
-    (broker.py) recognises a halt, "not tradable" and the not-shortable
-    wordings. A short IBKR refuses for any other reason (its $2,000 minimum,
-    a margin check) is re-sent at every 5-minute check that day. Holding back
-    any opening short refused that day would stop it; not built.
+    (broker.py) recognises a halt, "not tradable", "closing-only" / "no
+    trading permission" and the not-shortable wordings. A short IBKR refuses
+    for any other reason (its $2,000 minimum, a margin check) is re-sent at
+    the next 5-minute check that day - once per check since 2026-10-19, no
+    longer on every 5 s re-check within it. Holding back any opening short
+    refused that day would stop it; not built.
 16. **Unknown: why the borrow pre-check did not stop XLAB.** The tick-236
     check ran before each XLAB order and let it through; IBKR then refused
     every order with "The contract is not available for short sale". Either
@@ -89,3 +91,18 @@ Added after the first live refusals (2026-10-16, XLAB):
     what the PMI 12:00 bar read at 12:02 cannot be shown, only inferred (the
     code is deterministic and the 12:07 replay of the same bars entered). A
     per-check record of the last few bars as read would settle such cases.
+    Confirmed on the next bar the same day: the 12:00-12:05 bar read C14.30
+    at 12:07 and C14.42 an hour later (Finviz Elite: 14.42). FMP's volume on
+    the same bars also exceeds Finviz's (1,626 vs 1,120; 620 vs 364; 832 vs
+    316), so FMP counts prints Finviz does not; 23 of 31 closes that morning
+    differed by 1-14 cents, while the EMA math itself matched Finviz to the
+    cent wherever the closes agreed.
+19. **A symbol whose bar is late or absent keeps the retry loop busy.**
+    `Engine.behind` counts a symbol as behind until its `last_bar_end`
+    reaches the checked bar. When the feed has no such bar yet (a thin name
+    with no trade in the window, or a slow print) the scheduler re-checks
+    every 5 s for a minute and then every 3 min for the rest of the bar, one
+    FMP request per symbol each time, and ran the broker link on every
+    re-check. That turned one refused PMI order into 38 on 2026-10-19 (now
+    one attempt per check). Treating a bar still missing after `STALE_WAIT`
+    as not behind would end the loop sooner; not built.
