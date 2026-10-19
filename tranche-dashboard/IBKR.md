@@ -29,6 +29,17 @@ below), and equal is neither above nor below.
    the last earlier bar on which they differed had the 5 above. This includes
    the 9:30-9:35 and 9:35-9:40 bars.
    - **Stop:** the day's high at that moment, entry bar included.
+   - **Judged against the recorded side.** Each bar is checked once, and the
+     side the 5 is on at that check is recorded (`symbols.live_side`). A
+     cross is a change against that record, not against the day's history as
+     the feed serves it later. The feed can change a bar after its check: on
+     2026-10-19 the PMI 11:55-12:00 bar showed no cross at the 12:02 check
+     and read EMA5 14.599 < EMA10 14.610 five minutes later, and nothing was
+     entered. Now the next bar that reads on the other side is the cross,
+     taken at its close, one bar late, and the log says so ("seen one bar
+     late"). Equal at the tick records nothing. A fresh Live mark (or a
+     portfolio reset) clears the record, and the first bar judged after it
+     uses the bars alone.
 2. **`state_0945`:** on the 9:40-9:45 bar's close, if the 5 EMA is below the
    10 EMA (no cross needed), **only if no entry has been taken that day**.
    - **Stop:** the opening-range high, meaning the highest high of the
@@ -88,7 +99,10 @@ below), and equal is neither above nor below.
   settings, in seconds); set it just above the data feed's lag in publishing
   a finished bar. The scheduler wakes within a second of that time, and if
   the bar is not there yet it retries every 5 s for a minute. IBKR's fill of
-  the 1-share marketable limit then takes a second or two.
+  the 1-share marketable limit then takes a second or two. The shorter the
+  delay, the less settled the bar the check reads; a cross that only shows
+  once the feed has finished the bar is taken at the next bar's close (see
+  "Judged against the recorded side" above), not lost.
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.
@@ -117,7 +131,10 @@ below), and equal is neither above nor below.
   - If IBKR sends no short data, the order goes out and IBKR's own locate check
     accepts or rejects it.
   - A short IBKR refuses as not shortable is not re-sent that day; the
-    refusal is recorded with IBKR's reason. Covers are never blocked.
+    refusal is recorded with IBKR's reason. The same holds for a product IBKR
+    will not open at all ("closing-only status", "No Trading Permission" -
+    PMI on 2026-10-19; borrow read easy, the order itself was refused).
+    Covers are never blocked.
 - **Order limits enforced inside the IBKR adapter.** These are independent of
   the rest of the app:
   - No order may take a symbol past the share cap.

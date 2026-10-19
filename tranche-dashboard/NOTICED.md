@@ -75,3 +75,17 @@ Added after the first live refusals (2026-10-16, XLAB):
     shares its order-time check did not honour. The adapter does not record
     the borrow reading it acted on; logging it with each short would settle
     this.
+17. **Only the live 5/10 tranche judges crosses against its recorded side.**
+    The 2026-10-19 PMI miss (a cross that only showed once the feed had
+    finished the bar) is fixed for `Engine._live_510` only. The paper books'
+    10/20 tranche, the 5/10 tranche of non-live symbols and the VWAP-fail
+    trigger still judge each bar once from the bars as served at that moment,
+    so the same feed behaviour can still lose one of their signals. Extending
+    the record to them changes the model's results; not done without a
+    decision.
+18. **The feed's bars are not recorded as judged.** The engine keeps only the
+    EMA side it judged (`symbols.live_side`), not the close and EMAs the bar
+    had at the check, and the snapshot is overwritten at the next check. So
+    what the PMI 12:00 bar read at 12:02 cannot be shown, only inferred (the
+    code is deterministic and the 12:07 replay of the same bars entered). A
+    per-check record of the last few bars as read would settle such cases.

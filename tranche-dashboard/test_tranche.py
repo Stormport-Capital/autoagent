@@ -14,7 +14,7 @@ import review
 from app import bar_for_boundary, boundaries
 from engine import LIVE_SLEEVES, Engine, ValidationError, _dt, vwap_fail
 from indicators import (ET, Bar, atr, bar_bucket, cross_adverse_moves, crossed_below,
-                        ema, ema_cross, percentile,
+                        ema, ema_cross, ema_side, percentile,
                         price_tick, resample,
                         resample_hourly, session_bar_ends, session_hour_ends,
                         session_vwap)
@@ -1702,10 +1702,14 @@ class FakeIB:
     IB Gateway was seen to: status Inactive first, the reason only via
     errorEvent a moment later, and nothing in the trade log."""
 
+    NOT_SHORTABLE = "Order rejected - reason:The contract is not available for short sale."
+
     def __init__(self, accounts=("DU123",), pos=None, netliq=27000.0, hold=False, reject=(),
-                 shortable=3.0, shortable_shares=50000.0, bid=4.0, ask=4.02, reject_late=False):
+                 shortable=3.0, shortable_shares=50000.0, bid=4.0, ask=4.02, reject_late=False,
+                 reject_msg=NOT_SHORTABLE):
         self.accounts, self.pos, self.netliq = list(accounts), dict(pos or {}), netliq
         self.hold, self.reject, self.reject_late = hold, set(reject), reject_late
+        self.reject_msg = reject_msg
         self.errorEvent = FakeEvent()
         self.connected, self.connects, self.placed, self._trades = False, 0, [], []
         self.q = dict(shortable=shortable, shortableShares=shortable_shares, bid=bid, ask=ask)
@@ -1759,7 +1763,7 @@ class FakeIB:
                orderStatus=NS(status="Submitted", filled=0, avgFillPrice=0.0))
         self._trades.append(t)
         if c.symbol in self.reject:
-            msg = "Order rejected - reason:The contract is not available for short sale."
+            msg = self.reject_msg
             if self.reject_late:
                 t.orderStatus.status = "Inactive"
                 import threading
@@ -2031,6 +2035,22 @@ class LiveGuardTests(unittest.TestCase):
         self.assertEqual(row["status"], "rejected")
         self.assertIn("not available for short sale", row["message"])
         self.assertIn("can't short it today", sync.blocked(self.NOW)["HTB"])
+
+    def test_closing_only_refusal_holds_the_symbol_back_for_the_day(self):
+        """PMI, 2026-10-19: IBKR's risk desk had the product in closing-only
+        status. Borrow read easy, so only the order itself was refused."""
+        self.add("PMI")
+        self.tranche("PMI", "EMA5_10", "short", 10)
+        msg = ("Order rejected - reason:No Trading Permission, Customer Ineligible; Ineligibility "
+               "reasons:<br>Margin concern/risk management: For risk management purposes, this "
+               "product is in closing-only status. You may <br>close existing positions but not "
+               "open new ones.")
+        sync = self.ibsync(reject={"PMI"}, reject_late=True, reject_msg=msg)
+        for m in (0, 5, 10):
+            sync.sync(self.NOW + timedelta(minutes=m))
+        self.assertEqual(len(self.ib.placed), 1)  # refused once, then held back for the day
+        self.assertIn("won't trade it today", sync.blocked(self.NOW)["PMI"])
+        self.assertIsNone(sync._held_back(self.NOW + timedelta(days=1), "PMI", True))
 
     def test_daily_loss_limit_flattens_and_halts_for_the_day(self):
         self.add("AAA"); self.add("BBB")
@@ -2439,7 +2459,8 @@ class LiveRuleEngineTests(unittest.TestCase):
         rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
         self.assertEqual([r["trigger"] for r in rows], ["cross"])
         e5[5], e5[6] = 9.6, 9.4                           # up at 10:00, fresh down-cross at 10:05
-        self.step(eng, bars, 6, e5, e10)                  # the day's second (last) entry
+        for i in (3, 4, 5, 6):                            # every bar is judged, as in production
+            self.step(eng, bars, i, e5, e10)              # 10:05: the day's second (last) entry
         rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
         self.assertEqual([r["trigger"] for r in rows], ["cross", "cross"])
 
@@ -2451,10 +2472,12 @@ class LiveRuleEngineTests(unittest.TestCase):
         self.step(eng, bars, 2, e5, e10)                             # 9:45 state entry
         self.store.x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.4, "
                      "exit_reason='stop: test', gross_pnl=-1", (bars[3].end.isoformat(),))
+        self.step(eng, bars, 3, e5, e10)                             # 9:50 up: nothing open
         self.step(eng, bars, 4, e5, e10)                             # second: a fresh cross
         self.store.x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.4, "
                      "exit_reason='stop: test', gross_pnl=-1 WHERE status='open'",
                      (bars[5].end.isoformat(),))
+        self.step(eng, bars, 5, e5, e10)                             # 10:00 up: nothing open
         self.step(eng, bars, 6, e5, e10)                             # third: refused
         rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
         self.assertEqual([r["trigger"] for r in rows], ["state_0945", "cross"])
@@ -2469,6 +2492,64 @@ class LiveRuleEngineTests(unittest.TestCase):
         t = self.store.q("SELECT * FROM tranches")
         self.assertEqual(len(t), 1)
         self.assertTrue(t[0]["exit_reason"].startswith("5/10 EMA crossed up"))
+
+    # ---- crosses judged against the recorded side (PMI, 2026-10-19)
+    def test_cross_that_shows_only_after_the_bar_was_checked_is_taken_on_the_next_bar(self):
+        """At the 12:02 check the PMI 11:55-12:00 bar read 5 above 10; by 12:07
+        the feed's version of that bar read 14.599 < 14.610. The 12:05 bar's own
+        data shows no cross (the revised 12:00 bar is already below), so judging
+        each bar once from the bars alone loses the entry."""
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e10 = [9.5] * 7
+        self.step(eng, bars, 3, [9.6] * 7, e10)                 # 9:50 as checked: 5 above 10
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
+        self.assertEqual(self.sym()["live_side"], 1)
+        revised = [9.6, 9.6, 9.6, 9.4, 9.4, 9.4, 9.4]           # 9:50 now reads below, 9:55 below
+        self.assertEqual(ema_cross(revised, e10, 4, 0.01), 0)  # the 9:55 bar alone: no cross
+        self.step(eng, bars, 4, revised, e10)
+        t = self.store.q("SELECT * FROM tranches")
+        self.assertEqual(len(t), 1)
+        self.assertEqual((t[0]["side"], t[0]["trigger"], _dt(t[0]["entry_time"])),
+                         ("short", "cross", bars[4].end))
+        self.assertEqual(t[0]["stop_price"], 10.3)              # day's high at entry
+        self.assertEqual(self.sym()["live_side"], -1)
+        msg = self.store.q("SELECT message FROM events WHERE kind='entry'")[0]["message"]
+        self.assertIn("seen one bar late", msg)
+        self.step(eng, bars, 5, revised, e10)                   # still below: no second entry
+        self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)
+
+    def test_up_cross_that_shows_late_still_covers(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e10 = [9.5] * 7
+        self.step(eng, bars, 3, [9.6, 9.6, 9.6, 9.4, 9.4, 9.4, 9.4], e10)   # 9:50 down-cross
+        self.assertEqual(len(self.store.q("SELECT 1 FROM tranches WHERE status='open'")), 1)
+        revised = [9.6] * 7                                     # 9:50 now reads above; 9:55 above
+        self.assertEqual(ema_cross(revised, e10, 4, 0.01), 0)
+        self.step(eng, bars, 4, revised, e10)
+        t = self.store.q("SELECT * FROM tranches")[0]
+        self.assertEqual(t["status"], "closed")
+        self.assertIn("crossed up", t["exit_reason"])
+        self.assertIn("seen one bar late", t["exit_reason"])
+        self.assertEqual(self.sym()["live_side"], 1)
+
+    def test_equal_at_the_tick_records_nothing_and_a_fresh_live_mark_forgets_the_side(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()
+        e10 = [9.5] * 7
+        self.step(eng, bars, 3, [9.6] * 7, e10)                 # recorded: 5 above
+        self.step(eng, bars, 4, [9.6, 9.6, 9.6, 9.6, 9.504, 9.6, 9.6], e10)  # equal at the cent
+        self.assertEqual(self.sym()["live_side"], 1)            # not recorded as a side
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
+        eng.set_live(1, [], bars[4].end)
+        eng.set_live(1, ["EMA5_10"], bars[4].end)
+        self.assertIsNone(self.sym()["live_side"])
+        self.step(eng, bars, 5, [9.4] * 7, e10)                 # below all along on the bars
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))  # no cross invented from a stale record
+        self.assertEqual(self.sym()["live_side"], -1)
+        eng.reset(bars[5].end)
+        self.assertIsNone(self.sym()["live_side"])
 
     def test_non_live_symbol_keeps_cross_entries_before_0945_and_no_stop(self):
         bars = self.five(self.BARS)
@@ -2562,6 +2643,109 @@ class LiveRuleEngineTests(unittest.TestCase):
         eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(self.D, 15, 50), self.D, "c"),
                    self.UNIT, s, "x", fixed_stop=10.5)
         self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)  # 15:50 is fine
+
+
+class RevisingProvider:
+    """A feed whose bars change: `before` is what it serves until `switch`,
+    `after` from then on (both filtered to bars closed by `now`)."""
+    name = "revising"
+
+    def __init__(self, before, after, switch):
+        self.before, self.after, self.switch = before, after, switch
+
+    def five_min_bars(self, symbol, now):
+        src = self.before if now < self.switch else self.after
+        return [b for b in src if b.end <= now]
+
+    def session_open(self, symbol, day, now):
+        return None
+
+
+class RevisedBarTests(unittest.TestCase):
+    """The 2026-10-19 PMI miss end to end through Engine.tick, with the closes
+    the feed served that day. PMI was added at 11:54:51 and marked Live at
+    11:55:12, check delay 2 minutes. At the 12:02 check the 11:55-12:00 bar
+    read with the 5 EMA still above the 10; at 12:07 the feed's version of the
+    same bar closed 14.43 and read EMA5 14.599 < EMA10 14.610. No tranche, no
+    skip event, nothing: the bar had been judged once."""
+    D = date(2026, 10, 19)
+    TODAY = [(t, c) for t, c in (
+        ("09:35", 13.72), ("09:40", 12.89), ("09:45", 12.64), ("09:50", 13.09), ("09:55", 13.03),
+        ("10:00", 13.27), ("10:05", 13.36), ("10:10", 13.51), ("10:15", 13.80), ("10:20", 13.98),
+        ("10:25", 13.79), ("10:30", 14.23), ("10:35", 13.90), ("10:40", 14.09), ("10:45", 14.68),
+        ("10:50", 15.20), ("10:55", 15.40), ("11:00", 13.90), ("11:05", 14.56), ("11:10", 14.43),
+        ("11:15", 14.41), ("11:20", 14.34), ("11:25", 14.60), ("11:30", 14.57), ("11:35", 14.97),
+        ("11:40", 15.09), ("11:45", 15.06), ("11:50", 14.71), ("11:55", 14.39), ("12:00", 14.43),
+        ("12:05", 14.30))]
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = Store(self.path)
+        self.store.save_settings({"bar_close_delay_min": 2})
+
+    def tearDown(self):
+        self.store.db.close()
+        os.remove(self.path)
+
+    @staticmethod
+    def bar(day, end_hhmm, close, prev):
+        h, m = map(int, end_hhmm.split(":"))
+        end = datetime.combine(day, time(h, m), tzinfo=ET)
+        o = prev if prev is not None else close
+        return Bar(end - FIVE, end, o, max(o, close) + 0.05, min(o, close) - 0.05, close, 50000.0)
+
+    def bars(self, noon_close):
+        """Three quiet prior sessions (so EMA20/ATR exist), then the day's bars
+        with the 11:55-12:00 close as given."""
+        out, prev = [], 12.5
+        for d in (date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 16)):
+            t = datetime.combine(d, time(9, 30), tzinfo=ET)
+            while t < datetime.combine(d, time(16, 0), tzinfo=ET):
+                e = t + FIVE
+                c = round(prev + (0.03 if (e.minute // 5) % 3 else -0.02), 2)
+                out.append(self.bar(d, e.strftime("%H:%M"), c, prev))
+                prev, t = c, e
+        for hhmm, c in self.TODAY:
+            c = noon_close if hhmm == "12:00" else c
+            out.append(self.bar(self.D, hhmm, c, prev))
+            prev = c
+        return out
+
+    def at(self, hh, mm, ss=0, us=0):
+        return datetime.combine(self.D, time(hh, mm, ss, us), tzinfo=ET)
+
+    def test_pmi_2026_10_19_the_cross_the_feed_showed_late_is_taken_on_the_next_bar(self):
+        as_checked, as_revised = self.bars(14.60), self.bars(14.43)
+        # the premise, on the bars themselves
+        today = [b for b in as_revised if b.session == self.D]
+        k = next(i for i, b in enumerate(as_revised) if b.end == self.at(12, 0))
+        side = lambda bars, i: ema_side(ema([b.close for b in bars], 5), ema([b.close for b in bars], 10), i, 0.01)
+        cross = lambda bars, i: ema_cross(ema([b.close for b in bars], 5), ema([b.close for b in bars], 10), i, 0.01)
+        self.assertGreaterEqual(side(as_checked, k), 0)      # at 12:02: 5 not below 10
+        self.assertEqual(cross(as_revised, k), -1)           # at 12:07: the 12:00 bar is a down-cross
+        self.assertEqual(cross(as_revised, k + 1), 0)        # ... and the 12:05 bar alone shows none
+        self.assertEqual(len(today), 31)
+
+        eng = Engine(self.store, RevisingProvider(as_checked, as_revised, self.at(12, 4)), minutes=5)
+        added = self.at(11, 54, 51, 467982)
+        eng.add_symbols("PMI", "short_only", 1.5, added, grade="B")
+        eng.tick(added)                                      # the add handler's immediate check
+        eng.set_live(1, ["EMA5_10"], self.at(11, 55, 12))
+        eng.tick(self.at(11, 57, 0, 300000))
+        eng.tick(self.at(12, 2, 0, 300000))
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches"))  # 12:02: no cross to act on
+        self.assertEqual(self.store.q("SELECT live_side FROM symbols")[0]["live_side"], 1)
+        eng.tick(self.at(12, 7, 0, 300000))
+        t = self.store.q("SELECT * FROM tranches")
+        self.assertEqual(len(t), 1)
+        self.assertEqual((t[0]["side"], t[0]["trigger"], _dt(t[0]["entry_time"])),
+                         ("short", "cross", self.at(12, 5)))
+        self.assertAlmostEqual(t[0]["entry_price"], 14.30 * (1 - 5 / 1e4))
+        self.assertEqual(t[0]["stop_price"], max(b.high for b in today[:31]))  # day's high at entry
+        msg = self.store.q("SELECT message FROM events WHERE kind='entry'")[0]["message"]
+        self.assertIn("seen one bar late", msg)
+        self.assertFalse(self.store.q("SELECT 1 FROM events WHERE kind='error'"))
 
 
 if __name__ == "__main__":
