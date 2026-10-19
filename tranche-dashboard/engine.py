@@ -287,7 +287,9 @@ class Engine:
         sleeves = [s for s in SLEEVE_LABELS if s in asked]
         if sleeves and sym["status"] == "removed":
             raise ValidationError(f"{sym['symbol']} was removed")
-        self.store.x("UPDATE symbols SET live=? WHERE id=?", (",".join(sleeves) or None, symbol_id))
+        # a fresh mark forgets the recorded EMA side: the first bar judged uses the bars alone
+        self.store.x("UPDATE symbols SET live=?, live_side=NULL WHERE id=?",
+                     (",".join(sleeves) or None, symbol_id))
         self.store.log(now, "live", f"{sym['symbol']}: IBKR follows " + (
             " + ".join(SLEEVE_LABELS[s] for s in sleeves) if sleeves else "nothing (live off)"),
             sym["symbol"])
@@ -367,7 +369,7 @@ class Engine:
         """Wipe trades and history; keep symbols, which restart from `now`."""
         with self.store.lock:
             self.store.reset_portfolio()
-            self.store.x("UPDATE symbols SET added_at=? WHERE status!='removed'",
+            self.store.x("UPDATE symbols SET added_at=?, live_side=NULL WHERE status!='removed'",
                          (now.isoformat(),))
             self.store.log(now, "reset", "portfolio reset")
 
@@ -648,6 +650,28 @@ class Engine:
                 return True
         return False
 
+    def _live_cross(self, sym: dict, e5: list, e10: list, i: int, tick: float) -> tuple[int, bool]:
+        """The live 5/10 cross on bar i (-1 down, +1 up, 0 none) and whether it
+        is seen late. The side the 5 EMA is on (above or below the 10, at the
+        price tick) is RECORDED in symbols.live_side as each bar is judged, and
+        a cross is a change against that record - not against today's
+        recomputed history, which the feed can change after a bar was checked.
+        On 2026-10-19 the PMI 11:55-12:00 bar showed no cross when the 5-min
+        book checked it at 12:02; at 12:07 the feed's version of the same bar
+        read EMA5 14.599 < EMA10 14.610, a cross never acted on, because a bar
+        is judged once. Against the record, the next bar that reads on the
+        other side is the cross, one bar late; `late` says so for the log (the
+        bar's own data then shows no cross). Equal at the tick records nothing,
+        as in ema_cross. The first bar judged after a Live mark has no record
+        and uses the bars alone."""
+        now, on_bars = ema_side(e5, e10, i, tick), ema_cross(e5, e10, i, tick)
+        prev = sym.get("live_side")
+        c = on_bars if prev is None else (now if now and now != prev else 0)
+        if now and now != prev:
+            sym["live_side"] = now
+            self.store.x("UPDATE symbols SET live_side=? WHERE id=?", (now, sym["id"]))
+        return c, bool(c) and not on_bars
+
     def _live_510(self, sym, t, f: "Fill", bars: list[Bar], five: list[Bar], i: int,
                   e5: list, e10: list, s, ctx: str, unit) -> None:
         """The 5/10 tranche of a Live symbol. Exits are as usual (opposite cross).
@@ -657,11 +681,17 @@ class Engine:
           * state_0945: on the bar ending 9:45, only if no entry has been taken
             that day, if the 5 EMA is below the 10 EMA (no cross needed);
             stop = the opening-range high (9:30-9:45 bars).
-        Stops are fixed at entry."""
+        Stops are fixed at entry. Crosses are judged against the side recorded
+        at the bars already checked (_live_cross), so a bar the feed changes
+        after its check cannot swallow a signal: it is taken one bar late."""
         b, name = bars[i], sym["symbol"]
         tick = price_tick(b.close)
-        c1 = ema_cross(e5, e10, i, tick)
+        c1, late = self._live_cross(sym, e5, e10, i, tick)
         label = f"5/10 EMA crossed %s {ctx}"
+        if late:
+            label = ("5/10 EMA crossed %s - seen one bar late: when the earlier bar was checked "
+                     f"it showed no cross, and the feed's bars have changed since; acting at this "
+                     f"close {ctx}")
         if c1 > 0:  # up: cover a short; long only in the model, never live
             if t is not None and t["side"] == "short":
                 self._close(t, f.price, f.when, label % "up", s)

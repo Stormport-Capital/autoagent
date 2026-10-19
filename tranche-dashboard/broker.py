@@ -116,7 +116,9 @@ class AlpacaPaper:
 
 NO_SHORT = re.compile(r"cannot be sold short|not shortable|not easy to borrow|no shares available|"
                       r"not available for short|no shares to borrow", re.I)
-NO_TRADE = re.compile(r"not found|not tradable|not active", re.I)
+# "closing-only" / "No Trading Permission": IBKR's risk desk lets positions in the
+# product be closed but not opened (PMI, 2026-10-19) - no point re-sending that day
+NO_TRADE = re.compile(r"not found|not tradable|not active|closing-only|no trading permission", re.I)
 HALTED = re.compile(r"halt", re.I)
 HALT_PAUSE = timedelta(minutes=10)
 
