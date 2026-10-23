@@ -306,9 +306,19 @@ class FmpTests(unittest.TestCase):
         self.assertEqual((fake.calls[-1][1]["from"], fake.calls[-1][1]["to"]),
                          ("2026-09-24", "2026-09-28"))
 
+    @staticmethod
+    def rows_until(last_start):
+        """5-minute rows from 9:30 up to and including the bar starting last_start."""
+        out, t = [], datetime(2026, 9, 24, 9, 30)
+        while t.strftime("%H:%M") <= last_start:
+            out.append({"date": t.strftime("%Y-%m-%d %H:%M:%S"), "open": 10, "high": 10.5,
+                        "low": 9.9, "close": 10.2, "volume": 1000})
+            t += timedelta(minutes=5)
+        return out
+
     def test_books_share_one_fetch_per_5_minute_window(self):
         from data import CachedProvider
-        fake = FakeFmp(self.ROWS)
+        fake = FakeFmp(self.rows_until("09:55"))   # through the bar ending 10:00
         prov = CachedProvider(self.provider(fake))
         prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 2, 50, tzinfo=ET))
         n = len(fake.calls)
@@ -316,6 +326,43 @@ class FmpTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), n)
         prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 5, 1, tzinfo=ET))   # new window
         self.assertEqual(len(fake.calls), n + 1)
+
+    def test_a_fetch_missing_the_newest_bar_is_never_reused(self):
+        """2026-10-19: a bar published 2 s after a check's first fetch was hidden
+        from every 5-second retry for 60 s, so it was first seen about 70 s
+        after the close. A fetch without the newest bar is now fetched again."""
+        from data import CachedProvider
+        fake = FakeFmp(self.rows_until("09:50"))   # FMP hasn't published 9:55-10:00 yet
+        prov = CachedProvider(self.provider(fake))
+        t0 = datetime(2026, 9, 24, 10, 0, 10, tzinfo=ET)
+        self.assertEqual(prov.five_min_bars("AIXC", t0)[-1].end.strftime("%H:%M"), "09:55")
+        n = len(fake.calls)
+        fake.rows = self.rows_until("09:55")          # published 2 s later
+        bars = prov.five_min_bars("AIXC", t0 + timedelta(seconds=5))   # the first retry
+        self.assertEqual(len(fake.calls), n + 1)
+        self.assertEqual(bars[-1].end.strftime("%H:%M"), "10:00")
+        prov.five_min_bars("AIXC", t0 + timedelta(seconds=10))          # now complete: shared
+        self.assertEqual(len(fake.calls), n + 1)
+
+    def test_outside_regular_hours_the_cache_is_shared(self):
+        from data import CachedProvider
+        fake = FakeFmp(self.rows_until("09:55"))
+        prov = CachedProvider(self.provider(fake))
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 16, 20, tzinfo=ET))
+        n = len(fake.calls)
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 16, 21, tzinfo=ET))   # no bar can close now
+        self.assertEqual(len(fake.calls), n)
+
+    def test_every_real_fetch_reports_its_bars_with_the_time_seen(self):
+        from data import CachedProvider
+        seen = []
+        prov = CachedProvider(self.provider(FakeFmp(self.rows_until("09:55"))),
+                              on_bars=lambda sym, bars, at: seen.append((sym, bars[-1].end, at)))
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 2, tzinfo=ET))
+        prov.five_min_bars("AIXC", datetime(2026, 9, 24, 10, 3, tzinfo=ET))   # reused: not reported
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1].strftime("%H:%M"), "10:00")
+        self.assertIsNotNone(seen[0][2].tzinfo)
 
     def test_session_open_is_the_930_minute(self):
         rows = [{"date": "2026-09-24 09:29:00", "open": 9.0, "high": 9, "low": 9, "close": 9, "volume": 1},
@@ -1715,6 +1762,7 @@ class FakeIB:
         self.q = dict(shortable=shortable, shortableShares=shortable_shares, bid=bid, ask=ask)
         self.daily = float("nan")
         self.mdtype = None
+        self.mkt_reqs, self.mkt_cancels = [], []  # market-data requests opened / closed
 
     def isConnected(self):
         return self.connected
@@ -1750,10 +1798,12 @@ class FakeIB:
 
     def reqMktData(self, c, ticks, snapshot, regulatory):
         nan = float("nan")
+        self.mkt_reqs.append(c.symbol)
         return NS(bid=self.q["bid"], ask=self.q["ask"], last=nan, close=nan,
                   shortable=self.q["shortable"], shortableShares=self.q["shortableShares"])
 
     def cancelMktData(self, c):
+        self.mkt_cancels.append(c.symbol)
         return True
 
     def placeOrder(self, c, order):
@@ -2770,6 +2820,268 @@ class RevisedBarTests(unittest.TestCase):
         msg = self.store.q("SELECT message FROM events WHERE kind='entry'")[0]["message"]
         self.assertIn("seen one bar late", msg)
         self.assertFalse(self.store.q("SELECT 1 FROM events WHERE kind='error'"))
+
+
+class FastPipelineTests(unittest.TestCase):
+    """Phase 1 of PLAN_TIMEFRAMES.md: Live symbols first, the IBKR sync before
+    the paper sync, streaming quotes, and a timing record of every check and
+    order."""
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
+        for st in self.stores.values():
+            st.save_settings({"bar_close_delay_min": 0})
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    @staticmethod
+    def bars_until(end):
+        """Two quiet sessions of 5-minute bars, then today's through `end`."""
+        out, prev = [], 10.0
+        for d in (date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 21)):
+            t = datetime.combine(d, time(9, 30), tzinfo=ET)
+            stop = end if d == end.date() else datetime.combine(d, time(16), tzinfo=ET)
+            while t + FIVE <= stop:
+                c = round(prev + (0.02 if (t.minute // 5) % 3 else -0.03), 2)
+                out.append(Bar(t, t + FIVE, prev, max(prev, c) + 0.01, min(prev, c) - 0.01, c, 1000.0))
+                prev, t = c, t + FIVE
+        return out
+
+    def ibkr_link(self, book="5m"):
+        self.ib = FakeIB()
+        self.b = ibkr.IBKRBroker(ib_cfg(), ib=self.ib, api=FakeApi)
+        labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
+        return LiveSync(self.stores["live"], self.b, {k: (labels[k], self.stores[k]) for k in labels},
+                        live_book=book, sleeves=LIVE_SLEEVES, fill_wait_s=0, max_shares=1,
+                        daily_loss_limit=100)
+
+    # ---- the order of work in a check
+    def test_live_symbols_are_fetched_processed_and_synced_before_the_rest(self):
+        seen = []
+
+        class Recording(ScriptedProvider):
+            def five_min_bars(s, symbol, now):
+                seen.append(symbol)
+                return super().five_min_bars(symbol, now)
+        st = self.stores["5m"]
+        eng = Engine(st, Recording(self.bars_until(self.NOW)), 5)
+        eng.add_symbols("AAA BBB CCC", "short_only", 1.0, self.NOW - timedelta(days=5))
+        eng.set_live(st.q("SELECT id FROM symbols WHERE symbol='BBB'")[0]["id"], ["EMA5_10"], self.NOW)
+        at_sync, marks = {}, []
+
+        def after_live():
+            at_sync["fetched"] = sorted(seen)
+            at_sync["done"] = {r["symbol"]: r["last_bar_end"] for r in st.q("SELECT * FROM symbols")}
+        got = eng.tick(self.NOW, after_live=after_live, mark=marks.append)
+        self.assertEqual(at_sync["fetched"], ["BBB"])           # only the Live symbol so far
+        self.assertIsNotNone(at_sync["done"]["BBB"])            # ...and it was processed
+        self.assertIsNone(at_sync["done"]["AAA"])
+        self.assertEqual(sorted(seen), ["AAA", "BBB", "CCC"])   # one fetch per symbol in all
+        self.assertEqual(marks, ["data"])
+        self.assertEqual(got, {"symbols": 3, "live": 1})
+        self.assertTrue(all(r["last_bar_end"] for r in st.q("SELECT * FROM symbols")))
+
+    def test_a_failed_fetch_is_reported_on_its_symbol_only(self):
+        class Flaky(ScriptedProvider):
+            def five_min_bars(s, symbol, now):
+                if symbol == "BAD":
+                    raise RuntimeError("feed down for BAD")
+                return super().five_min_bars(symbol, now)
+        st = self.stores["5m"]
+        eng = Engine(st, Flaky(self.bars_until(self.NOW)), 5)
+        eng.add_symbols("BAD GOOD", "short_only", 1.0, self.NOW - timedelta(days=5))
+        eng.tick(self.NOW)
+        rows = {r["symbol"]: r for r in st.q("SELECT * FROM symbols")}
+        self.assertIn("feed down", rows["BAD"]["error"])
+        self.assertIsNotNone(rows["GOOD"]["last_bar_end"])
+
+    def test_the_ibkr_sync_runs_before_the_paper_sync_which_runs_off_the_check(self):
+        order = []
+        st = self.stores["5m"]
+        st.save_settings({"broker_sync_enabled": True})
+        eng = Engine(st, ScriptedProvider(self.bars_until(self.NOW)), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW - timedelta(days=5))
+
+        class Link:
+            last_error = None
+
+            def enabled(s):
+                return True
+
+            def sync(s, now, bar_end=None):
+                order.append(("ibkr", bar_end))
+
+        class Paper:
+            needs_followup, last_sync, last_error = False, None, None
+
+            def sync(s, now, bar_end=None):
+                order.append(("paper", bar_end))
+        clock = type("C", (), {"demo": False, "now": lambda s: self.NOW})()
+        sched = app.Scheduler(eng, clock, Paper(), Link())
+        bar = (self.NOW.replace(minute=30, second=0), self.NOW.replace(minute=30, second=0))
+        sched.run_tick(check=bar)
+        sched._paper_job.join(5)
+        self.assertEqual(order, [("ibkr", bar[1]), ("paper", None)])
+
+    # ---- the timing record
+    def test_each_check_is_recorded_with_its_times(self):
+        st = self.stores["5m"]
+        eng = Engine(st, ScriptedProvider(self.bars_until(self.NOW)), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW - timedelta(days=5))
+        clock = type("C", (), {"demo": False, "now": lambda s: self.NOW})()
+        sched = app.Scheduler(eng, clock)
+        bar_end = self.NOW.replace(minute=30, second=0)
+        sched.run_tick(check=(bar_end, bar_end))
+        r = st.q("SELECT * FROM checks")[0]
+        self.assertEqual((r["kind"], r["bar_end"], r["symbols"], r["live"], r["behind"]),
+                         ("check", bar_end.isoformat(), 1, 0, 0))
+        self.assertTrue(r["started_at"] <= r["data_at"] <= r["done_at"])
+        self.assertIsNone(r["ibkr_start"])                       # no IBKR link on this book
+        last = app.last_check(st)
+        self.assertEqual(last["kind"], "check")
+        self.assertIsNotNone(last["done_s"])
+
+    def test_orders_carry_their_bar_and_send_and_answer_times(self):
+        live = self.ibkr_link()
+        st = self.stores["5m"]
+        eng = Engine(st, ScriptedProvider([]), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW)
+        sid = st.q("SELECT id FROM symbols")[0]["id"]
+        eng.set_live(sid, ["EMA5_10"], self.NOW)
+        st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+                stop_price, risk_dollars, fee_through, trigger) VALUES (?,?,?,?,?,?,10,11,100,
+                '2026-09-21','cross')""", (sid, "AAA", "EMA5_10", "short", 100, self.NOW.isoformat()))
+        bar_end = self.NOW.replace(minute=30, second=0)
+        live.sync(self.NOW, bar_end)
+        o = self.stores["live"].q("SELECT * FROM orders")[0]
+        self.assertEqual((o["book"], o["bar_end"], o["status"]), ("5m", bar_end.isoformat(), "filled"))
+        self.assertTrue(o["sent_at"] and o["acked_at"] and o["sent_at"] <= o["acked_at"])
+        row = live.status()["orders"][0]
+        self.assertIsNotNone(row["sent_s"])
+
+    def test_a_refused_order_records_when_it_reached_ibkr(self):
+        live = self.ibkr_link()
+        self.ib.reject = {"AAA"}
+        st = self.stores["5m"]
+        Engine(st, ScriptedProvider([]), 5).add_symbols("AAA", "short_only", 1.0, self.NOW)
+        sid = st.q("SELECT id FROM symbols")[0]["id"]
+        Engine(st, ScriptedProvider([]), 5).set_live(sid, ["EMA5_10"], self.NOW)
+        st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+                stop_price, risk_dollars, fee_through, trigger) VALUES (?,?,?,?,?,?,10,11,100,
+                '2026-09-21','cross')""", (sid, "AAA", "EMA5_10", "short", 100, self.NOW.isoformat()))
+        live.sync(self.NOW, self.NOW)
+        o = self.stores["live"].q("SELECT * FROM orders")[0]
+        self.assertEqual(o["status"], "rejected")
+        self.assertTrue(o["sent_at"] and o["acked_at"])
+
+    def test_an_order_refused_before_it_left_has_no_send_time(self):
+        live = self.ibkr_link()
+        self.ib.pos = {"AAA": -1}                     # already at the 1-share cap
+        st = self.stores["5m"]
+        live._submit(self.NOW, "AAA", -1, "test")     # the adapter refuses before placeOrder
+        o = self.stores["live"].q("SELECT * FROM orders")[0]
+        self.assertEqual(o["status"], "rejected")
+        self.assertIsNone(o["sent_at"])
+        self.assertEqual(self.ib.placed, [])
+
+    # ---- streaming quotes
+    def test_live_symbols_keep_one_quote_subscription_read_without_waiting(self):
+        live = self.ibkr_link()
+        st = self.stores["5m"]
+        eng = Engine(st, ScriptedProvider([]), 5)
+        eng.add_symbols("AAA BBB", "short_only", 1.0, self.NOW)
+        a, b = (r["id"] for r in st.q("SELECT id FROM symbols ORDER BY symbol"))
+        eng.set_live(a, ["EMA5_10"], self.NOW)
+        live._keep_quotes(force=True)
+        self.assertEqual(self.ib.mkt_reqs, ["AAA"])
+        for _ in range(3):
+            self.b.quote("AAA")                       # read from the open subscription
+        self.b.short_check("AAA", 1)
+        self.assertEqual(self.ib.mkt_reqs, ["AAA"])
+        self.assertEqual(self.ib.mkt_cancels, [])
+        self.b.quote("BBB")                           # not Live: a one-off request, closed after
+        self.assertEqual((self.ib.mkt_reqs, self.ib.mkt_cancels), (["AAA", "BBB"], ["BBB"]))
+        eng.set_live(a, [], self.NOW)
+        eng.set_live(b, ["EMA5_10"], self.NOW)
+        live._keep_quotes(force=True)
+        self.assertEqual(self.ib.mkt_reqs[-1], "BBB")
+        self.assertIn("AAA", self.ib.mkt_cancels)
+        self.assertEqual(set(self.b._tickers), {"BBB"})
+
+    def test_a_reconnect_drops_the_old_subscriptions(self):
+        live = self.ibkr_link()
+        st = self.stores["5m"]
+        eng = Engine(st, ScriptedProvider([]), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW)
+        eng.set_live(st.q("SELECT id FROM symbols")[0]["id"], ["EMA5_10"], self.NOW)
+        live._keep_quotes(force=True)
+        self.assertEqual(set(self.b._tickers), {"AAA"})
+        self.ib.connected = False                     # e.g. the nightly gateway restart
+        self.b.quote("AAA")                           # reconnects; falls back to a one-off request
+        self.assertEqual(self.b._tickers, {})
+        live._keep_quotes(force=True)
+        self.assertEqual(set(self.b._tickers), {"AAA"})
+
+    def test_a_sync_sends_a_live_short_without_a_fresh_quote_request(self):
+        live = self.ibkr_link()
+        st = self.stores["5m"]
+        eng = Engine(st, ScriptedProvider([]), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW)
+        sid = st.q("SELECT id FROM symbols")[0]["id"]
+        eng.set_live(sid, ["EMA5_10"], self.NOW)
+        live.sync(self.NOW)                           # opens the subscription, nothing to trade
+        n = len(self.ib.mkt_reqs)
+        st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+                stop_price, risk_dollars, fee_through, trigger) VALUES (?,?,?,?,?,?,10,11,100,
+                '2026-09-21','cross')""", (sid, "AAA", "EMA5_10", "short", 100, self.NOW.isoformat()))
+        live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.assertEqual(len(self.ib.mkt_reqs), n)    # short_check and submit read the stream
+
+    # ---- first sight of each bar
+    def test_bar_arrivals_record_new_bars_only_after_a_symbols_first_fetch(self):
+        st = self.stores["live"]
+        rec = app.arrivals_recorder(st)
+        bars = self.bars_until(datetime(2026, 9, 21, 12, 0, tzinfo=ET))
+        rec("AAA", bars, datetime(2026, 9, 21, 12, 3, tzinfo=ET))       # startup: sets the mark
+        self.assertEqual(st.q("SELECT * FROM bar_arrivals"), [])
+        more = self.bars_until(datetime(2026, 9, 21, 12, 5, tzinfo=ET))
+        seen = datetime(2026, 9, 21, 12, 5, 7, tzinfo=ET)
+        rec("AAA", more, seen)
+        rec("AAA", more, seen + timedelta(seconds=5))                     # same bars again
+        rows = st.q("SELECT * FROM bar_arrivals")
+        self.assertEqual([(r["bar_end"], r["first_seen_at"]) for r in rows],
+                         [(datetime(2026, 9, 21, 12, 5, tzinfo=ET).isoformat(), seen.isoformat())])
+
+    def test_old_databases_gain_the_timing_columns(self):
+        path = f"{self.dir.name}/old.db"
+        import sqlite3
+        db = sqlite3.connect(path)
+        db.execute("""CREATE TABLE orders (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, symbol TEXT NOT
+                      NULL, side TEXT NOT NULL, qty INTEGER NOT NULL, reason TEXT, client_order_id
+                      TEXT NOT NULL, broker_order_id TEXT, status TEXT NOT NULL, filled_qty REAL,
+                      filled_avg_price REAL, filled_at TEXT, message TEXT)""")
+        db.commit()
+        db.close()
+        st = Store(path)
+        cols = {r["name"] for r in st.q("PRAGMA table_info(orders)")}
+        self.assertTrue({"book", "bar_end", "sent_at", "acked_at"} <= cols)
+        self.assertEqual(st.q("SELECT * FROM checks"), [])
+        st.db.close()
+
+    def test_seconds_after_reads_every_time_format_in_use(self):
+        from broker import seconds_after
+        bar = "2026-10-19T14:15:00-04:00"
+        self.assertEqual(seconds_after(bar, "2026-10-19T14:15:12.345678-04:00"), 12.3)
+        self.assertEqual(seconds_after(bar, "2026-10-19T18:15:13+00:00"), 13.0)      # ib_async (UTC)
+        self.assertEqual(seconds_after(bar, "2026-10-19T18:15:14.123456789Z"), 14.1)  # Alpaca
+        self.assertIsNone(seconds_after(None, "2026-10-19T18:15:14Z"))
+        self.assertIsNone(seconds_after(bar, "not a time"))
 
 
 if __name__ == "__main__":

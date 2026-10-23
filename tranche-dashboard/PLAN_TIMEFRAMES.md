@@ -1,7 +1,9 @@
 # Plan: live IBKR trading on every timeframe, fast
 
-Status: plan only. Nothing here is built. Written 2026-10-22 from a read of the
-code at commit 7724ae7 and the measurements made on the droplet in October 2026.
+Status: **Phase 1 built** (2026-10-23): fixes L1-L4 and L7, the timing
+record and its dashboard display; its exit criteria need a market day on the
+droplet. Phases 2-6 not started. Written 2026-10-22 from a read of the code at
+commit 7724ae7 and the measurements made on the droplet in October 2026.
 
 ## 1. Goal
 
@@ -223,8 +225,8 @@ supplying history. These are the bars your broker trades on.
 | Store | Table | Change | Phase |
 |---|---|---|---|
 | `tranche_live.db` | `orders` | add `book`, `bar_end`, `sent_at`, `acked_at` (`ts` stays the sync start; `filled_at` exists) | 1 |
-| `tranche_live.db` | `checks` (new) | `book`, `boundary`, `started_at`, `data_at`, `ibkr_start`, `ibkr_done`, `symbols`, `behind` | 1 |
-| `tranche_live.db` | `bar_arrivals` (new) | `symbol`, `bar_end`, `first_seen_at`; primary key (`symbol`, `bar_end`); kept 30 days | 1 |
+| each book DB | `checks` (new) | `kind`, `bar_end`, `started_at`, `data_at`, `ibkr_start`, `ibkr_done`, `done_at`, `symbols`, `live`, `behind`; kept 30 days. Built in each book's database (not `tranche_live.db` as first planned) so books without the IBKR link are timed too | 1 |
+| `tranche_live.db` | `bar_arrivals` (new) | `symbol`, `bar_end`, `first_seen_at`; primary key (`symbol`, `bar_end`); kept 30 days (the 5-min book's database when IBKR is not linked) | 1 |
 | each book DB | `settings` | `live_hold_overnight` (0/1), `live_flat_friday` (0/1) | 3 |
 | each book DB | `symbols` | none: `live` and `live_side` already exist | - |
 | `tranche_1d.db` (new) | same schema as the other books, plus `daily_bars` (`symbol`, `day`, OHLCV, `source`, `fetched_at`) | | 4 |

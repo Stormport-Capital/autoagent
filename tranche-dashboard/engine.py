@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import re
 from datetime import date, datetime, time, timedelta
@@ -72,6 +73,7 @@ GRADES = {"A+": 3.0, "A": 2.0, "B": 1.5, "C": 1.0}
 EMA_RISK_PCTL = 0.75
 EMA_MIN_SAMPLES = 5
 STALE_WAIT = timedelta(minutes=20)
+FETCH_WORKERS = 8  # parallel 5-minute fetches at a check (FMP Starter allows 300 a minute)
 # "Close by end of day" symbols: no new entries from this time, and every open
 # tranche is covered/sold at the close of the 5-minute bar ending here.
 EOD_CUTOFF = time(15, 55)
@@ -374,28 +376,88 @@ class Engine:
             self.store.log(now, "reset", "portfolio reset")
 
     # ------------------------------------------------------------------ tick
-    def tick(self, now: datetime, only_behind: tuple | None = None) -> None:
-        """only_behind=(bar_end, acts_at): a retry - process only the symbols
-        still missing that bar, so one lagging symbol doesn't re-fetch them all."""
+    def tick(self, now: datetime, only_behind: tuple | None = None, after_live=None,
+             mark=None) -> dict:
+        """Process every watched symbol's new bars.
+
+        only_behind=(bar_end, acts_at): a retry - process only the symbols
+        still missing that bar, so one lagging symbol doesn't re-fetch them all.
+
+        Live symbols go first: their bars are fetched in parallel, they are
+        processed, and after_live() (the IBKR sync) runs before the other
+        symbols are even fetched, so a live order never waits on the rest of
+        the watchlist. mark("data") is called once the first group's bars are
+        in. Network fetches happen outside the store lock. Returns the number
+        of symbols and Live symbols handled."""
+        mark = mark or (lambda _name: None)
+        rows = self.store.q("SELECT * FROM symbols WHERE status!='removed' ORDER BY id")
+        if only_behind:
+            rows = [r for r in rows if self._is_behind(r, *only_behind)]
+        live = [r for r in rows if r.get("live")]
+        rest = [r for r in rows if not r.get("live")]
+        groups = [g for g in (live, rest) if g]
+        for k, group in enumerate(groups):
+            self._run_group(group, now, on_fetched=(lambda: mark("data")) if k == 0 else None)
+            if group is live and after_live is not None:
+                after_live()
+                after_live = None
+        if after_live is not None:  # no Live symbol here: the link may still need to close one
+            after_live()
+        if not groups:
+            mark("data")
+        with self.store.lock:
+            self.store.record_equity(now, self.equity())
+        return {"symbols": len(rows), "live": len(live)}
+
+    def _run_group(self, group: list[dict], now: datetime, on_fetched=None) -> None:
+        """Fetch the group's 5-minute bars in parallel (outside the store lock),
+        then process each symbol under the lock, re-reading its row so a change
+        made from the dashboard meanwhile is honoured."""
+        fetched = self._fetch_all([r["symbol"] for r in group], now)
+        if on_fetched is not None:
+            on_fetched()
         with self.store.lock:
             s = self.store.settings()
-            for sym in self.store.q("SELECT * FROM symbols WHERE status!='removed' ORDER BY id"):
-                if only_behind and not self._is_behind(sym, *only_behind):
+            for r in group:
+                sym = next(iter(self.store.q(
+                    "SELECT * FROM symbols WHERE id=? AND status!='removed'", (r["id"],))), None)
+                if sym is None:
                     continue
                 try:
-                    self._process_symbol(sym, now, s)
+                    self._process_symbol(sym, now, s, fetched.get(sym["symbol"]))
                 except Exception as e:  # one bad symbol must not stop the rest
                     msg = redact(e)[:300]
                     self.store.x("UPDATE symbols SET error=? WHERE id=?", (msg, sym["id"]))
                     self.store.log(now, "error", msg, sym["symbol"])
-            self.store.record_equity(now, self.equity(s))
+
+    def _fetch_all(self, symbols: list[str], now: datetime) -> dict:
+        """symbol -> its 5-minute bars, or the exception its fetch raised.
+        Up to FETCH_WORKERS requests at once."""
+        out: dict = {}
+
+        def one(sym):
+            try:
+                return sym, self.provider.five_min_bars(sym, now)
+            except Exception as e:
+                return sym, e
+        names = list(dict.fromkeys(symbols))
+        if len(names) <= 1:
+            return dict(one(x) for x in names)
+        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(names))) as pool:
+            for sym, got in pool.map(one, names):
+                out[sym] = got
+        return out
 
     def behind(self, bar_end: datetime, acts_at: datetime | None = None) -> bool:
         """True if any watched symbol has not yet processed the hourly bar
         ending at `bar_end` (e.g. a delayed feed had not printed it yet).
         `acts_at` is when that bar's signals execute (the next open for the
         final bar); symbols added after that don't need it."""
-        return any(self._is_behind(r, bar_end, acts_at) for r in self.store.q(
+        return self.behind_count(bar_end, acts_at) > 0
+
+    def behind_count(self, bar_end: datetime, acts_at: datetime | None = None) -> int:
+        """How many watched symbols are still missing the bar ending at bar_end."""
+        return sum(self._is_behind(r, bar_end, acts_at) for r in self.store.q(
             "SELECT added_at, last_bar_end FROM symbols WHERE status!='removed'"))
 
     @staticmethod
@@ -404,9 +466,14 @@ class Engine:
             return False
         return r["last_bar_end"] is None or _dt(r["last_bar_end"]) < bar_end
 
-    def _load(self, symbol: str, now: datetime, s: dict):
-        """5-minute data -> completed bars of this book's size + indicators."""
-        five = self.provider.five_min_bars(symbol, now)
+    def _load(self, symbol: str, now: datetime, s: dict, five=None):
+        """5-minute data -> completed bars of this book's size + indicators.
+        five: bars already fetched for this check (or the exception the fetch
+        raised); None fetches them here."""
+        if isinstance(five, Exception):
+            raise five
+        if five is None:
+            five = self.provider.five_min_bars(symbol, now)
         delay = timedelta(minutes=s["bar_close_delay_min"])
         # an hour counts as complete once the feed has printed through its end
         # (delayed feeds lag), or 20 min later for names with no late prints
@@ -457,8 +524,8 @@ class Engine:
             })
         return rows
 
-    def _process_symbol(self, sym: dict, now: datetime, s: dict) -> None:
-        five, bars, ind = self._load(sym["symbol"], now, s)
+    def _process_symbol(self, sym: dict, now: datetime, s: dict, five=None) -> None:
+        five, bars, ind = self._load(sym["symbol"], now, s, five)
         added = _dt(sym["added_at"])
         last = _dt(sym["last_bar_end"])
         for i, b in enumerate(bars):

@@ -98,11 +98,59 @@ below), and equal is neither above nor below.
   check runs the book's **check delay** after the bar closes (Portfolio
   settings, in seconds); set it just above the data feed's lag in publishing
   a finished bar. The scheduler wakes within a second of that time, and if
-  the bar is not there yet it retries every 5 s for a minute. IBKR's fill of
-  the 1-share marketable limit then takes a second or two. The shorter the
-  delay, the less settled the bar the check reads; a cross that only shows
-  once the feed has finished the bar is taken at the next bar's close (see
-  "Judged against the recorded side" above), not lost.
+  the bar is not there yet it retries every 5 s for a minute, asking the feed
+  again each time. IBKR's fill of the 1-share marketable limit then takes a
+  second or two. The shorter the delay, the less settled the bar the check
+  reads; a cross that only shows once the feed has finished the bar is taken
+  at the next bar's close (see "Judged against the recorded side" above), not
+  lost.
+- **Order of work at a check** (fastest path to IBKR first): the Live
+  symbols' bars are fetched in parallel, the Live symbols are processed, the
+  IBKR sync runs, then the other symbols are fetched and processed, and the
+  Alpaca paper sync runs last, in its own thread. Each Live symbol keeps an
+  IBKR quote subscription open (bid, ask, borrow), so the borrow check and
+  the order's price check read it at once.
+
+## Timing record
+
+Every bar check and every order is timed, so bar close to IBKR order can be
+checked against the target (15-30 s on 5-min bars).
+
+- **Dashboard:** the header shows the last check as seconds after the bar
+  closed (bars fetched, IBKR sync done, check done) and how many symbols were
+  still waiting for data. "Recent IBKR orders" shows **Bar→sent** and
+  **Bar→fill** for each order. For the last bar of the day, the reference is
+  the 9:30 open where its signals act.
+- **`orders`** (`tranche_live.db`): `bar_end` (the bar whose check sent it),
+  `sent_at` (just before IBKR's placeOrder), `acked_at` (IBKR accepted or
+  refused it), `filled_at` (IBKR's fill time), `book`. `ts` stays the time the
+  sync started. An order the adapter refused before sending has no `sent_at`.
+- **`checks`** (each book's database): one row per check: `kind` (check,
+  retry, other), `bar_end`, `started_at`, `data_at`, `ibkr_start`, `ibkr_done`,
+  `done_at`, `symbols`, `live`, `behind`. Kept 30 days.
+- **`bar_arrivals`** (`tranche_live.db`): the first time this app saw each
+  symbol's 5-minute bar. It is the time of our fetch, not FMP's publish time:
+  a bar already there at a check's first fetch shows the check's time, a late
+  one shows the 5-second retry that found it. Kept 30 days.
+
+Queries on the droplet (5-min book, today):
+
+```
+D=/opt/tranche/autoagent/tranche-dashboard; S="sudo -u tranche sqlite3 -header"
+$S $D/tranche_live.db "SELECT substr(bar_end,12,8) bar, symbol, side, status,
+  round((julianday(sent_at)-julianday(bar_end))*86400,1) bar_to_sent,
+  round((julianday(filled_at)-julianday(bar_end))*86400,1) bar_to_fill
+  FROM orders WHERE bar_end >= date('now') ORDER BY id;"
+$S $D/tranche_5m.db "SELECT kind, substr(bar_end,12,8) bar,
+  round((julianday(data_at)-julianday(bar_end))*86400,1) data_s,
+  round((julianday(ibkr_done)-julianday(bar_end))*86400,1) ibkr_s,
+  round((julianday(done_at)-julianday(bar_end))*86400,1) done_s, symbols, live, behind
+  FROM checks WHERE bar_end >= date('now') ORDER BY id DESC LIMIT 20;"
+$S $D/tranche_live.db "SELECT symbol, count(*) bars,
+  round(avg((julianday(first_seen_at)-julianday(bar_end))*86400),1) avg_s,
+  round(max((julianday(first_seen_at)-julianday(bar_end))*86400),1) worst_s
+  FROM bar_arrivals WHERE bar_end >= date('now') GROUP BY symbol;"
+```
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.

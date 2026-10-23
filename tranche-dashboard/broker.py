@@ -60,6 +60,30 @@ class BrokerError(RuntimeError):
     pass
 
 
+def _wall() -> datetime:
+    """The real clock, for timing records (the scheduler's clock is simulated in demo)."""
+    return datetime.now(ET)
+
+
+def _parse_ts(v) -> datetime | None:
+    """ISO time from this app, ib_async or Alpaca ('...Z', nanoseconds) -> datetime."""
+    if not v:
+        return None
+    try:
+        v = re.sub(r"(\.\d{6})\d+", r"\1", str(v).replace("Z", "+00:00"))
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+def seconds_after(start, end) -> float | None:
+    """end - start in seconds, one decimal; None if either is missing."""
+    a, b = _parse_ts(start), _parse_ts(end)
+    if a is None or b is None or a.tzinfo is None or b.tzinfo is None:
+        return None
+    return round((b - a).total_seconds(), 1)
+
+
 def _msg(e: Exception) -> str:
     if isinstance(e, requests.RequestException):
         return f"can't reach Alpaca paper ({type(e).__name__}); will retry on the next check"
@@ -131,6 +155,7 @@ REJECT_PAUSE = timedelta(minutes=4)
 
 KILL_MODES = ("pause", "flatten")
 WATCH_EVERY_S = 60
+QUOTES_EVERY_S = 30.0  # IBKR link: re-check which quote subscriptions to keep open
 
 
 class BrokerSync:
@@ -150,6 +175,8 @@ class BrokerSync:
         self.snapshot: dict | None = None      # cached account + positions for the UI
         self.snapshot_at = 0.0
         self.needs_followup = False            # an order was working: re-sync soon
+        self.book: str | None = None           # recorded on each order (the IBKR link sets it)
+        self._bar_end: str | None = None       # the bar whose check this sync serves
 
     # ---------------------------------------------------------------- sync
     def _net(self) -> dict[str, int]:
@@ -176,8 +203,11 @@ class BrokerSync:
     def managed(self) -> set[str]:
         return {r["symbol"] for r in self.store.q("SELECT DISTINCT symbol FROM symbols")}
 
-    def sync(self, now: datetime) -> None:
+    def sync(self, now: datetime, bar_end: datetime | None = None) -> None:
+        """bar_end: the bar whose check this sync follows, recorded on its orders
+        so bar close to order can be measured (None for other syncs)."""
         with self.lock:
+            self._bar_end = bar_end.isoformat() if bar_end else None
             try:
                 self._refresh_orders()
                 acct = self.broker.account()
@@ -195,6 +225,7 @@ class BrokerSync:
                 self.last_error = _msg(e)
                 self.store.log(now, "broker-error", self.last_error[:300])
             self.last_sync = now
+            self._bar_end = None
             self.snapshot_at = 0.0  # force a fresh account read
 
     def _sync_positions(self, now: datetime, flatten: bool) -> None:
@@ -419,21 +450,27 @@ class BrokerSync:
         side = "buy" if delta > 0 else "sell"
         cid = f"td-{sym}-{uuid.uuid4().hex[:12]}"
         row = self.store.x(
-            """INSERT INTO orders (ts, symbol, side, qty, reason, client_order_id, status)
-               VALUES (?,?,?,?,?,?, 'submitting')""",
-            (now.isoformat(), sym, side, abs(delta), reason, cid))
+            """INSERT INTO orders (ts, symbol, side, qty, reason, client_order_id, status,
+               book, bar_end) VALUES (?,?,?,?,?,?, 'submitting', ?, ?)""",
+            (now.isoformat(), sym, side, abs(delta), reason, cid, self.book, self._bar_end))
         kw = {"order_type": order_type} if order_type else {}
         if hasattr(self.broker, "quote"):  # IBKR: the model's last price as a fallback reference
             r = self.store.q("SELECT last_price FROM symbols WHERE symbol=? AND last_price IS NOT "
                              "NULL ORDER BY id DESC LIMIT 1", (sym,))
             if r:
                 kw["ref_price"] = r[0]["last_price"]
+        sent = _wall()
         try:
             o = self.broker.submit(sym, abs(delta), side, cid, **kw)
         except BrokerError as e:
-            self.store.x("UPDATE orders SET status='rejected', message=? WHERE id=?", (str(e)[:300], row))
+            # sent_at only when the broker says the order actually left (IBKR sets it)
+            out = getattr(e, "sent_at", None)
+            self.store.x("UPDATE orders SET status='rejected', message=?, sent_at=?, acked_at=? "
+                         "WHERE id=?", (str(e)[:300], out, _wall().isoformat() if out else None, row))
             self.store.log(now, "broker-reject", f"{side} {abs(delta)} rejected: {e}", sym)
             return None
+        self.store.x("UPDATE orders SET sent_at=?, acked_at=? WHERE id=?",
+                     (o.get("sent_at") or sent.isoformat(), _wall().isoformat(), row))
         self._record(row, o)
         self.store.log(now, "broker", f"{side.upper()} {abs(delta)} market ({reason}) -> {o.get('status')}", sym)
         return o
@@ -518,7 +555,9 @@ class BrokerSync:
             "error": self.snapshot["error"] or self.last_error,
             "last_sync": self.last_sync.isoformat() if self.last_sync else None,
             "reconciliation": recon,
-            "orders": self.store.q("SELECT * FROM orders ORDER BY id DESC LIMIT 200"),
+            "orders": [dict(r, sent_s=seconds_after(r.get("bar_end"), r.get("sent_at")),
+                            fill_s=seconds_after(r.get("bar_end"), r.get("filled_at")))
+                       for r in self.store.q("SELECT * FROM orders ORDER BY id DESC LIMIT 200")],
             "curve": self.store.q("SELECT ts, equity FROM broker_equity ORDER BY ts"),
         }
 
@@ -538,6 +577,32 @@ class LiveSync(BrokerSync):
         self.books = books  # key -> (label, Store)
         self.live_book, self.sleeves = live_book, tuple(sleeves)
         self.book_label, self.book_store = books[live_book]
+        self.book = live_book
+        self._quotes_at: float | None = None
+
+    def _keep_quotes(self, force: bool = False) -> None:
+        """Keep IBKR quote subscriptions open for exactly the Live symbols, so
+        a check reads bid, ask and borrow at once (ibkr.watch_quotes). At most
+        every QUOTES_EVERY_S between checks; at every sync."""
+        keep = getattr(self.broker, "watch_quotes", None)
+        if keep is None:
+            return
+        if not force and self._quotes_at is not None \
+                and _time.monotonic() - self._quotes_at < QUOTES_EVERY_S:
+            return
+        self._quotes_at = _time.monotonic()
+        try:
+            keep(sorted(self.selections()))
+        except (BrokerError, requests.RequestException):
+            pass  # the sync itself reports a connection problem
+
+    def sync(self, now: datetime, bar_end: datetime | None = None) -> None:
+        self._keep_quotes(force=True)
+        super().sync(now, bar_end)
+
+    def watch(self, now: datetime) -> None:
+        self._keep_quotes()
+        super().watch(now)
 
     def enabled(self) -> bool:
         return bool(self.store.settings()["broker_sync_enabled"])

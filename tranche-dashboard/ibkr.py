@@ -39,8 +39,10 @@ import os
 import threading
 import time as _time
 from dataclasses import dataclass
+from datetime import datetime
 
 from broker import BrokerError
+from indicators import ET
 
 DEFAULT_PORTS = {"paper": 4002, "live": 4001}  # IB Gateway; TWS uses 7497 / 7496
 DONE = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
@@ -159,6 +161,7 @@ class IBKRBroker:
         self._pnl_on = False
         self._lock = threading.RLock()
         self._errors: dict[int, str] = {}  # orderId -> IBKR's latest refusal of it
+        self._tickers: dict = {}  # symbol -> (contract, ticker, monotonic start): open quotes
         if hasattr(self.ib, "errorEvent"):
             self.ib.errorEvent += self._on_error
 
@@ -200,6 +203,7 @@ class IBKRBroker:
             if _time.monotonic() < self._next_try:
                 raise BrokerError("not connected to IB Gateway; retrying shortly")
             self._pnl_on = False
+            self._tickers = {}  # subscriptions die with the connection
             c = self.cfg
             try:
                 self._run(lambda: self.ib.connectAsync(c.host, c.port, clientId=c.client_id,
@@ -313,12 +317,43 @@ class IBKRBroker:
                     "message": "not in this IB Gateway session; check positions"}
         return self._run(lambda: self._order(t))
 
+    def watch_quotes(self, symbols) -> None:
+        """Keep one market-data subscription (bid, ask, shortable tick 236)
+        open for each of `symbols` and close the others. quote() then reads a
+        Live symbol at once instead of opening a request and waiting up to
+        quote_wait_s - which an opening short did twice (short_check, then
+        submit), up to 6 s before the order left."""
+        self._ensure()
+        want = set(symbols)
+        with self._lock:
+            for sym in [x for x in self._tickers if x not in want]:
+                c = self._tickers.pop(sym)[0]
+                try:
+                    self._run(lambda c=c: self.ib.cancelMktData(c))
+                except BrokerError:
+                    pass
+            for sym in sorted(want - set(self._tickers)):
+                try:
+                    c = self._contract(sym)
+                except BrokerError:
+                    continue  # not a known stock: quote() reports it when it matters
+                tk = self._run(lambda c=c: self.ib.reqMktData(c, "236", False, False))
+                self._tickers[sym] = (c, tk, _time.monotonic())
+
     def quote(self, symbol: str) -> dict:
         """Bid/ask/last plus IBKR's short availability (generic tick 236):
-        shortable > 2.5 = easy to borrow, > 1.5 = locate needed, else none."""
+        shortable > 2.5 = easy to borrow, > 1.5 = locate needed, else none.
+        A symbol with an open subscription (watch_quotes) is read at once; one
+        without is requested and given up to quote_wait_s for its first ticks."""
         self._ensure()
-        c = self._contract(symbol)
-        tk = self._run(lambda: self.ib.reqMktData(c, "236", False, False))
+        held = self._tickers.get(symbol)
+        if held:
+            c, tk, since = held
+            deadline = since + self.cfg.quote_wait_s  # only a brand-new subscription waits
+        else:
+            c = self._contract(symbol)
+            tk = self._run(lambda: self.ib.reqMktData(c, "236", False, False))
+            deadline = _time.monotonic() + self.cfg.quote_wait_s
 
         def read():
             return {"bid": _clean(tk.bid), "ask": _clean(tk.ask), "last": _clean(tk.last),
@@ -327,7 +362,6 @@ class IBKRBroker:
                     or math.isnan(tk.shortableShares) else float(tk.shortableShares),
                     "shortable": None if tk.shortable is None or math.isnan(tk.shortable)
                     else float(tk.shortable)}
-        deadline = _time.monotonic() + self.cfg.quote_wait_s
         try:
             while True:
                 q = self._run(read)
@@ -336,7 +370,8 @@ class IBKRBroker:
                     return q
                 _time.sleep(0.25)
         finally:
-            self._run(lambda: self.ib.cancelMktData(c))
+            if not held:
+                self._run(lambda: self.ib.cancelMktData(c))
 
     def short_check(self, symbol: str, qty: int) -> str | None:
         """Why a new short of `qty` can't be opened (None = go ahead). When IBKR
@@ -393,6 +428,7 @@ class IBKRBroker:
             order = self.api.LimitOrder(action, qty, limit_price(side, px, cfg.collar_pct))
         order.tif, order.outsideRth = "DAY", False
         order.orderRef, order.account = client_order_id, cfg.account
+        sent = datetime.now(ET).isoformat()  # bar close to here is the latency that matters
         trade = self._run(lambda: self.ib.placeOrder(c, order))
         deadline = _time.monotonic() + 5
         while True:  # wait for IBKR to accept or refuse it
@@ -406,7 +442,10 @@ class IBKRBroker:
             while not o["message"] and _time.monotonic() < deadline:
                 _time.sleep(0.2)
                 o = self._run(lambda: self._order(trade))
-            raise BrokerError(f"IBKR: {o['message'] or 'order ' + o['ib_status']}")
+            err = BrokerError(f"IBKR: {o['message'] or 'order ' + o['ib_status']}")
+            err.sent_at = sent  # it did reach IBKR
+            raise err
+        o["sent_at"] = sent
         return o
 
     def cancel(self, order_id: str) -> None:

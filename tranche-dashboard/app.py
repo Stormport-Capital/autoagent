@@ -40,12 +40,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from backup import Backups, backup_folder
-from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync
+from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync, seconds_after
 import ibkr
 from data import make_provider, redact
 from engine import LIVE_SLEEVES, SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
-from indicators import ET, RTH_OPEN, session_bar_ends
+from indicators import ET, RTH_OPEN, in_rth, session_bar_ends
 from review import ProfileCache, review_payload, save_day_note, save_journal
 from store import Store
 
@@ -55,6 +55,7 @@ RETRY_WINDOW = timedelta(minutes=40)
 FAST_RETRY_EVERY = timedelta(seconds=5)   # right after a bar closes, while the feed
 FAST_RETRY_WINDOW = timedelta(seconds=60)  # may still be printing it
 POLL_S = 20.0                              # between bars
+TIMING_DAYS = 30                           # checks and bar_arrivals rows are kept this long
 
 # (key, bar minutes, label, env prefix for its Alpaca paper keys, db file)
 BOOKS = (
@@ -195,6 +196,43 @@ def next_boundary(now: datetime, delay: timedelta, minutes: int = 60) -> datetim
         d += timedelta(days=1)
 
 
+def _wall() -> datetime:
+    """The real clock, for timing records."""
+    return datetime.now(ET)
+
+
+def arrivals_recorder(store: Store):
+    """CachedProvider.on_bars -> the `bar_arrivals` table: when this app first
+    saw each symbol's regular-hours 5-minute bar. A bar counts as new when it
+    ends after the newest bar of that symbol's previous fetch; a symbol's first
+    fetch since startup only sets that mark, so a restart never records old
+    bars as late. Times are when our fetch returned, so a bar already there at
+    a check's first fetch shows the check's time; a late one shows the retry
+    (every 5 s) that found it."""
+    newest: dict = {}
+    lock = threading.Lock()
+    pruned: list = [None]
+
+    def record(symbol: str, bars: list, seen: datetime) -> None:
+        if not bars:
+            return
+        top = max(b.end for b in bars)
+        with lock:
+            before = newest.get(symbol)
+            newest[symbol] = max(top, before) if before else top
+        if before is None:
+            return
+        for b in bars:
+            if b.end > before and in_rth(b.start) and b.end <= seen:
+                store.x("INSERT OR IGNORE INTO bar_arrivals VALUES (?,?,?)",
+                        (symbol, b.end.isoformat(), seen.isoformat()))
+        if pruned[0] != seen.date():
+            pruned[0] = seen.date()
+            store.x("DELETE FROM bar_arrivals WHERE first_seen_at < ?",
+                    ((seen - timedelta(days=TIMING_DAYS)).isoformat(),))
+    return record
+
+
 class Scheduler(threading.Thread):
     """One book's clock: a tick at the 9:30 open (for yesterday's last bar)
     and as each intraday bar closes."""
@@ -208,25 +246,93 @@ class Scheduler(threading.Thread):
         self.live = live  # the IBKR link, on the live book's scheduler only (live_link)
         self.last_tick: datetime | None = None
         self.last_error: str | None = None
+        self._paper_job: threading.Thread | None = None
+        self._pruned: date | None = None
 
     def delay(self) -> timedelta:
         return timedelta(minutes=self.engine.store.settings()["bar_close_delay_min"])
 
-    def run_tick(self, only_behind: tuple | None = None) -> None:
+    def run_tick(self, only_behind: tuple | None = None, check: tuple | None = None) -> None:
+        """One check. check=(bar_end, acts_at): the bar it handles (None for the
+        startup catch-up and dashboard actions). Order of work, fastest path to
+        IBKR first: the Live symbols' bars, the Live symbols, the IBKR sync, the
+        other symbols, then the Alpaca paper sync in its own thread. Before
+        2026-10-23 the paper sync ran first and every symbol was fetched one
+        after another before any IBKR order could go out."""
         now = self.clock.now()
+        ref = check[1] if check else None  # when its signals act (9:30 for the last bar)
+        times = {"started_at": _wall()}
+        live_on = self.live is not None and self.live.enabled()
+
+        def mark(name: str) -> None:
+            times.setdefault(name + "_at", _wall())
+
+        def after_live() -> None:
+            times["ibkr_start"] = _wall()
+            try:
+                self.live.sync(self.clock.now(), ref)
+            except Exception as e:  # never let the link stop the rest of the check
+                self.live.last_error = f"sync failed: {redact(e)}"
+            times["ibkr_done"] = _wall()
+        counts: dict = {}
         try:
-            self.engine.tick(now, only_behind)
+            counts = self.engine.tick(now, only_behind, after_live=after_live if live_on else None,
+                                      mark=mark) or {}
             self.last_error = None
         except Exception as e:  # keep the loop alive; surface on the dashboard
             self.last_error = redact(e)
+        if live_on and "ibkr_start" not in times:
+            after_live()  # the check failed before reaching the link: sync anyway
         self.last_tick = now
-        self.run_sync()
+        times["done_at"] = _wall()
+        self._record_check("retry" if only_behind else "check" if check else "other",
+                           ref, check, times, counts)
+        self.sync_paper_async()
+
+    def _record_check(self, kind, ref, check, times, counts) -> None:
+        """One row in this book's `checks` table: where the time went."""
+        if self.clock.demo:
+            return
+        iso = lambda k: times[k].isoformat() if times.get(k) else None
+        st = self.engine.store
+        try:
+            st.x("""INSERT INTO checks (kind, bar_end, started_at, data_at, ibkr_start, ibkr_done,
+                    done_at, symbols, live, behind) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 (kind, ref.isoformat() if ref else None, iso("started_at"), iso("data_at"),
+                  iso("ibkr_start"), iso("ibkr_done"), iso("done_at"), counts.get("symbols"),
+                  counts.get("live"), self.engine.behind_count(*check) if check else None))
+            today = times["started_at"].date()
+            if self._pruned != today:
+                self._pruned = today
+                st.x("DELETE FROM checks WHERE started_at < ?",
+                     ((times["started_at"] - timedelta(days=TIMING_DAYS)).isoformat(),))
+        except Exception:
+            pass  # a timing record must never stop trading
+
+    def sync_paper_async(self) -> None:
+        """The Alpaca paper sync, off the check's critical path. One at a time:
+        if the last one is still running, a follow-up sync picks this up."""
+        if not (self.sync and self.engine.store.settings()["broker_sync_enabled"]):
+            return
+        job = self._paper_job
+        if job is not None and job.is_alive():
+            self.sync.needs_followup = True
+            return
+        self._paper_job = threading.Thread(target=self._sync_paper, daemon=True, name="paper-sync")
+        self._paper_job.start()
+
+    def _sync_paper(self) -> None:
+        try:
+            self.sync.sync(self.clock.now())
+        except Exception as e:
+            self.sync.last_error = redact(e)
 
     def run_sync(self) -> None:
-        if self.sync and self.engine.store.settings()["broker_sync_enabled"]:
-            self.sync.sync(self.clock.now())
+        """Dashboard actions and follow-ups: IBKR first, then the paper account."""
         if self.live and self.live.enabled():
             self.live.sync(self.clock.now())
+        if self.sync and self.engine.store.settings()["broker_sync_enabled"]:
+            self.sync.sync(self.clock.now())
 
     def retry_due(self, now: datetime, boundary: datetime) -> bool:
         """Re-check while some symbol is still missing that bar: every 5 s for
@@ -263,10 +369,11 @@ class Scheduler(threading.Thread):
             now = self.clock.now()
             due = [b for b in boundaries(now.date(), self.delay(), self.minutes) if b <= now]
             if due and (self.last_tick is None or self.last_tick < due[-1]):
-                self.run_tick()
+                self.run_tick(check=bar_for_boundary(due[-1], self.delay()))
             elif due and self.retry_due(now, due[-1]):
                 # the feed hadn't finished that bar yet: look again, lagging symbols only
-                self.run_tick(only_behind=bar_for_boundary(due[-1], self.delay()))
+                bar = bar_for_boundary(due[-1], self.delay())
+                self.run_tick(only_behind=bar, check=bar)
             elif any(s and s.needs_followup and s.last_sync
                      and (now - s.last_sync).total_seconds() >= 60 for s in (self.sync, self.live)):
                 self.run_sync()  # an order was still working: finish the job
@@ -409,6 +516,7 @@ def build_state(book: Book, books: list, provider_name: str, demo, live=None) ->
         "provider": provider_name,
         "market_open": market_open(now),
         "last_tick": sched.last_tick.isoformat() if sched.last_tick else None,
+        "last_check": last_check(store),
         "next_tick": sched.next_tick().isoformat(),
         "scheduler_error": sched.last_error,
         "settings": store.settings(),
@@ -419,6 +527,18 @@ def build_state(book: Book, books: list, provider_name: str, demo, live=None) ->
         "broker": broker_state(book),
         "live": live_state(live, book.sched.clock.demo),
     }
+
+
+def last_check(store: Store) -> dict | None:
+    """The book's latest bar check, as seconds after the bar closed."""
+    r = next(iter(store.q("SELECT * FROM checks WHERE kind != 'other' ORDER BY id DESC LIMIT 1")),
+             None)
+    if r is None:
+        return None
+    ref = r["bar_end"]
+    return {"kind": r["kind"], "bar_end": ref, "data_s": seconds_after(ref, r["data_at"]),
+            "ibkr_s": seconds_after(ref, r["ibkr_done"]), "done_s": seconds_after(ref, r["done_at"]),
+            "symbols": r["symbols"], "live": r["live"], "behind": r["behind"]}
 
 
 def broker_state(book: Book) -> dict:
@@ -812,6 +932,8 @@ def main() -> None:
                         {k: (label, stores[k]) for k, _m, label, _p, _db in BOOKS},
                         live_book=ib.cfg.book, sleeves=LIVE_SLEEVES,
                         max_shares=ib.max_shares, daily_loss_limit=ib.daily_loss_limit)
+    if not args.demo:  # first sight of each bar, for the publish-lag record
+        provider.on_bars = arrivals_recorder(live.store if live else stores["5m"])
 
     books: dict[str, Book] = {}
     for key, minutes, label, _prefix, _db in BOOKS:

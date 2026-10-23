@@ -91,7 +91,11 @@ CREATE TABLE IF NOT EXISTS orders (
     filled_qty REAL,
     filled_avg_price REAL,
     filled_at TEXT,
-    message TEXT
+    message TEXT,
+    book TEXT,                              -- IBKR: the book whose Live symbol this order follows
+    bar_end TEXT,                           -- end of the bar whose check sent it (NULL: not a bar check)
+    sent_at TEXT,                           -- wall clock when the order left (IBKR: just before placeOrder)
+    acked_at TEXT                           -- wall clock when the broker accepted or refused it
 );
 CREATE TABLE IF NOT EXISTS broker_equity (
     ts TEXT PRIMARY KEY,
@@ -118,6 +122,25 @@ CREATE TABLE IF NOT EXISTS equity (
     ts TEXT PRIMARY KEY,
     equity REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS checks (      -- one row per scheduler check of this book: where the time goes
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,                  -- check | retry | other (startup, a dashboard action)
+    bar_end TEXT,                        -- the bar the check handles (NULL for 'other')
+    started_at TEXT NOT NULL,            -- wall clock, as are the times below
+    data_at TEXT,                        -- Live symbols' bars fetched (all symbols when none is Live)
+    ibkr_start TEXT,                     -- IBKR sync started (NULL: this book has no IBKR link)
+    ibkr_done TEXT,
+    done_at TEXT,
+    symbols INTEGER,
+    live INTEGER,                        -- how many of them are Live
+    behind INTEGER                       -- symbols still missing bar_end after the check
+);
+CREATE TABLE IF NOT EXISTS bar_arrivals (  -- when this app first saw each symbol's 5-minute bar
+    symbol TEXT NOT NULL,
+    bar_end TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,           -- wall clock of the fetch that first returned it
+    PRIMARY KEY (symbol, bar_end)
+);
 """
 
 
@@ -139,6 +162,10 @@ class Store:
                 self.db.execute(f"ALTER TABLE tranches ADD COLUMN {col} TEXT")
         if "stop_dist" not in cols:  # databases created before stop distances were recorded
             self.db.execute("ALTER TABLE tranches ADD COLUMN stop_dist REAL")
+        ocols = {r[1] for r in self.db.execute("PRAGMA table_info(orders)")}
+        for col in ("book", "bar_end", "sent_at", "acked_at"):  # before order timings
+            if col not in ocols:
+                self.db.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
         scols = {r[1] for r in self.db.execute("PRAGMA table_info(symbols)")}
         if "grade" not in scols:  # databases created before trade grades
             self.db.execute("ALTER TABLE symbols ADD COLUMN grade TEXT")
