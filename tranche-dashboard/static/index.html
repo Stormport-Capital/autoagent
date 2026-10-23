@@ -301,6 +301,7 @@ function render() {
     `<span>Data: ${esc(S.provider)}</span>`,
     `<span>${S.demo ? "Sim time" : "Now"}: ${fmtT(S.now)} · market ${S.market_open ? "open" : "closed"}</span>`,
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
+    S.last_check ? `<span title="Seconds after the bar closed: bars fetched${S.last_check.ibkr_s == null ? "" : ", IBKR sync done"}, check done">${S.last_check.kind === "retry" ? "Retry" : "Bar"} ${fmtT(S.last_check.bar_end)}: data +${S.last_check.data_s ?? "—"} s${S.last_check.ibkr_s == null ? "" : `, IBKR +${S.last_check.ibkr_s} s`}, done +${S.last_check.done_s ?? "—"} s${S.last_check.behind ? ` · <span class="neg">${S.last_check.behind} waiting for data</span>` : ""}</span>` : "",
     S.backup ? (S.backup.error ? `<span class="neg">${esc(S.backup.error)}</span>`
       : `<span title="${esc(S.backup.folder)}">Backed up ${fmtT(S.backup.last)}</span>`) : "",
     `<a href="/api/${BOOK}/download.db" title="Download a copy of this book's database">Download backup</a>`,
@@ -470,8 +471,9 @@ function renderBroker(B, o) {
   }
   if (o.shared) {
     const ords = (B.orders || []).slice(0, 10), evs = (B.events || []).slice(0, 8);
-    if (ords.length) h += `<details style="margin-top:8px"><summary>Recent IBKR orders</summary><div class="tablewrap"><table><thead><tr><th class="l">Time</th><th class="l">Symbol</th><th>Side</th><th>Qty</th><th class="l">Status</th><th>Fill</th></tr></thead><tbody>` +
-      ords.map(x => `<tr><td class="l">${fmtT(x.ts)}</td><td class="l sym">${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${x.qty}</td><td class="l">${esc(x.status)}${x.message ? `<div class="err-text" style="max-width:220px">${esc(x.message)}</div>` : ""}</td><td>${x.filled_avg_price == null ? "—" : num(x.filled_avg_price)}</td></tr>`).join("") + `</tbody></table></div></details>`;
+    const secs = v => v == null ? "—" : `${v.toFixed(1)} s`;
+    if (ords.length) h += `<details style="margin-top:8px"><summary>Recent IBKR orders</summary><div class="tablewrap"><table><thead><tr><th class="l">Time</th><th class="l">Symbol</th><th>Side</th><th>Qty</th><th class="l">Status</th><th>Fill</th><th title="Seconds from the bar close (the 9:30 open for the last bar of the day) to the order leaving for IBKR">Bar→sent</th><th title="Seconds from the bar close to IBKR's fill">Bar→fill</th></tr></thead><tbody>` +
+      ords.map(x => `<tr><td class="l">${fmtT(x.ts)}</td><td class="l sym">${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${x.qty}</td><td class="l">${esc(x.status)}${x.message ? `<div class="err-text" style="max-width:220px">${esc(x.message)}</div>` : ""}</td><td>${x.filled_avg_price == null ? "—" : num(x.filled_avg_price)}</td><td>${secs(x.sent_s)}</td><td>${secs(x.fill_s)}</td></tr>`).join("") + `</tbody></table></div></details>`;
     if (evs.length) h += `<details style="margin-top:4px"><summary>IBKR log</summary><div class="hint">${evs.map(e => `${fmtT(e.ts)} · ${e.symbol ? esc(e.symbol) + ": " : ""}${esc(e.message)}`).join("<br>")}</div></details>`;
   }
   id("Body").innerHTML = h;

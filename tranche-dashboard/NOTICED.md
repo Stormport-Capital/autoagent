@@ -101,8 +101,14 @@ Added after the first live refusals (2026-10-16, XLAB):
     `Engine.behind` counts a symbol as behind until its `last_bar_end`
     reaches the checked bar. When the feed has no such bar yet (a thin name
     with no trade in the window, or a slow print) the scheduler re-checks
-    every 5 s for a minute and then every 3 min for the rest of the bar, one
-    FMP request per symbol each time, and ran the broker link on every
-    re-check. That turned one refused PMI order into 38 on 2026-10-19 (now
-    one attempt per check). Treating a bar still missing after `STALE_WAIT`
-    as not behind would end the loop sooner; not built.
+    every 5 s for a minute and then every 3 min for the rest of the bar, and
+    ran the broker link on every re-check. That turned one refused PMI order
+    into 38 on 2026-10-19 (now one attempt per check). Since 2026-10-23 each
+    re-check really asks FMP for the lagging symbols (before, the shared cache
+    answered the 5-second re-checks with the copy that lacked the bar): up to
+    12 requests per lagging symbol in the first minute, then one every 3 min.
+    The app has no market-holiday calendar, so on a weekday holiday every
+    symbol lags all day: about 13 requests per symbol per 5 minutes, roughly
+    250 MB for 10 symbols, well inside FMP Starter's 20 GB a month. Treating
+    a bar still missing after `STALE_WAIT` as not behind, or a holiday
+    calendar, would end the loop sooner; not built.

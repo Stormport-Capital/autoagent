@@ -20,13 +20,14 @@ import random
 import re
 import threading
 import time as _time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import requests
 
-from indicators import ET, RTH_OPEN, Bar
+from indicators import ET, RTH_CLOSE, RTH_OPEN, Bar
 
 FIVE_MIN = timedelta(minutes=5)
+RTH_FIRST_END = time(9, 35)  # the first regular-hours 5-minute bar ends here
 
 
 class DataError(RuntimeError):
@@ -387,28 +388,52 @@ class DemoProvider:
 
 
 class CachedProvider:
-    """Shares one fetch per symbol between the books: a fetch is reused for
-    up to ttl_s seconds while the clock is still in the same 5-minute window
-    (no new 5-minute bar can have completed in between)."""
+    """Shares one fetch per symbol between the books. A fetch is reused for up
+    to ttl_s seconds within the same 5-minute window, and only if it already
+    holds the newest regular-hours bar that can have closed by then. A fetch
+    that is missing that bar is never reused: on 2026-10-19 the old rule
+    (reuse for 60 s, whatever it held) meant a bar published 2 s after the
+    first fetch of a check was hidden from every 5-second retry and first seen
+    about 70 s after the close.
 
-    def __init__(self, inner, ttl_s: float = 60.0):
+    on_bars(symbol, bars, seen_at), if given, is called after every real fetch
+    (never for a reuse), so the first sight of each bar can be recorded."""
+
+    def __init__(self, inner, ttl_s: float = 60.0, on_bars=None):
         self.inner, self.ttl_s = inner, ttl_s
         self.name = inner.name
+        self.on_bars = on_bars
         self._cache: dict = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def due(now: datetime) -> datetime | None:
+        """End of the newest regular-hours 5-minute bar that can have closed by
+        `now`, or None outside 9:35-16:00 ET, when no new one closes."""
+        local = now.astimezone(ET)
+        window = local.replace(minute=local.minute - local.minute % 5, second=0, microsecond=0)
+        return window if RTH_FIRST_END <= window.time() <= RTH_CLOSE else None
+
     def five_min_bars(self, symbol: str, now: datetime) -> list[Bar]:
-        window = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+        local = now.astimezone(ET)
+        window = local.replace(minute=local.minute - local.minute % 5, second=0, microsecond=0)
         key = (symbol, window)
         with self._lock:
             hit = self._cache.get(key)
-            if hit and _time.monotonic() - hit[0] < self.ttl_s:
+            if hit and hit[2] and _time.monotonic() - hit[0] < self.ttl_s:
                 return [b for b in hit[1] if b.end <= now]
         bars = self.inner.five_min_bars(symbol, now)
+        due = self.due(now)
+        complete = due is None or any(b.end >= due for b in bars)
         with self._lock:
             if len(self._cache) > 500:
                 self._cache.clear()
-            self._cache[key] = (_time.monotonic(), bars)
+            self._cache[key] = (_time.monotonic(), bars, complete)
+        if self.on_bars is not None:
+            try:
+                self.on_bars(symbol, bars, datetime.now(ET))
+            except Exception:  # a timing record must never stop trading
+                pass
         return bars
 
     def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
