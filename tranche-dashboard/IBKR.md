@@ -1,18 +1,20 @@
 # Interactive Brokers link (paper or LIVE)
 
-One Interactive Brokers account, paper or live, trades **one book**:
-`IBKR_BOOK`, the **5-minute book** by default. The scope is fixed in code:
+One Interactive Brokers account, paper or live, trades the books listed in
+`IBKR_BOOKS`: the **5-minute book** by default, or any of `5m`, `15m`, `1h`
+(for example `IBKR_BOOKS=5m,15m,1h`). The scope is fixed in code:
 
 | Rule | Where it is enforced |
 |---|---|
-| Only the 5-min book's symbols can be Live; the Live button exists only on that tab, and the server refuses it elsewhere | `app.py` live route, `LiveSync.selections` |
+| Only the listed books' symbols can be Live; the Live button exists only on those tabs, and the server refuses it elsewhere | `app.py` live route, `LiveSync.selections` |
+| **One book per symbol.** A symbol Live in one book can't be marked Live in another: one IBKR account holds one position per symbol | `app.py` live route, `LiveSync.conflict` |
 | Only the **5/10 EMA tranche** can be Live. VWAP-fail and 10/20 are refused | `Engine.set_live` (`LIVE_SLEEVES`), `LiveSync.selections` |
 | **Short only.** The account never goes above 0 shares; a long signal in the model means flat | `LiveSync.desired`; the adapter refuses any buy that would open a long |
 | **1 share** (`IBKR_MAX_SHARES`, the only size setting) | `BrokerSync.desired` and the adapter |
 | **Flat by 15:55**, whatever the symbol's own EOD switch | `Engine.day_only`: a Live symbol is close-by-end-of-day in the model |
 | **No new entry from 15:55**, and no entry at the next open from the 15:55-16:00 bar | `Engine._enter` |
-| **Entries:** a down-cross on any bar, or the 9:45 state entry if nothing was entered yet that day; at most 2 a day | `Engine._live_510` |
-| **Hard stop, fixed at entry:** cover on a 5-minute close above it, as a **market** order | `Engine._live_stop`, `LiveSync._order_type` |
+| **Entries:** a down-cross at any bar close of the symbol's book, or the 9:45 state entry if nothing was entered yet that day (5-min and 15-min books; an hourly book has no 9:45 bar, so it enters on crosses only); at most 2 a day | `Engine._live_510` |
+| **Hard stop, fixed at entry:** cover on a 5-minute close above it, as a **market** order. On 15-min and hourly books it is checked at every 5-minute close, not only at the book's own bar close | `Engine._live_stop`, `Engine.live_stop_sweep`, `LiveSync._order_type` |
 | **$100 daily loss limit** | `BrokerSync._check_loss` |
 
 The Alpaca paper accounts are not affected; each book keeps its own.
@@ -78,9 +80,15 @@ below), and equal is neither above nor below.
 
 ## Choosing what trades live
 
-- On the **5-min** tab, click **Live: off** on a row, tick **5/10 EMA cross
-  (short)**, then click **Save**. The row shows `IBKR 5/10 short · flat 3:55`
-  (`LIVE …` once the account is live).
+- On the tab of a listed book (`IBKR_BOOKS`; the **5-min** tab by default),
+  click **Live: off** on a row, tick **5/10 EMA cross (short)**, then click
+  **Save**. The row shows `IBKR 5/10 short · flat 3:55` (`LIVE …` once the
+  account is live). A symbol can be Live in one book at a time: to move it,
+  turn Live off in the old book first.
+- **Which book drives it decides the bars.** The same 5/10 rule runs on that
+  book's bars: 5-minute, 15-minute or hourly. Hourly bars are 9:30-10:00,
+  then on the hour. Orders go out after each check of that book, and the
+  stop is checked at every 5-minute close whatever the book.
 - Turning Live on applies these entry and stop rules to the model's 5/10
   tranche for that symbol, and makes the symbol flat by 15:55 **in the
   model**, for all its tranches. The model's other tranches keep trading, but
@@ -94,7 +102,9 @@ below), and equal is neither above nor below.
   shares** of each Live symbol: −1 while the model's 5/10 tranche is short,
   0 otherwise. So the live P&L is **not** the model's P&L. It tests the
   plumbing: signals, orders, borrow, fills and fees.
-- **When orders go out:** after each 5-min book check, every 5 minutes. The
+- **When orders go out:** after each check of the symbol's book (every 5
+  minutes on the 5-min book, 15 on the 15-min, hourly on the hourly), and for
+  a stop on any book within seconds of the 5-minute close that hits it. The
   check runs the book's **check delay** after the bar closes (Portfolio
   settings, in seconds); set it just above the data feed's lag in publishing
   a finished bar. The scheduler wakes within a second of that time, and if
@@ -354,7 +364,7 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 |---|---|---|
 | `IBKR_ACCOUNT` | (off) | `DU…` paper or `U…` live account ID |
 | `IBKR_MODE` | `paper` | `paper` or `live`; must match the account ID |
-| `IBKR_BOOK` | `5m` | The one book whose Live symbols trade at IBKR: `1h`, `15m` or `5m` |
+| `IBKR_BOOKS` | `5m` | The books whose Live symbols trade at IBKR, comma-separated from `5m`, `15m`, `1h` (for example `5m,15m,1h`). `IBKR_BOOK` (one book) is still read when this is unset |
 | `IBKR_MAX_SHARES` | 1 | Shares per symbol. The only size setting. Short only, so −1 by default |
 | `IBKR_DAILY_LOSS_LIMIT` | 100 | $ loss in a day that halts and flattens (live: must be > 0) |
 | `IBKR_MAX_ORDER_USD` | 1000 | Max value of one order |
@@ -367,9 +377,9 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 
 ## Not covered
 
-- **No resting stop orders at IBKR.** Exits happen at the 5-min book's checks
-  (every 5 minutes, 2 minutes after each bar closes), as in the model. A move
-  between checks is not protected. The loss limit is checked once a minute;
+- **No resting stop orders at IBKR.** Stop exits happen at the 5-minute
+  checks (the check delay after each 5-minute close, on every book), as in
+  the model. A move between checks is not protected. The loss limit is checked once a minute;
   its covers, like every cover except the stop, are marketable limit orders.
 - **No pre-borrow and no locate purchase.** If IBKR can't borrow a stock, that
   short is skipped.

@@ -3084,6 +3084,261 @@ class FastPipelineTests(unittest.TestCase):
         self.assertIsNone(seconds_after(bar, "not a time"))
 
 
+class MultiBookLiveTests(unittest.TestCase):
+    """Phase 2 of PLAN_TIMEFRAMES.md: the 15-min and hourly books can trade
+    live at IBKR (IBKR_BOOKS), one book per symbol, with the live stop checked
+    at every 5-minute close."""
+    NOW = datetime(2026, 9, 21, 10, 25, 10, tzinfo=ET)
+    D = date(2026, 9, 21)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
+        for st in self.stores.values():
+            st.save_settings({"bar_close_delay_min": 10 / 60})
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    def link(self, books=("5m", "15m", "1h")):
+        self.ib = FakeIB()
+        self.b = ibkr.IBKRBroker(ib_cfg(IBKR_BOOKS=",".join(books)), ib=self.ib, api=FakeApi)
+        labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
+        return LiveSync(self.stores["live"], self.b, {k: (labels[k], self.stores[k]) for k in labels},
+                        live_books=self.b.cfg.books, sleeves=LIVE_SLEEVES, fill_wait_s=0,
+                        max_shares=1, daily_loss_limit=100)
+
+    def add_live(self, book, sym, bars=()):
+        minutes = {"1h": 60, "15m": 15, "5m": 5}[book]
+        eng = Engine(self.stores[book], ScriptedProvider(list(bars)), minutes)
+        eng.add_symbols(sym, "short_only", 1.0, datetime(2026, 9, 18, 9, tzinfo=ET))
+        sid = self.stores[book].q("SELECT id FROM symbols WHERE symbol=?", (sym,))[0]["id"]
+        eng.set_live(sid, ["EMA5_10"], datetime(2026, 9, 18, 9, tzinfo=ET))
+        return eng, sid
+
+    def short(self, book, sid, sym, entry, stop=11.0):
+        return self.stores[book].x(
+            """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+               stop_price, risk_dollars, fee_through, trigger) VALUES (?,?,?,?,?,?,10,?,100,?,
+               'cross')""", (sid, sym, "EMA5_10", "short", 100, entry.isoformat(), stop,
+                            entry.date().isoformat()))
+
+    def five(self, closes, start=time(10, 0)):
+        """5-minute bars from `start` today with the given closes (highs just above)."""
+        out, t, prev = [], datetime.combine(self.D, start, tzinfo=ET), closes[0]
+        for c in closes:
+            out.append(Bar(t, t + FIVE, prev, max(prev, c) + 0.01, min(prev, c) - 0.01, c, 1000.0))
+            prev, t = c, t + FIVE
+        return out
+
+    # ---- the setting
+    def test_ibkr_books_lists_the_books_that_may_trade_live(self):
+        self.assertEqual(ib_cfg(IBKR_BOOKS="5m, 15m,1h,5m").books, ("5m", "15m", "1h"))
+        self.assertEqual(ib_cfg().books, ("5m",))                    # default: the 5-min book
+        self.assertEqual(ib_cfg(IBKR_BOOK="1h").books, ("1h",))       # the older single-book name
+        self.assertEqual(ib_cfg(IBKR_BOOKS="15m", IBKR_BOOK="1h").books, ("15m",))
+        with self.assertRaises(BrokerError):
+            ib_cfg(IBKR_BOOKS="5m,1d")
+        live = self.link(("5m", "1h"))
+        self.assertIs(app.live_link("1h", live), live)
+        self.assertIs(app.live_link("5m", live), live)
+        self.assertIsNone(app.live_link("15m", live))
+
+    # ---- one link, several books
+    def test_live_symbols_of_every_listed_book_trade_with_their_book_on_the_order(self):
+        live = self.link()
+        _e, a = self.add_live("1h", "AAA")
+        _e, b = self.add_live("15m", "BBB")
+        self.short("1h", a, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        self.short("15m", b, "BBB", datetime(2026, 9, 21, 10, tzinfo=ET))
+        sel = live.selections()
+        self.assertEqual({k: v["book"] for k, v in sel.items()}, {"AAA": "1h", "BBB": "15m"})
+        live.sync(self.NOW, self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": -1})
+        books = {r["symbol"]: r["book"] for r in self.stores["live"].q("SELECT * FROM orders")}
+        self.assertEqual(books, {"AAA": "1h", "BBB": "15m"})
+        recon = {r["symbol"]: r["book"] for r in live.status()["reconciliation"]}
+        self.assertEqual(recon, {"AAA": "Hourly", "BBB": "15-min"})
+
+    def test_a_book_not_listed_is_ignored_and_a_symbol_is_live_in_one_book(self):
+        live = self.link(("5m", "1h"))
+        _e, f = self.add_live("15m", "AAA")                 # 15-min isn't listed
+        self.short("15m", f, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        self.assertEqual(live.selections(), {})
+        _e, h = self.add_live("1h", "CCC")
+        self.assertEqual(live.conflict("CCC", "5m"), "Hourly")
+        self.assertIsNone(live.conflict("CCC", "1h"))      # its own book is no conflict
+        self.assertIsNone(live.conflict("ZZZ", "5m"))
+
+    # ---- the 5-minute stop watch
+    def test_an_hourly_live_stop_is_taken_at_the_5_minute_close_not_the_hour(self):
+        bars = self.five([10.5, 10.6, 10.8, 10.9, 11.2])     # 10:20-10:25 closes 11.2 > stop 11
+        eng, sid = self.add_live("1h", "AAA", bars)
+        self.stores["1h"].x("UPDATE symbols SET last_bar_end=? WHERE id=?",
+                            (datetime(2026, 9, 21, 10, tzinfo=ET).isoformat(), sid))
+        self.short("1h", sid, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        got = eng.live_stop_sweep(self.NOW)
+        self.assertEqual((got["symbols"], got["closed"], got["waiting"]), (1, 1, 0))
+        t = self.stores["1h"].q("SELECT * FROM tranches")[0]
+        self.assertEqual((t["status"], _dt(t["exit_time"])), ("closed", datetime(2026, 9, 21, 10, 25, tzinfo=ET)))
+        self.assertTrue(t["exit_reason"].startswith("stop: 5-min close 11.2 above the fixed stop 11"))
+        self.assertEqual(eng.live_stop_sweep(self.NOW)["closed"], 0)   # nothing left to stop
+
+    def test_the_sweep_waits_for_a_missing_5_minute_bar_and_skips_old_ones(self):
+        bars = self.five([11.5, 10.6, 10.8, 10.9])            # 10:00-10:05 above the stop, then fine
+        eng, sid = self.add_live("1h", "AAA", bars)           # ...and the 10:20-10:25 bar not in yet
+        self.stores["1h"].x("UPDATE symbols SET last_bar_end=? WHERE id=?",
+                            (datetime(2026, 9, 21, 10, 5, tzinfo=ET).isoformat(), sid))
+        self.short("1h", sid, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        got = eng.live_stop_sweep(self.NOW)
+        self.assertEqual((got["closed"], got["waiting"]), (0, 1))  # 10:05 was already processed
+        self.assertEqual(self.stores["1h"].q("SELECT status FROM tranches")[0]["status"], "open")
+
+    def test_the_5_min_book_has_no_sweep(self):
+        eng, sid = self.add_live("5m", "AAA", self.five([11.5]))
+        self.short("5m", sid, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        self.assertEqual(eng.live_stop_sweep(self.NOW), {"symbols": 0, "closed": 0, "waiting": 0})
+
+    def test_the_hourly_scheduler_runs_the_sweep_and_covers_at_market_at_once(self):
+        live = self.link(("5m", "1h"))
+        live.store.save_settings({"broker_sync_enabled": True})
+        bars = self.five([10.5, 10.6, 10.8, 10.9, 11.2])
+        eng, sid = self.add_live("1h", "AAA", bars)
+        self.stores["1h"].x("UPDATE symbols SET last_bar_end=? WHERE id=?",
+                            (datetime(2026, 9, 21, 10, tzinfo=ET).isoformat(), sid))
+        self.short("1h", sid, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        self.ib.pos = {"AAA": -1}
+        self.stores["live"].x("""INSERT INTO orders (ts, symbol, side, qty, client_order_id, status)
+                                 VALUES (?, 'AAA', 'sell', 1, 'x', 'filled')""",
+                              (datetime(2026, 9, 21, 10, 0, 10, tzinfo=ET).isoformat(),))
+        now = {"t": datetime(2026, 9, 21, 10, 24, 50, tzinfo=ET)}
+        clock = type("C", (), {"demo": False, "now": lambda s: now["t"]})()
+        sched = app.Scheduler(eng, clock, None, live)
+        self.assertTrue(sched.stop_due(now["t"]))             # the 10:20 close is due
+        sched._stop_at = datetime(2026, 9, 21, 10, 20, 11, tzinfo=ET)   # ...and was checked
+        self.assertFalse(sched.stop_due(now["t"]))            # 10:25 + 10 s not reached yet
+        self.assertLessEqual(sched.pause(now["t"]), 20.0)
+        self.assertGreaterEqual(sched.pause(datetime(2026, 9, 21, 10, 25, 9, 500000, tzinfo=ET)), 1.0)
+        self.assertLessEqual(sched.pause(datetime(2026, 9, 21, 10, 25, 8, tzinfo=ET)), 2.0)  # wakes for 10:25:10
+        now["t"] = self.NOW
+        self.assertTrue(sched.stop_due(now["t"]))
+        sched.run_stop_check()
+        self.assertEqual(self.ib.pos, {})                     # covered
+        self.assertEqual(self.ib.placed[-1][1].orderType, "MKT")
+        o = self.stores["live"].q("SELECT * FROM orders ORDER BY id DESC LIMIT 1")[0]
+        self.assertEqual((o["book"], o["bar_end"]), ("1h", datetime(2026, 9, 21, 10, 25, tzinfo=ET).isoformat()))
+        row = self.stores["1h"].q("SELECT * FROM checks")[0]
+        self.assertEqual((row["kind"], row["symbols"]), ("stop", 1))
+        self.assertTrue(row["ibkr_done"])
+        self.assertFalse(sched.stop_due(now["t"] + timedelta(seconds=30)))  # nothing open now
+
+    def test_a_missing_bar_retries_the_sweep_every_5_seconds_for_a_minute(self):
+        live = self.link(("5m", "1h"))
+        live.store.save_settings({"broker_sync_enabled": True})
+        eng, sid = self.add_live("1h", "AAA", self.five([10.5, 10.6, 10.8, 10.9]))
+        self.stores["1h"].x("UPDATE symbols SET last_bar_end=? WHERE id=?",
+                            (datetime(2026, 9, 21, 10, tzinfo=ET).isoformat(), sid))
+        self.short("1h", sid, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        now = {"t": self.NOW}
+        clock = type("C", (), {"demo": False, "now": lambda s: now["t"]})()
+        sched = app.Scheduler(eng, clock, None, live)
+        sched.run_stop_check()
+        self.assertTrue(sched._stop_waiting)
+        self.assertFalse(sched.stop_due(self.NOW + timedelta(seconds=3)))
+        self.assertTrue(sched.stop_due(self.NOW + timedelta(seconds=5)))
+        self.assertEqual(sched.pause(self.NOW + timedelta(seconds=5)), 5.0)
+        self.assertFalse(sched.stop_due(self.NOW + timedelta(seconds=75)))   # the minute is over
+
+    def test_a_book_without_the_link_or_without_an_open_live_short_does_not_sweep(self):
+        live = self.link(("5m", "1h"))
+        live.store.save_settings({"broker_sync_enabled": True})
+        eng, _sid = self.add_live("1h", "AAA")
+        clock = type("C", (), {"demo": False, "now": lambda s: self.NOW})()
+        self.assertFalse(app.Scheduler(eng, clock, None, live).stop_due(self.NOW))  # nothing open
+        self.assertFalse(app.Scheduler(eng, clock, None, None).stop_due(self.NOW))  # no link
+
+    # ---- entries per book
+    def test_hourly_has_no_state_entry_and_15_min_enters_at_its_9_45_close(self):
+        from engine import Fill
+        for book, minutes, want in (("1h", 60, 0), ("15m", 15, 1)):
+            eng, sid = self.add_live(book, "AAA")
+            start = datetime.combine(self.D, time(9, 30), tzinfo=ET)
+            first = Bar(start, start + timedelta(minutes=minutes if minutes < 60 else 30),
+                        10, 10.3, 9.8, 9.9, 1000.0)
+            sym = self.stores[book].q("SELECT * FROM symbols WHERE id=?", (sid,))[0]
+            eng._live_510(sym, None, Fill(first.close, first.end, first.session, "close"), [first],
+                          [first], 0, [9.0], [9.5], self.stores[book].settings(), "ctx",
+                          lambda: ("abs", 0.5, "unit"))
+            got = self.stores[book].q("SELECT trigger FROM tranches")
+            self.assertEqual(len(got), want, book)
+            if want:
+                self.assertEqual(got[0]["trigger"], "state_0945")
+
+    # ---- the dashboard route
+    def test_http_live_mark_rules_across_books(self):
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        live = self.link(("5m", "1h"))
+        engines = {k: Engine(self.stores[k], ScriptedProvider([]), m)
+                   for k, m in (("1h", 60), ("15m", 15), ("5m", 5))}
+        ids = {}
+        for k in ("1h", "15m", "5m"):
+            engines[k].add_symbols("AAA", "short_only", 1.0, self.NOW)
+            ids[k] = self.stores[k].q("SELECT id FROM symbols")[0]["id"]
+
+        class Clock:
+            demo = False
+
+            def now(s):
+                return self.NOW
+
+        class B:
+            def __init__(s, key, label, eng):
+                s.key, s.label, s.engine, s.minutes = key, label, eng, eng.minutes
+                s.sched = app.Scheduler(eng, Clock(), None, app.live_link(key, live))
+                s.link_note = "no paper keys"
+        books = {k: B(k, l, engines[k]) for k, l in (("1h", "Hourly"), ("15m", "15-min"), ("5m", "5-min"))}
+        old = os.environ.pop("TRANCHE_PASSWORD", None)
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(books, "demo", None, None, live))
+        finally:
+            if old is not None:
+                os.environ["TRANCHE_PASSWORD"] = old
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def call(path, body):
+            req = urllib.request.Request(base + path, method="POST", data=_json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, _json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, _json.loads(e.read())
+        try:
+            code, body = call(f"/api/15m/symbols/{ids['15m']}/live", {"sleeves": ["EMA5_10"]})
+            self.assertEqual(code, 400)
+            self.assertIn("IBKR_BOOKS", _json.dumps(body))
+            code, _b = call(f"/api/1h/symbols/{ids['1h']}/live", {"sleeves": ["EMA5_10"]})
+            self.assertEqual(code, 200)
+            code, body = call(f"/api/5m/symbols/{ids['5m']}/live", {"sleeves": ["EMA5_10"]})
+            self.assertEqual(code, 400)
+            self.assertIn("already Live in the Hourly book", _json.dumps(body))
+            code, _b = call(f"/api/1h/symbols/{ids['1h']}/live", {"sleeves": []})   # off there...
+            self.assertEqual(code, 200)
+            code, _b = call(f"/api/5m/symbols/{ids['5m']}/live", {"sleeves": ["EMA5_10"]})  # ...then here
+            self.assertEqual(code, 200)
+            state = app.live_state(live)
+            self.assertEqual((state["books"], state["book_labels"]), (["5m", "1h"], ["5-min", "Hourly"]))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 class TimingReportTests(unittest.TestCase):
     """timing_report.py: the Monday read-out of the Phase 1 timing record."""
 

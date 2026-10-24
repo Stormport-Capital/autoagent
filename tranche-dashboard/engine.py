@@ -46,7 +46,7 @@ from dataclasses import dataclass
 import re
 from datetime import date, datetime, time, timedelta
 
-from indicators import (ET, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, ema_side, percentile,
+from indicators import (ET, RTH_CLOSE, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, ema_side, percentile,
                         price_tick,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
                         resample, session_bar_ends, session_vwap)
@@ -706,9 +706,14 @@ class Engine:
         """Live 5/10 short hard stop: the first regular-hours 5-minute bar after
         entry, up to the end of book bar b, whose CLOSE is above the tranche's
         stop_price, which is fixed at entry and never moves. Covers at that close."""
+        return self._live_stop_between(t, five, b.start, b.end, s)
+
+    def _live_stop_between(self, t: dict, five: list[Bar], after: datetime, upto: datetime,
+                           s) -> bool:
+        """The live stop rule on the 5-minute bars ending in (after, upto]."""
         opened, stop = _dt(t["entry_time"]), t["stop_price"]
         for x in five:
-            if x.end <= opened or x.end <= b.start or x.end > b.end or not in_rth(x.start):
+            if x.end <= opened or x.end <= after or x.end > upto or not in_rth(x.start):
                 continue
             if x.close > stop:
                 self._close(t, x.close, x.end,
@@ -716,6 +721,57 @@ class Engine:
                             f"({x.start.astimezone(ET):%b %d %H:%M}-{x.end.astimezone(ET):%H:%M} bar)", s)
                 return True
         return False
+
+    def _live_open(self) -> list[dict]:
+        """Open live 5/10 shorts of this book's Live symbols."""
+        return self.store.q(
+            "SELECT t.* FROM tranches t JOIN symbols s ON s.id = t.symbol_id "
+            "WHERE t.status='open' AND t.side='short' AND t.sleeve='EMA5_10' "
+            "AND t.trigger IN (?, ?) AND s.live IS NOT NULL AND s.status != 'removed' "
+            "ORDER BY t.id", LIVE_TRIGGERS)
+
+    def has_open_live(self) -> bool:
+        return bool(self._live_open())
+
+    def live_stop_sweep(self, now: datetime) -> dict:
+        """Books with bars longer than 5 minutes: check each open live 5/10
+        short's fixed stop on every 5-minute close, not only when the book's
+        own bar closes. Without this an hourly book's stop cover reached IBKR
+        up to 55 minutes after the 5-minute close that triggered it, and a
+        15-min book's up to 10 minutes after. Looks at the regular-hours
+        5-minute bars that closed after the symbol's last processed book bar
+        and at least the check delay ago. The model covers at that bar's close,
+        exactly as the book's own check would. Returns counts: symbols checked,
+        tranches closed, and symbols whose newest 5-minute bar hasn't arrived."""
+        out = {"symbols": 0, "closed": 0, "waiting": 0}
+        if self.minutes <= 5:
+            return out
+        rows = self._live_open()
+        if not rows:
+            return out
+        s = self.store.settings()
+        upto = now - timedelta(minutes=s["bar_close_delay_min"])
+        local = upto.astimezone(ET)
+        due = local.replace(minute=local.minute - local.minute % 5, second=0, microsecond=0)
+        if local.weekday() >= 5 or not time(9, 35) <= due.time() <= RTH_CLOSE:
+            due = None
+        names = sorted({r["symbol"] for r in rows})
+        out["symbols"] = len(names)
+        fetched = self._fetch_all(names, now)
+        with self.store.lock:
+            for t in self._live_open():  # re-read under the lock
+                five = fetched.get(t["symbol"])
+                if not isinstance(five, list):
+                    continue  # its fetch failed; the next check reports it
+                sym = next(iter(self.store.q("SELECT last_bar_end FROM symbols WHERE id=?",
+                                             (t["symbol_id"],))), {})
+                after = _dt(sym.get("last_bar_end")) or _dt(t["entry_time"])
+                if self._live_stop_between(t, five, after, upto, s):
+                    out["closed"] += 1
+        if due is not None:
+            out["waiting"] = sum(1 for n in names if isinstance(fetched.get(n), list)
+                                 and not any(x.end >= due for x in fetched[n]))
+        return out
 
     def _live_cross(self, sym: dict, e5: list, e10: list, i: int, tick: float) -> tuple[int, bool]:
         """The live 5/10 cross on bar i (-1 down, +1 up, 0 none) and whether it
