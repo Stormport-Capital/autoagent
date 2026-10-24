@@ -3339,6 +3339,50 @@ class MultiBookLiveTests(unittest.TestCase):
             srv.server_close()
 
 
+class LinkDownWarningTests(unittest.TestCase):
+    """The dashboard warns when the IBKR link is down while a position may be
+    open: it keeps the last positions IBKR reported, with their time."""
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    def test_status_keeps_the_last_good_positions_when_the_gateway_drops(self):
+        ib = FakeIB()
+        b = ibkr.IBKRBroker(ib_cfg(), ib=ib, api=FakeApi)
+        labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
+        live = LiveSync(self.stores["live"], b, {k: (labels[k], self.stores[k]) for k in labels},
+                        live_book="5m", sleeves=LIVE_SLEEVES, fill_wait_s=0, max_shares=1,
+                        daily_loss_limit=100)
+        eng = Engine(self.stores["5m"], ScriptedProvider([]), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW)
+        sid = self.stores["5m"].q("SELECT id FROM symbols")[0]["id"]
+        eng.set_live(sid, ["EMA5_10"], self.NOW)
+        self.stores["5m"].x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                               entry_price, stop_price, risk_dollars, fee_through, trigger)
+                               VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21','cross')""",
+                            (sid, "AAA", "EMA5_10", "short", 100, self.NOW.isoformat()))
+        live.sync(self.NOW)
+        st = live.status()
+        self.assertEqual((st["error"], st["last_positions"]), (None, {"AAA": -1}))
+
+        async def refuse(*a, **k):
+            raise ConnectionRefusedError()
+        ib.connected, ib.connectAsync = False, refuse      # the gateway is logged out
+        b._next_try = 0
+        st = live.status(max_age_s=0)
+        self.assertIn("IB Gateway", st["error"])
+        self.assertEqual(st["last_positions"], {"AAA": -1})  # still shown: what may be open
+        self.assertIsNotNone(st["positions_at"])
+        self.assertEqual([(r["symbol"], r["model"]) for r in st["reconciliation"]], [("AAA", -1)])
+
+
 class TimingReportTests(unittest.TestCase):
     """timing_report.py: the Monday read-out of the Phase 1 timing record."""
 

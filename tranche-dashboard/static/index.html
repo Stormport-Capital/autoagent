@@ -120,6 +120,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
   </div>
 </header>
 <main>
+  <div class="msg err" id="liveAlert" style="display:none"></div>
   <div class="kpis" id="kpis"></div>
 
   <div class="grid2">
@@ -324,6 +325,7 @@ function render() {
   renderSettings(S.settings);
   renderWatch(S);
   renderBroker(S.broker, {p: "bk", on: S.settings.broker_sync_enabled, toggle: bk("/api/settings"), key: "broker_sync_enabled", sync: bk("/api/broker/sync")});
+  renderLiveAlert(S.live || {});
   renderBroker(S.live, {p: "lv", on: S.live.enabled, toggle: "/api/live/settings", key: "enabled", sync: "/api/live/sync", kill: "/api/live/kill", shared: true});
   renderChart(m.curve, m.starting_capital, S.broker.curve || []);
   renderPerf(m);
@@ -436,6 +438,20 @@ function renderChart(curve, start, paper) {
 const SL_SHORT = {EMA5_10: "5/10", EMA10_20: "10/20", VWAP: "VWAP"};
 
 // one broker card: this book's Alpaca paper account (p="bk") or the shared IBKR account (p="lv")
+function renderLiveAlert(L) {
+  // The IBKR link can't reach the account while a position may be open there:
+  // stops and the 3:55 flat can't be sent until IB Gateway is back.
+  const el = $("#liveAlert");
+  const held = Object.entries(L.last_positions || {}).filter(([, q]) => q);
+  const model = (L.reconciliation || []).filter(r => r.model);
+  if (!(L.configured && L.enabled && L.error && (held.length || model.length))) { el.style.display = "none"; return; }
+  el.style.display = "";
+  el.innerHTML = `<b>IBKR link is down while a position may be open.</b> ${esc(L.error)}. ` +
+    (held.length ? `Last seen at IBKR (${fmtT(L.positions_at)}): ${held.map(([s, q]) => `${esc(s)} ${q}`).join(", ")}. ` : "") +
+    (model.length ? `The model wants ${model.map(r => `${esc(r.symbol)} ${r.model}`).join(", ")}. ` : "") +
+    `Stops and the 3:55 PM flat can't reach IBKR until IB Gateway is back: check the gateway (approve the 2FA on IBKR Mobile), or manage the position in the IBKR app.`;
+}
+
 function renderBroker(B, o) {
   const id = x => $(`#${o.p}${x}`);
   if (!B.configured) {

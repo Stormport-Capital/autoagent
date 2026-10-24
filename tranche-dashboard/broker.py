@@ -176,6 +176,8 @@ class BrokerSync:
         self.snapshot_at = 0.0
         self.needs_followup = False            # an order was working: re-sync soon
         self.book: str | None = None           # recorded on each order (the IBKR link sets it)
+        self.last_positions: dict[str, int] = {}  # the broker's positions at the last good read
+        self.positions_at: datetime | None = None  # ...and when that was (for the "link down" warning)
         self._bar_end: str | None = None       # the bar whose check this sync serves
 
     # ---------------------------------------------------------------- sync
@@ -197,6 +199,11 @@ class BrokerSync:
     def _book_for(self, sym: str) -> str | None:
         """The book recorded on an order for `sym`."""
         return self.book
+
+    def _seen_positions(self, pos: dict[str, int]) -> None:
+        """Remember the broker's positions from a good read, so the dashboard
+        can say what may still be open when the link goes down."""
+        self.last_positions, self.positions_at = dict(pos), datetime.now(ET)
 
     def desired(self) -> dict[str, int]:
         want = self._net()
@@ -239,6 +246,7 @@ class BrokerSync:
                     self._cancel(now, sym, o, "closing everything")
         want = {} if flatten else self.desired()
         pos = {s: int(float(p["qty"])) for s, p in self.broker.positions().items()}
+        self._seen_positions(pos)
         busy = {o["symbol"]: o for o in self.broker.open_orders()}
         self.needs_followup = False
         # a renamed ticker waits until the account has converted the old one
@@ -514,6 +522,7 @@ class BrokerSync:
                 acct = self.broker.account()
                 pos = self.broker.positions()
                 self.snapshot = {"account": acct, "positions": pos, "error": None}
+                self._seen_positions({s: int(float(p["qty"])) for s, p in pos.items()})
             except (BrokerError, requests.RequestException) as e:
                 self.snapshot = {"account": None, "positions": {}, "error": _msg(e)}
             self.snapshot_at = _time.monotonic()
@@ -558,6 +567,9 @@ class BrokerSync:
                 "trading_blocked": acct.get("trading_blocked"),
             },
             "error": self.snapshot["error"] or self.last_error,
+            "last_positions": {k: v for k, v in self.last_positions.items()
+                               if v and k in self.managed()},
+            "positions_at": self.positions_at.isoformat() if self.positions_at else None,
             "last_sync": self.last_sync.isoformat() if self.last_sync else None,
             "reconciliation": recon,
             "orders": [dict(r, sent_s=seconds_after(r.get("bar_end"), r.get("sent_at")),
