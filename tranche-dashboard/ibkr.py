@@ -1,9 +1,10 @@
-"""Interactive Brokers link (paper or LIVE) for ONE book (IBKR_BOOK, default the
-5-minute book), through IB Gateway.
+"""Interactive Brokers link (paper or LIVE) for the books in IBKR_BOOKS (default
+the 5-minute book only; for example IBKR_BOOKS=5m,15m,1h), through IB Gateway.
 
 Scope: short only, the 5/10 EMA tranche only, flat by 15:55, one share. Which
-symbols trade is chosen per watchlist row in that book (Live button);
-broker.LiveSync turns those choices into one target position per ticker.
+symbols trade is chosen per watchlist row in those books (Live button), one
+book per symbol; broker.LiveSync turns those choices into one target position
+per ticker.
 
 IBKRBroker speaks the same small interface as broker.AlpacaPaper (account,
 positions, open_orders, submit, get_order) plus cancel / quote / short_check /
@@ -36,6 +37,7 @@ import asyncio
 import concurrent.futures
 import math
 import os
+import re
 import threading
 import time as _time
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ from broker import BrokerError
 from indicators import ET
 
 DEFAULT_PORTS = {"paper": 4002, "live": 4001}  # IB Gateway; TWS uses 7497 / 7496
+BOOK_KEYS = ("1h", "15m", "5m")  # books that may be listed in IBKR_BOOKS
 DONE = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
 STATUS = {"Filled": "filled", "Cancelled": "canceled", "ApiCancelled": "canceled",
           "Inactive": "rejected"}
@@ -55,7 +58,8 @@ WARNING_CODES = {0, 399, 2104, 2106, 2107, 2108, 2158, 10167}  # informational, 
 class IBKRConfig:
     account: str
     mode: str                  # paper | live
-    book: str = "5m"           # the one book whose Live symbols trade here
+    book: str = "5m"           # the first book in `books` (kept for single-book callers)
+    books: tuple = ("5m",)     # the books whose Live symbols trade here (IBKR_BOOKS)
     host: str = "127.0.0.1"
     port: int = 4002
     client_id: int = 17
@@ -96,9 +100,12 @@ def config_from_env(env=None) -> IBKRConfig | None:
         raise BrokerError(f"IBKR_MODE=paper but {account} is not a paper account ID (DU...)")
     if mode == "live" and not (account.startswith("U") and account[1:].isdigit()):
         raise BrokerError(f"IBKR_MODE=live but {account} is not a live account ID (U...)")
-    book = (env.get("IBKR_BOOK") or "5m").strip().lower()
-    if book not in ("1h", "15m", "5m"):
-        raise BrokerError("IBKR_BOOK must be 1h, 15m or 5m")
+    raw = env.get("IBKR_BOOKS") or env.get("IBKR_BOOK") or "5m"  # IBKR_BOOK: the older name
+    books = tuple(dict.fromkeys(x for x in re.split(r"[\s,;]+", raw.strip().lower()) if x))
+    bad = [x for x in books if x not in BOOK_KEYS]
+    if bad or not books:
+        raise BrokerError(f"IBKR_BOOKS must list books from {', '.join(BOOK_KEYS)} "
+                          f"(for example 5m,15m,1h); got {raw!r}")
     order_type = (env.get("IBKR_ORDER_TYPE") or "limit").strip().lower()
     if order_type not in ("limit", "market"):
         raise BrokerError("IBKR_ORDER_TYPE must be limit or market")
@@ -106,7 +113,7 @@ def config_from_env(env=None) -> IBKRConfig | None:
     if mode == "live" and loss <= 0:
         raise BrokerError("IBKR_DAILY_LOSS_LIMIT must be above 0 for a live account")
     return IBKRConfig(
-        account=account, mode=mode, book=book,
+        account=account, mode=mode, book=books[0], books=books,
         host=(env.get("IBKR_HOST") or "127.0.0.1").strip(),
         port=_num(env, "IBKR_PORT", DEFAULT_PORTS[mode], int, 1),
         client_id=_num(env, "IBKR_CLIENT_ID", 17, int, 0),

@@ -301,7 +301,7 @@ function render() {
     `<span>Data: ${esc(S.provider)}</span>`,
     `<span>${S.demo ? "Sim time" : "Now"}: ${fmtT(S.now)} · market ${S.market_open ? "open" : "closed"}</span>`,
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
-    S.last_check ? `<span title="Seconds after the bar closed: bars fetched${S.last_check.ibkr_s == null ? "" : ", IBKR sync done"}, check done">${S.last_check.kind === "retry" ? "Retry" : "Bar"} ${fmtT(S.last_check.bar_end)}: data +${S.last_check.data_s ?? "—"} s${S.last_check.ibkr_s == null ? "" : `, IBKR +${S.last_check.ibkr_s} s`}, done +${S.last_check.done_s ?? "—"} s${S.last_check.behind ? ` · <span class="neg">${S.last_check.behind} waiting for data</span>` : ""}</span>` : "",
+    S.last_check ? `<span title="Seconds after the bar closed: bars fetched${S.last_check.ibkr_s == null ? "" : ", IBKR sync done"}, check done">${S.last_check.kind === "retry" ? "Retry" : S.last_check.kind === "stop" ? "Stop check" : "Bar"} ${fmtT(S.last_check.bar_end)}: data +${S.last_check.data_s ?? "—"} s${S.last_check.ibkr_s == null ? "" : `, IBKR +${S.last_check.ibkr_s} s`}, done +${S.last_check.done_s ?? "—"} s${S.last_check.behind ? ` · <span class="neg">${S.last_check.behind} waiting for data</span>` : ""}</span>` : "",
     S.backup ? (S.backup.error ? `<span class="neg">${esc(S.backup.error)}</span>`
       : `<span title="${esc(S.backup.folder)}">Backed up ${fmtT(S.backup.last)}</span>`) : "",
     `<a href="/api/${BOOK}/download.db" title="Download a copy of this book's database">Download backup</a>`,
@@ -373,7 +373,7 @@ function renderWatch(S) {
       <td><button class="small" data-act="bars" data-sym="${esc(s.symbol)}" title="Every bar the engine used, with EMAs, ATR, VWAP and signals">Bars</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
         <button class="small" data-act="eod" data-id="${s.id}" data-on="${s.eod_close ? 0 : 1}" title="${s.eod_close ? "Stop closing at end of day (positions may be held overnight again)" : "Trade all day, then be flat at the 3:55 PM close every session"}">${s.eod_close ? "EOD close: on" : "EOD close: off"}</button>
-        ${STATE.live.configured && STATE.live.book === BOOK ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" title="Trade this symbol's 5/10 EMA short at IBKR (one share, flat by 3:55 PM)">${s.live ? "Live: on" : "Live: off"}</button>` : ""}
+        ${STATE.live.configured && (STATE.live.books || [STATE.live.book]).includes(BOOK) ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" title="Trade this symbol's 5/10 EMA short at IBKR (one share, flat by 3:55 PM)">${s.live ? "Live: on" : "Live: off"}</button>` : ""}
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
         <button class="small" data-act="rename" data-id="${s.id}" data-sym="${esc(s.symbol)}" title="Ticker changed? Move this symbol and its open positions to the new ticker">Rename</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
@@ -449,7 +449,7 @@ function renderBroker(B, o) {
     (C.kill ? `<span class="pill warn">kill switch: ${esc(C.kill)}</span>` : on ? '<span class="pill long">orders on</span>' : '<span class="pill">orders off</span>');
   const mism = (B.reconciliation || []).filter(r => !r.match);
   let h = `<label class="switch"><input type="checkbox" id="${o.p}Toggle" ${on ? "checked" : ""}> Send ${o.shared ? "the Live symbols' trades" : "the model's trades"} to ${V}</label>
-    <div class="hint">${esc(B.endpoint)}. ${o.shared ? `${esc(B.book_label)} book only: mark symbols with the <b>Live</b> button on that tab's watchlist. 5/10 EMA short only, flat by 3:55 PM. Orders go out after each ${esc(B.book_label)} check.` : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
+    <div class="hint">${esc(B.endpoint)}. ${o.shared ? `${esc((B.book_labels || [B.book_label]).join(", "))} book${(B.book_labels || []).length > 1 ? "s" : ""}: mark symbols with the <b>Live</b> button on that tab's watchlist, one book per symbol. 5/10 EMA short only, flat by 3:55 PM. Orders go out after each check of the symbol's book; stops are checked on every 5-minute close.` : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
   if (C.max_shares || C.daily_loss_limit)
     h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (${o.shared ? "short only: the 5/10 short's direction, not its size" : "the model's direction, not its size"})` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
   if (a) h += `<div class="bk-kpis">
@@ -698,6 +698,10 @@ $("#watch").onclick = async e => {
   if (b.dataset.act === "live") {
     const dlg = $("#liveDlg"), cur = (b.dataset.v || "").split(",");
     $("#liveSym").textContent = `${b.dataset.sym} (${STATE.book.label} book)`;
+    const m = STATE.book.minutes, bars = m >= 60 ? "hourly" : `${m}-minute`;
+    $("#liveEntry").textContent = m >= 60
+      ? `Entry: a down-cross at an hourly bar close (stop: the day's high at entry); there is no 9:45 entry on hourly bars; at most 2 a day.`
+      : `Entry: a down-cross at any ${bars} bar close (stop: the day's high at entry), or the 9:45 bar close if the 5 EMA is below the 10 and nothing was entered yet that day (stop: the 9:30-9:45 high); at most 2 a day.`;
     $("#liveCap").textContent = (STATE.live.control || {}).max_shares || "no";
     dlg.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = cur.includes(c.value));
     dlg.onclose = async () => {
@@ -735,7 +739,7 @@ setInterval(refresh, 5000);
 <dialog id="liveDlg">
   <form method="dialog">
     <h3 style="margin:0 0 6px">IBKR live: <span id="liveSym"></span></h3>
-    <div class="hint" style="margin:0 0 8px">IBKR follows this symbol's 5/10 EMA tranche, short only (a long signal means flat), <span id="liveCap"></span> share(s). Entry: a down-cross on any bar (stop: the day's high at entry), or the 9:45 bar close if the 5 EMA is below the 10 and nothing was entered yet that day (stop: the 9:30-9:45 high); at most 2 a day. Exit: a 5-minute close above the stop (market order), the up-cross, or the 3:55 PM close. Turning Live on applies these rules to the model's 5/10 tranche for this symbol and makes the symbol flat by 3:55. VWAP-fail and 10/20 can't trade live.</div>
+    <div class="hint" style="margin:0 0 8px">IBKR follows this symbol's 5/10 EMA tranche, short only (a long signal means flat), <span id="liveCap"></span> share(s). <span id="liveEntry"></span> Exit: a 5-minute close above the stop (checked at every 5-minute close; market order), the up-cross, or the 3:55 PM close. One book per symbol. Turning Live on applies these rules to the model's 5/10 tranche for this symbol and makes the symbol flat by 3:55. VWAP-fail and 10/20 can't trade live.</div>
     <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross (short)</label>
     <div class="row" style="margin-top:12px"><button value="save" class="primary">Save</button> <button value="off">Live off</button> <button value="cancel">Cancel</button></div>
   </form>

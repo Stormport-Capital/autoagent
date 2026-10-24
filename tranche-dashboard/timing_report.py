@@ -101,8 +101,11 @@ def report(folder: Path, day: str) -> str:
             out.append(f"  {label}: no checks recorded")
             continue
         waiting = sum(1 for r in checks if r["behind"])
-        out.append(f"  {label}: {len(checks)} checks, {len(rows) - len(checks)} retries; "
-                   f"{waiting} check(s) left a symbol waiting for its bar")
+        retries = sum(1 for r in rows if r["kind"] == "retry")
+        stops = [r for r in rows if r["kind"] == "stop"]
+        out.append(f"  {label}: {len(checks)} checks, {retries} retries"
+                   + (f", {len(stops)} 5-minute stop checks" if stops else "")
+                   + f"; {waiting} check(s) left a symbol waiting for its bar")
         out.append(f"    bars fetched  {_stats([seconds_after(r['bar_end'], r['data_at']) for r in checks])}")
         ibkr = [seconds_after(r["bar_end"], r["ibkr_done"]) for r in checks if r["ibkr_done"]]
         if ibkr:

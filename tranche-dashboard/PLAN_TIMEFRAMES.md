@@ -2,8 +2,13 @@
 
 Status: **Phase 1 built** (2026-10-23): fixes L1-L4 and L7, the timing
 record and its dashboard display; its exit criteria need a market day on the
-droplet. Phases 2-6 not started. Written 2026-10-22 from a read of the code at
-commit 7724ae7 and the measurements made on the droplet in October 2026.
+droplet. **Phase 2 built** (2026-10-24) except item 7 (thin-name bar
+completeness, which needs Phase 1's arrival data); it ships off: nothing
+changes until `IBKR_BOOKS` lists more than `5m`. Built with D2 (a) (an hourly
+book has no 9:45 bar, so no state entry) and D6 (a) (one book per symbol);
+D1 is unchanged (hourly bars 9:30-10:00, then on the hour) until checked.
+Phases 3-6 not started. Written 2026-10-22 from a read of the code at commit
+7724ae7 and the measurements made on the droplet in October 2026.
 
 ## 1. Goal
 

@@ -77,7 +77,8 @@ KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
 OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
                  "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",  # 15-min book's paper account
                  "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",  # 5-min book's paper account
-                 "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOK")  # Interactive Brokers (IBKR.md)
+                 "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOKS",  # Interactive Brokers (IBKR.md)
+                 "IBKR_BOOK")  # older single-book name, still read when IBKR_BOOKS is unset
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -248,6 +249,8 @@ class Scheduler(threading.Thread):
         self.last_error: str | None = None
         self._paper_job: threading.Thread | None = None
         self._pruned: date | None = None
+        self._stop_at: datetime | None = None  # last 5-minute stop check (books above 5 min)
+        self._stop_waiting = False             # ...and a symbol's 5-minute bar was missing
 
     def delay(self) -> timedelta:
         return timedelta(minutes=self.engine.store.settings()["bar_close_delay_min"])
@@ -356,8 +359,66 @@ class Scheduler(threading.Thread):
         due = [b for b in boundaries(now.date(), self.delay(), self.minutes) if b <= now]
         if due and now - due[-1] <= FAST_RETRY_WINDOW:
             return FAST_RETRY_EVERY.total_seconds()
-        until = (next_boundary(now, self.delay(), self.minutes) - now).total_seconds()
+        nxt = next_boundary(now, self.delay(), self.minutes)
+        if self._watching_stops():  # also wake for every 5-minute close
+            sd = self._stop_bounds(now)
+            if sd and self._stop_waiting and now - sd[-1] <= FAST_RETRY_WINDOW:
+                return FAST_RETRY_EVERY.total_seconds()
+            nxt = min(nxt, next_boundary(now, self.delay(), 5))
+        until = (nxt - now).total_seconds()
         return max(1.0, min(POLL_S, until))
+
+    # ---- 5-minute stop watch (books with bars longer than 5 minutes)
+    def _watching_stops(self) -> bool:
+        """A 15-min or hourly book with an open live short checks its stop at
+        every 5-minute close (Engine.live_stop_sweep)."""
+        return (self.minutes > 5 and self.live is not None and self.live.enabled()
+                and self.engine.has_open_live())
+
+    def _stop_bounds(self, now: datetime) -> list[datetime]:
+        """Today's 5-minute check times so far (9:35 ... 15:55, plus the delay)."""
+        d = self.delay()
+        return [b for b in boundaries(now.date(), d, 5)
+                if b <= now and (b - d).time() != RTH_OPEN]
+
+    def stop_due(self, now: datetime) -> bool:
+        if self.minutes <= 5 or self.live is None or not self.live.enabled():
+            return False
+        sd = self._stop_bounds(now)
+        if not sd:
+            return False
+        b = sd[-1]
+        if self._stop_at is not None and self._stop_at >= b:
+            # done for this close, unless a bar was missing: again every 5 s for a minute
+            return (self._stop_waiting and now - b <= FAST_RETRY_WINDOW
+                    and now - self._stop_at >= FAST_RETRY_EVERY)
+        return self.engine.has_open_live()
+
+    def run_stop_check(self) -> None:
+        """Check the live shorts' stops on the 5-minute bars since this book's
+        last bar; if one is hit, the model covers at that 5-minute close and the
+        IBKR sync sends the cover (at market) at once."""
+        now = self.clock.now()
+        sd = self._stop_bounds(now)
+        ref = bar_for_boundary(sd[-1], self.delay())[0] if sd else None
+        times = {"started_at": _wall()}
+        res = {"symbols": 0, "closed": 0, "waiting": 0}
+        try:
+            res = self.engine.live_stop_sweep(now)
+        except Exception as e:
+            self.last_error = redact(e)
+        times["data_at"] = _wall()
+        if res["closed"]:
+            times["ibkr_start"] = _wall()
+            try:
+                self.live.sync(self.clock.now(), ref)
+            except Exception as e:
+                self.live.last_error = f"sync failed: {redact(e)}"
+            times["ibkr_done"] = _wall()
+        self._stop_at, self._stop_waiting = now, bool(res["waiting"])
+        times["done_at"] = _wall()
+        self._record_check("stop", ref, None, times, {"symbols": res["symbols"],
+                                                      "live": res["symbols"]})
 
     def next_tick(self) -> datetime:
         return next_boundary(self.clock.now(), self.delay(), self.minutes)
@@ -370,6 +431,9 @@ class Scheduler(threading.Thread):
             due = [b for b in boundaries(now.date(), self.delay(), self.minutes) if b <= now]
             if due and (self.last_tick is None or self.last_tick < due[-1]):
                 self.run_tick(check=bar_for_boundary(due[-1], self.delay()))
+                self._stop_at = now  # the book's own check ran the stop on its bar's 5-min closes
+            elif self.stop_due(now):
+                self.run_stop_check()
             elif due and self.retry_due(now, due[-1]):
                 # the feed hadn't finished that bar yet: look again, lagging symbols only
                 bar = bar_for_boundary(due[-1], self.delay())
@@ -414,7 +478,7 @@ def live_link(key: str, live: "LiveSync | None") -> "LiveSync | None":
     5-minute check. On every book's scheduler it synced three times at a shared
     bar boundary (12:00 closes an hourly, a 15-min and a 5-min bar) and re-sent
     a refused order three times within seconds (2026-10-16)."""
-    return live if live is not None and key == live.live_book else None
+    return live if live is not None and key in live.live_books else None
 
 
 def _short(e: Exception) -> str:
@@ -481,7 +545,8 @@ def live_check(live: "LiveSync | None", note: str | None) -> str:
         a = b.account()
         return (f"{b.venue}: OK - {a['account_id']} net liquidation ${float(a['equity']):,.2f}; "
                 f"cap {b.max_shares} share(s) per symbol, daily loss limit "
-                f"${b.daily_loss_limit:,.0f}; {live.book_label} book, 5/10 EMA short only, "
+                f"${b.daily_loss_limit:,.0f}; {', '.join(live.book_labels)} "
+                f"book{'s' if len(live.book_labels) > 1 else ''}, 5/10 EMA short only, "
                 f"flat by 15:55; {len(live.selections())} live symbol(s)")
     except Exception as e:
         return f"{b.venue}: FAILED - {_short(e)}"
@@ -560,6 +625,7 @@ def live_state(live, demo=False) -> dict:
         return {"configured": False, "reason": LIVE_NOTE}
     return {"configured": True, "endpoint": live.broker.endpoint, "enabled": live.enabled(),
             "book": live.live_book, "book_label": live.book_label,
+            "books": list(live.live_books), "book_labels": live.book_labels,
             **live.status(),
             "events": live.store.q("SELECT * FROM events ORDER BY id DESC LIMIT 12")}
 
@@ -737,9 +803,17 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                     if live is None:
                         raise ValidationError(f"IBKR is not linked: {LIVE_NOTE}")
                     sleeves = body.get("sleeves") or []
-                    if sleeves and book.key != live.live_book:
-                        raise ValidationError(f"Live trading is only in the {live.book_label} book "
-                                              f"(IBKR_BOOK)")
+                    if sleeves and book.key not in live.live_books:
+                        raise ValidationError(
+                            f"Live trading is only in the {', '.join(live.book_labels)} "
+                            f"book{'s' if len(live.book_labels) > 1 else ''} (IBKR_BOOKS in .env)")
+                    if sleeves:
+                        ticker = engine._symbol(int(m.group(1)))["symbol"]
+                        other = live.conflict(ticker, book.key)
+                        if other:
+                            raise ValidationError(
+                                f"{ticker} is already Live in the {other} book. One IBKR account "
+                                f"holds one position per symbol: turn it off there first")
                     engine.set_live(int(m.group(1)), sleeves, now)
                     # forced end-of-day close and the live stop take effect at the next check
                     threading.Thread(target=sched.run_tick, daemon=True).start()
@@ -930,7 +1004,7 @@ def main() -> None:
     if ib is not None:
         live = LiveSync(Store(str(HERE / "tranche_live.db")), ib,
                         {k: (label, stores[k]) for k, _m, label, _p, _db in BOOKS},
-                        live_book=ib.cfg.book, sleeves=LIVE_SLEEVES,
+                        live_book=ib.cfg.book, live_books=ib.cfg.books, sleeves=LIVE_SLEEVES,
                         max_shares=ib.max_shares, daily_loss_limit=ib.daily_loss_limit)
     if not args.demo:  # first sight of each bar, for the publish-lag record
         provider.on_bars = arrivals_recorder(live.store if live else stores["5m"])
