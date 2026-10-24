@@ -379,7 +379,7 @@ These figures are approximate, from IBKR's published rates. Check your plan.
 |---|---|---|
 | `IBKR_ACCOUNT` | (off) | `DU…` paper or `U…` live account ID |
 | `IBKR_MODE` | `paper` | `paper` or `live`; must match the account ID |
-| `IBKR_BOOKS` | `5m` | The books whose Live symbols trade at IBKR, comma-separated from `5m`, `15m`, `1h` (for example `5m,15m,1h`). `IBKR_BOOK` (one book) is still read when this is unset |
+| `IBKR_BOOKS` | `5m` | The books whose Live symbols trade at IBKR, comma-separated from `5m`, `15m`, `1h` (for example `5m,15m,1h`). `IBKR_BOOK` (one book) is still read when this is unset. The daily book (`1d`) is refused: it is model and paper only until its live rule exists (PLAN_TIMEFRAMES.md, Phase 5) |
 | `IBKR_MAX_SHARES` | 1 | Shares per symbol. The only size setting. Short only, so −1 by default |
 | `IBKR_DAILY_LOSS_LIMIT` | 100 | $ loss in a day that halts and flattens (live: must be > 0) |
 | `IBKR_MAX_ORDER_USD` | 1000 | Max value of one order |

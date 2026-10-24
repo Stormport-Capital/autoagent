@@ -35,6 +35,15 @@ Short tranches pay the symbol's borrow rate (its own, else the book's borrow_rat
 / borrow_day_count per calendar night held; same-day shorts pay none. A short whose
 rate is above overnight_borrow_max_pct is flat by 15:55 like a close-by-end-of-day name.
 Only hourly bars that complete after the symbol was added are ever traded.
+
+The daily book (bars of SESSION_MINUTES) uses the data source's daily bars for
+past sessions and builds today's from 5-minute bars. With daily_at_close on
+(the default) its signals act at 15:55 on the day's bar as it stands then
+(9:30-15:55), filled at that 5-minute close; a cross is judged against the EMA
+side recorded at the previous 15:55 check (symbols.close_sides), because the
+official close can differ from the 15:55 price. Off, they act at the next 9:30
+open on the finished bar, like the last bar of the other books. The VWAP
+tranche can't fire on one bar a session.
 """
 
 from __future__ import annotations
@@ -49,7 +58,7 @@ from datetime import date, datetime, time, timedelta
 from indicators import (ET, RTH_CLOSE, RTH_OPEN, Bar, atr, cross_adverse_moves, ema_cross, ema_side, percentile,
                         price_tick,
                         daily_closes, daily_sma, ema, in_rth, is_final_bar,
-                        resample, session_bar_ends, session_vwap)
+                        resample, session_bar_ends, session_vwap, SESSION_MINUTES)
 from data import redact
 from store import DEFAULT_SETTINGS, Store
 
@@ -95,6 +104,7 @@ SETTING_BOUNDS = {
     "bar_close_delay_min": (0, 30),
     "vwap_max_sessions": (0, 30),
     "vwap_scale_out_20": (0, 1),
+    "daily_at_close": (0, 1),
 }
 
 
@@ -164,7 +174,8 @@ class Engine:
     def __init__(self, store: Store, provider, minutes: int = 60):
         self.store = store
         self.provider = provider
-        self.minutes = minutes  # bar size: 60 (hourly) or 15
+        self.minutes = minutes  # bar size: 60 (hourly), 15, 5 or SESSION_MINUTES (daily)
+        self.daily = minutes >= SESSION_MINUTES
 
     # ------------------------------------------------------------------ setup
     def update_settings(self, updates: dict) -> dict:
@@ -185,7 +196,10 @@ class Engine:
             if k == "borrow_day_count" and num not in (360, 365):
                 raise ValidationError("borrow_day_count must be 360 or 365")
             clean[k] = int(num) if isinstance(DEFAULT_SETTINGS[k], int) else num
+        before = self.store.settings()
         self.store.save_settings(clean)
+        if "daily_at_close" in clean and clean["daily_at_close"] != before["daily_at_close"]:
+            self.store.x("UPDATE symbols SET close_sides=NULL")  # the record only means anything at 15:55
         return self.store.settings()
 
     def add_symbols(self, raw: str, mode: str, risk_pct, now: datetime,
@@ -432,12 +446,18 @@ class Engine:
 
     def _fetch_all(self, symbols: list[str], now: datetime) -> dict:
         """symbol -> its 5-minute bars, or the exception its fetch raised.
-        Up to FETCH_WORKERS requests at once."""
+        Up to FETCH_WORKERS requests at once. The daily book also fetches each
+        symbol's daily bars here; the data source keeps them for the day."""
         out: dict = {}
+
+        daily = getattr(self.provider, "daily_bars", None) if self.daily else None
 
         def one(sym):
             try:
-                return sym, self.provider.five_min_bars(sym, now)
+                five = self.provider.five_min_bars(sym, now)
+                if daily is not None:
+                    daily(sym, now)  # the daily book: fetch (once a day) outside the store lock
+                return sym, five
             except Exception as e:
                 return sym, e
         names = list(dict.fromkeys(symbols))
@@ -475,12 +495,16 @@ class Engine:
         if five is None:
             five = self.provider.five_min_bars(symbol, now)
         delay = timedelta(minutes=s["bar_close_delay_min"])
-        # an hour counts as complete once the feed has printed through its end
-        # (delayed feeds lag), or 20 min later for names with no late prints
-        data_end = max((b.end for b in five), default=None)
-        bars = [b for b in resample(five, self.minutes)
-                if b.end + delay <= now
-                and ((data_end and data_end >= b.end) or b.end + max(delay, STALE_WAIT) <= now)]
+        provisional = None
+        if self.daily:
+            bars, provisional = self._daily_bars(symbol, five, now, s, delay)
+        else:
+            # an hour counts as complete once the feed has printed through its end
+            # (delayed feeds lag), or 20 min later for names with no late prints
+            data_end = max((b.end for b in five), default=None)
+            bars = [b for b in resample(five, self.minutes)
+                    if b.end + delay <= now
+                    and ((data_end and data_end >= b.end) or b.end + max(delay, STALE_WAIT) <= now)]
         if not bars:
             raise RuntimeError("no completed bars returned")
         closes = [b.close for b in bars]
@@ -488,8 +512,50 @@ class Engine:
             "e5": ema(closes, 5), "e10": ema(closes, 10), "e20": ema(closes, 20),
             "atr": atr(bars, int(s["atr_period"])),
             "daily": daily_closes(five),
+            "provisional": provisional,  # daily book: end of today's 15:55 bar, if it is the last
         }
         return five, bars, ind
+
+    def _daily_bars(self, symbol: str, five: list[Bar], now: datetime, s: dict,
+                    delay: timedelta) -> tuple[list[Bar], datetime | None]:
+        """The daily book's bars. Past sessions: the data source's daily bars;
+        a session it lacks (or every one, for a source without daily bars) is
+        built from the 5-minute bars. Then today's bar, from today's 5-minute bars:
+          * daily_at_close on, from the 15:55 check until 16:00: the bar as it
+            stands at 15:55 (9:30-15:55), once the 15:50-15:55 bar has printed.
+            Its signals act at that close. A name with no print in that bar
+            gets no 15:55 bar and acts at the next open instead.
+          * from 16:00: the whole session, once the feed has printed through
+            16:00 (or 20 min later). It acts at the next open, unless it was
+            already acted on at 15:55.
+        Returns (bars, end of today's 15:55 bar or None)."""
+        today = now.astimezone(ET).date()
+        getter = getattr(self.provider, "daily_bars", None)
+        hist = list(getter(symbol, now)) if getter else []
+        have = {b.session for b in hist}
+        past = [b for b in resample([x for x in five if x.session < today], self.minutes)
+                if b.session not in have]
+        bars = sorted(hist + past, key=lambda b: b.start)
+        day = [x for x in five if x.session == today and in_rth(x.start)]
+        cut, close = eod_cutoff(today), datetime.combine(today, RTH_CLOSE, tzinfo=ET)
+        if s["daily_at_close"] and cut + delay <= now < close:
+            upto = [x for x in day if x.end <= cut]
+            if upto and max(x.end for x in upto) >= cut:
+                b = resample(upto, self.minutes)[0]
+                return bars + [b], b.end
+        elif now >= close + delay and day:
+            if max(x.end for x in day) >= close or now >= close + max(delay, STALE_WAIT):
+                bars.append(resample(day, self.minutes)[0])
+        return bars, None
+
+    def _acts_at(self, b: Bar, s: dict) -> str:
+        """When a signal on bar b executes, for the bars page."""
+        if not is_final_bar(b):
+            return b.end.astimezone(ET).strftime("%H:%M")
+        if self.daily:
+            return ("15:55 that day, on the bar as it stood then" if s["daily_at_close"]
+                    else "next session 9:30 open")
+        return "next session 9:30 open (EMA only)"
 
     def bar_table(self, symbol: str, now: datetime, n: int = 80) -> list[dict]:
         """The last n completed bars exactly as the engine sees them, with the
@@ -519,8 +585,7 @@ class Engine:
                 "volume": int(b.volume), "ema5": r(e5[i]), "ema10": r(e10[i]),
                 "ema20": r(e20[i]), "atr": r(ind["atr"][i]), "vwap": r(vw),
                 "signals": "; ".join(sig),
-                "acts_at": ("next session 9:30 open (EMA only)" if is_final_bar(b) else
-                            b.end.astimezone(ET).strftime("%H:%M")) if sig else "",
+                "acts_at": self._acts_at(b, s) if sig else "",
             })
         return rows
 
@@ -531,9 +596,19 @@ class Engine:
         for i, b in enumerate(bars):
             if last and b.end <= last:
                 continue
-            if is_final_bar(b):
-                # the 15:00-16:00 bar acts at the next session's 9:30 open
-                fill = self._next_open(sym["symbol"], b, five, now)
+            if b.end == ind["provisional"]:
+                # daily book: today's bar as it stands at 15:55 acts at that close
+                fill = Fill(b.close, eod_cutoff(b.session), b.session,
+                            f"at the {b.session:%b %d} 15:55 5-min close {b.close:.4g} "
+                            f"(the day's bar as it stood then)")
+            elif is_final_bar(b):
+                # the 15:00-16:00 bar (a daily bar) acts at the next session's 9:30 open;
+                # daily history reaches past the 5-minute bars, so its next open is the
+                # next daily bar's
+                nxt = bars[i + 1] if self.daily and i + 1 < len(bars) else None
+                fill = (Fill(nxt.open, nxt.start, nxt.session,
+                             f"at the {nxt.session:%b %d} 9:30 open {nxt.open:.4g} (that day's bar)")
+                        if nxt else self._next_open(sym["symbol"], b, five, now))
                 if fill is None:
                     break  # before the next open: wait for the 9:30 check
             else:
@@ -667,7 +742,15 @@ class Engine:
             ctx = (f"on the {bar_txt}; EMA5 {e5[j]:.4g}->{e5[i]:.4g}, EMA10 {e10[j]:.4g}->"
                    f"{e10[i]:.4g}, EMA20 {e20[j]:.4g}->{e20[i]:.4g}; filled {fill.how}")
             tick = price_tick(b.close)
-            c1, c2 = ema_cross(e5, e10, i, tick), ema_cross(e10, e20, i, tick)
+            ctx1 = ctx2 = ctx
+            if self.daily and s["daily_at_close"]:
+                (c1, late1), (c2, late2) = (self._judged_cross(sym, "EMA5_10", e5, e10, i, tick),
+                                            self._judged_cross(sym, "EMA10_20", e10, e20, i, tick))
+                note = ("; judged against the side recorded at the previous 15:55 check (the "
+                        "official close since then reads differently)")
+                ctx1, ctx2 = ctx + (note if late1 else ""), ctx + (note if late2 else "")
+            else:
+                c1, c2 = ema_cross(e5, e10, i, tick), ema_cross(e10, e20, i, tick)
             u2 = self._ema_unit(bars, e10, e20, i, a, s) if c2 else None
             if "EMA5_10" in (sym.get("live") or ""):
                 self._live_510(sym, open_tr.get("EMA5_10"), fill, bars, five, i, e5, e10, s, ctx,
@@ -675,9 +758,9 @@ class Engine:
             else:
                 u1 = self._ema_unit(bars, e5, e10, i, a, s) if c1 else None
                 self._ema_sleeve(sym, "EMA5_10", open_tr.get("EMA5_10"), fill, u1, s,
-                                 c1 < 0, c1 > 0, ctx)
+                                 c1 < 0, c1 > 0, ctx1)
             self._ema_sleeve(sym, "EMA10_20", open_tr.get("EMA10_20"), fill, u2, s,
-                             c2 < 0, c2 > 0, ctx)
+                             c2 < 0, c2 > 0, ctx2)
 
         vwap = session_vwap(five, b.session, b.end)
         if vwap is None:
@@ -795,6 +878,26 @@ class Engine:
             self.store.x("UPDATE symbols SET live_side=? WHERE id=?", (now, sym["id"]))
         return c, bool(c) and not on_bars
 
+    def _judged_cross(self, sym: dict, key: str, a: list, b: list, i: int,
+                      tick: float) -> tuple[int, bool]:
+        """Daily book at 15:55: the cross of line a vs line b on bar i, judged
+        against the side recorded when the previous bar was judged at 15:55
+        (symbols.close_sides), as _live_cross does for the live 5/10. The bars
+        alone would judge yesterday by its official close, which can sit on the
+        other side of the 15:55 price that was acted on: a short taken on a
+        15:55 down-cross that the close undid would then never see an up-cross.
+        Returns (cross, judged against the record rather than the bars)."""
+        now, on_bars = ema_side(a, b, i, tick), ema_cross(a, b, i, tick)
+        sides = json.loads(sym.get("close_sides") or "{}")
+        prev = sides.get(key)
+        c = on_bars if prev is None else (now if now and now != prev else 0)
+        if now and now != prev:
+            sides[key] = now
+            sym["close_sides"] = json.dumps(sides)
+            self.store.x("UPDATE symbols SET close_sides=? WHERE id=?",
+                         (sym["close_sides"], sym["id"]))
+        return c, bool(c) and c != on_bars
+
     def _live_510(self, sym, t, f: "Fill", bars: list[Bar], five: list[Bar], i: int,
                   e5: list, e10: list, s, ctx: str, unit) -> None:
         """The 5/10 tranche of a Live symbol. Exits are as usual (opposite cross).
@@ -897,7 +1000,8 @@ class Engine:
             return t
         b, start = bars[i], _dt(t["entry_time"]).astimezone(ET).date()
         held = len({x.session for x in bars[:i + 1] if x.session >= start})
-        last_check = session_bar_ends(b.session, self.minutes)[-2]
+        ends = session_bar_ends(b.session, self.minutes)
+        last_check = ends[-2] if len(ends) > 1 else ends[-1]
         if held > n or (held == n and b.end >= last_check):
             self._close(t, fill.price, fill.when, f"time stop: held {held} sessions "
                         f"(max {n}); covered {fill.how}", s)

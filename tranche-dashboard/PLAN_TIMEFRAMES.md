@@ -8,7 +8,10 @@ changes until `IBKR_BOOKS` lists more than `5m`. Built with D2 (a) (an hourly
 book has no 9:45 bar, so no state entry) and D6 (a) (one book per symbol);
 D1 is unchanged (hourly bars 9:30-10:00, then on the hour) until checked.
 Phase 3 items 4 (position guard) and 5 (link-down warning) built
-2026-10-24; its other items wait on D3 and D4. Phases 4-6 not started. Written 2026-10-22 from a read of the code at commit
+2026-10-24; its other items wait on D3 and D4. **Phase 4 built** (2026-10-24,
+waiting for Dean's yes before merge): D4 for the daily bar is a setting
+(`daily_at_close`, default (a)); D7 waits on C4. Phases 5-6 not started.
+Written 2026-10-22 from a read of the code at commit
 7724ae7 and the measurements made on the droplet in October 2026.
 
 ## 1. Goal
@@ -193,6 +196,16 @@ proof.
 
 ### Phase 4: daily book, model and paper (about 1-1.5 days; needs C3, D7)
 
+**Built 2026-10-24.** C3 passed on the droplet (FMP's EOD endpoint answered for
+SPY). As built, differences from the items below: no `daily_bars` table (FMP is
+asked once per symbol per ET day and the answer kept in memory, so a restart
+costs one request per symbol); D4 is the Daily-tab setting `daily_at_close`
+((a) by default, (c) when off), and at (a) a cross is judged against the EMA
+side read at the previous 15:55 check (`symbols.close_sides`), since the
+official close can sit on the other side of the 15:55 price; `IBKR_BOOKS` does
+**not** accept `1d` (live is Phase 5); a daily bar's next open is the next
+daily bar's open, because the daily history reaches past the 5-minute bars.
+
 1. **New book** `("1d", "Daily", "APCA_1D", "tranche_1d.db")`. `bar_bucket`
    and `session_bar_ends` get a whole-session case: today they would split a
    390-minute day into 9:30-13:00 and 13:00-16:00 (checked).
@@ -206,7 +219,7 @@ proof.
    bar of the same session), so the VWAP tranche is inert there.
 5. **Paper link** per D7; without it the book runs unlinked, which the app
    already supports. The new key names join the redaction list
-   (`data.SECRET_ENV`) and `IBKR_BOOKS` accepts `1d`.
+   (`data.SECRET_ENV`). `IBKR_BOOKS` accepts `1d` only in Phase 5.
 6. **Dashboard.** The tab list, settings, reset and backups are built from
    `BOOKS`, so the daily tab appears with no page change beyond labels; the
    Trade Review page already iterates the books.

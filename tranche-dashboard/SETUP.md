@@ -240,8 +240,12 @@ as the hourly book's.
    On the 15-min tab, tick **Send the model's trades to Alpaca paper**.
 
 The **5-min book** works the same way with a **third** paper account, under
-`APCA_5M_API_KEY_ID` and `APCA_5M_API_SECRET_KEY`. No two books may share an
-account; the app refuses to link a book whose keys match another book's.
+`APCA_5M_API_KEY_ID` and `APCA_5M_API_SECRET_KEY`, and the **Daily book** with
+a **fourth**, under `APCA_1D_API_KEY_ID` and `APCA_1D_API_SECRET_KEY`. No two
+books may share an account; the app refuses to link a book whose keys match
+another book's. An Alpaca forum reply (not official) says a login gets three
+paper accounts; if Alpaca won't create a fourth, the Daily book runs without
+one.
 
 Without these keys a book still runs and tracks performance. It just doesn't
 send paper orders.
@@ -283,7 +287,8 @@ its time stamps mark the start or the end of a bar.
 ## Backups (Google Drive)
 
 All trades, signals, equity and paper orders live in `tranche.db` (Hourly),
-`tranche_15m.db` (15-min) and `tranche_5m.db` (5-min) in the app folder. **Don't move those files or the
+`tranche_15m.db` (15-min), `tranche_5m.db` (5-min) and `tranche_1d.db` (Daily)
+in the app folder. **Don't move those files or the
 app folder into Google Drive.** Drive syncs files while they're being written,
 which can corrupt a live database. The folder also holds `.env` with your keys.
 

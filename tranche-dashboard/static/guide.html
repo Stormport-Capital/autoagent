@@ -89,7 +89,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 <h2 id="map">The screen, top to bottom</h2>
 <div class="wrap"><table>
 <tr><th>Area</th><th>What it is</th></tr>
-<tr><td>Book tabs</td><td>Hourly / 15-min / 5-min. Three separate portfolios with the same rules. <b>Everything below the tabs belongs to the tab you're on</b>, including settings and buttons. The small text shows that book's equity, return, and "paper on" if orders go to Alpaca.</td></tr>
+<tr><td>Book tabs</td><td>Hourly / 15-min / 5-min / Daily. Four separate portfolios with the same rules. <b>Everything below the tabs belongs to the tab you're on</b>, including settings and buttons. The small text shows that book's equity, return, and "paper on" if orders go to Alpaca.</td></tr>
 <tr><td>Status line</td><td>Model + Alpaca PAPER orders (or "Model only"), data source, time and market open/closed, Last check, Backed up, <b>Download backup</b>, Next check. A red message here means something failed.</td></tr>
 <tr><td>Tiles</td><td>Equity, Total return, Realized P&amp;L (closed trades), Open P&amp;L, Borrow fees, Win rate (PF = profit factor, avg R), Max drawdown, Exposure (long / short).</td></tr>
 <tr><td>Add symbols</td><td>Where new names go in (left column).</td></tr>
@@ -108,7 +108,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 <tr><td>Book tab</td><td>top</td><td>Switches which book you're looking at and editing. Doesn't change any trade.</td></tr>
 <tr><td><span class="btn">Check now</span></td><td>top right</td><td>Runs this book's check immediately (fetches bars, acts on any completed bar). Safe: it never doubles a trade. You never need it in normal use.</td></tr>
 <tr><td><span class="btn">Guide</span></td><td>top right</td><td>This page.</td></tr>
-<tr><td><span class="btn">Trade Review</span></td><td>top, next to the book tabs</td><td>Opens the review page: every closed trade from all three books, with stats, a P&amp;L calendar, breakdowns and your notes/tags. Read-only except your notes; it never changes a trade.</td></tr>
+<tr><td><span class="btn">Trade Review</span></td><td>top, next to the book tabs</td><td>Opens the review page: every closed trade from all four books, with stats, a P&amp;L calendar, breakdowns and your notes/tags. Read-only except your notes; it never changes a trade.</td></tr>
 <tr><td>Download backup</td><td>status line</td><td>Saves a copy of this book's database to your computer.</td></tr>
 <tr><td>Short only / Long &amp; short</td><td>Add symbols</td><td>For the two EMA tranches only. Short only: shorts on a down-cross, goes flat on an up-cross. Long &amp; short: flips between long and short on each cross. The VWAP tranche is always short.</td></tr>
 <tr><td>Trade grade</td><td>Add symbols</td><td>Risk for the whole symbol: A+ 3%, A 2%, B 1.5%, C 1% of equity, split across the 3 tranches. "Custom" uses the slider (0.5–3%).</td></tr>
@@ -137,7 +137,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 
 <h2 id="howto">How to…</h2>
 <h3>Add a symbol to only one book</h3>
-<ol class="steps"><li>Type it, set direction and grade.</li><li>Untick the two books you don't want under <b>Add to</b>.</li><li><span class="btn">Add to watchlist</span>.</li></ol>
+<ol class="steps"><li>Type it, set direction and grade.</li><li>Under <b>Add to</b>, tick only the book you want. <b>Daily book</b> starts unticked.</li><li><span class="btn">Add to watchlist</span>.</li></ol>
 <h3>Get out of a position now</h3>
 <ol class="steps"><li>Go to the book tab that holds it.</li><li><span class="btn">Flatten</span> on the symbol's row, confirm.</li><li><span class="btn">Pause</span> (or <span class="btn">Remove</span>) so it doesn't re-enter.</li><li>Repeat on every book tab that holds the stock.</li></ol>
 <h3 id="rename">A ticker changed (e.g. AIXC → FFR)</h3>
@@ -162,7 +162,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 <p>Everything on it follows the filter bar at the top. <b>Dates are the day a trade closed</b> (when its P&amp;L became real). Open positions aren't included; they're on each book tab.</p>
 <table>
 <tr><th>Part</th><th>What it shows / does</th></tr>
-<tr><td>Filters</td><td>Book (All / Hourly / 15-min / 5-min), date presets or From/To, Strategy, Side, Symbol, Grade, Exit, Sector, Tag. <span class="btn">Clear filters</span> resets. Filters added by clicking a Breakdown row show as chips under the bar; × removes one.</td></tr>
+<tr><td>Filters</td><td>Book (All / Hourly / 15-min / 5-min / Daily), date presets or From/To, Strategy, Side, Symbol, Grade, Exit, Sector, Tag. <span class="btn">Clear filters</span> resets. Filters added by clicking a Breakdown row show as chips under the bar; × removes one.</td></tr>
 <tr><td>Tiles</td><td>Net P&amp;L (after borrow fees), trades W/L, win rate, profit factor (gross wins ÷ gross losses), expectancy ($ and R per trade), average win/loss and payoff, best/worst trade, max drawdown of the closed-trade P&amp;L, average hold.</td></tr>
 <tr><td>Cumulative P&amp;L</td><td>Running total, trade by trade. Hover for each trade.</td></tr>
 <tr><td>What the numbers say</td><td>Plain-language findings computed from the filtered trades: sample-size warning, the symbol causing most losing dollars, best/worst strategy, timeframe and entry window, grade comparison, your manual exits vs rule exits, long vs short, worst/best day. Rules, not AI.</td></tr>
@@ -197,6 +197,7 @@ code { background: var(--card); border: 1px solid var(--line); border-radius: 5p
 <tr><td>VWAP fail (short)</td><td>(a) An earlier bar today closed above VWAP, this bar closes below VWAP with a lower high; or (b) opening fade: bars 1 and 2 both red and below VWAP, bar 2 with a lower high.</td><td>Stop: the day's high at entry, trailed down each day to the lowest session high since. Half covers at the daily 10-day average, the rest at the 20-day. Time stop after 10 sessions. Held overnight.</td></tr>
 </table></div>
 <p><b>When it checks</b> (about 2 minutes after each bar closes, ET): Hourly at 10:00 … 15:00; 15-min at 9:45 … 15:45; 5-min at 9:35 … 15:55. Each book also checks at the <b>9:30 open</b> for the previous day's last bar. A symbol only trades on signals after you add it.</p>
+<p><b>Daily book</b>: past days are FMP's daily bars; today's bar is built from 5-minute bars. With <b>Daily signals trade</b> (its settings card) at <b>3:55 PM</b>, the default, it checks at 3:55 on the day's bar as it stands then and fills at the 3:55 5-minute close; the next day's cross is judged against what the EMAs read at 3:55, since the official close can differ. Set to <b>the next 9:30 open</b>, it acts on the finished bar at the open. The VWAP tranche never fires on daily bars. The daily book never trades at IBKR; it can use a fourth Alpaca paper account (SETUP.md).</p>
 <p><b>Size</b>: equity × grade % ÷ 3 per tranche, divided by the risk per share; total exposure capped at 2× equity.</p>
 
 <h2 id="read">Reading the numbers</h2>

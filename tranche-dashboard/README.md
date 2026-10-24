@@ -5,8 +5,8 @@ checks them after every hourly bar closes, and trades a **mock portfolio** in
 three thirds per symbol. Performance is tracked in total, per tranche, per side
 and per symbol.
 
-It runs **three books with identical rules**, an **Hourly** book, a **15-min**
-book and a **5-min** book, side by side in one dashboard. Each has its own portfolio, settings and
+It runs **four books with identical rules**, an **Hourly** book, a **15-min**
+book, a **5-min** book and a **Daily** book (see below), side by side in one dashboard. Each has its own portfolio, settings and
 performance, and optionally its own Alpaca paper account. Each book keeps its
 own records: simulated fills, per-tranche attribution and borrow fees. It can also be **linked to an Alpaca paper account**. With that on,
 after each hourly check the paper account is brought to the model's net
@@ -84,6 +84,23 @@ Each tranche gets one third of that budget.
   A signal only trades if it executes after you added the symbol. So a name
   added pre-market can act on yesterday's last bar at the open, but never on
   anything older.
+- **Daily book.** Past sessions are FMP's end-of-day bars (about 400 calendar
+  days, fetched once per symbol per day); today's bar is built from the
+  5-minute bars. The setting **Daily signals trade** picks when a signal acts:
+  - **At 3:55 PM** (default): at the 3:55 check, on the day's bar as it stands
+    (9:30-3:55), filled at the 3:55 5-minute close. The official close can
+    differ, so the next day's cross is judged against the EMA side read at
+    3:55, not the official bar. A name with no print in the 3:50-3:55 bar gets
+    no 3:55 decision and acts at the next open. A symbol set to close by end of
+    day, or a short whose own borrow rate is above the overnight limit, takes
+    no entries at 3:55.
+  - **At the next 9:30 open:** on the finished bar, like the last bar of the
+    other books.
+
+  A name added before the open can act on the previous day's daily signal at
+  the open, as on the other books. The VWAP tranche can't fire on one bar a
+  session. The daily book never trades at IBKR. It gets a paper account with
+  `APCA_1D_API_KEY_ID` / `APCA_1D_API_SECRET_KEY` ([SETUP.md](SETUP.md)).
 - **EMA tranches have no stop.** They enter on a cross and exit only on the
   opposite cross, at that bar's close (or at the next open for the day's last
   bar), whatever the loss. There is no ATR stop and no gap exit.
@@ -148,7 +165,7 @@ Each tranche gets one third of that budget.
 ## Trade Review page
 
 The **Trade Review** button (next to the book tabs) opens `/review`: every closed
-trade from all three books, with filters (book, dates, strategy, side, symbol,
+trade from all four books, with filters (book, dates, strategy, side, symbol,
 grade, exit type, sector, tag), KPI tiles (net P&L, win rate, profit factor,
 expectancy in $ and R, payoff, best/worst, drawdown, hold), a cumulative P&L
 curve, a P&L calendar with per-day review notes, an R-multiple histogram,
@@ -189,7 +206,8 @@ closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&
 
 - `engine.py` — strategy rules, sizing, fills, borrow fees and performance stats
 - `indicators.py` — hourly resampling, EMA, ATR, session VWAP and crosses (pure functions)
-- `data.py` — Polygon, Yahoo, Alpaca and demo providers (5-minute bars)
+- `data.py` — Polygon, Yahoo, Alpaca, FMP and demo providers (5-minute bars; FMP and
+  demo also daily bars)
 - `broker.py` — broker sync: net-position mirror, order log, reconciliation, share cap,
   daily loss limit and kill switch; the Alpaca paper client
 - `ibkr.py` — Interactive Brokers client (ib_async via IB Gateway), paper or live;

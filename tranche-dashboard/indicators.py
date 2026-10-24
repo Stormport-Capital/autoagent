@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 RTH_OPEN = time(9, 30)
 RTH_CLOSE = time(16, 0)
+SESSION_MINUTES = 390  # a whole regular session, 9:30-16:00: the daily book's bar
 
 
 @dataclass(frozen=True)
@@ -39,14 +40,17 @@ def in_rth(ts: datetime) -> bool:
 def bar_bucket(ts: datetime, minutes: int = 60) -> tuple[datetime, datetime]:
     """Clock-aligned bucket, as on standard charts. Hourly: the first bar is the
     half hour 9:30-10:00, then 10-11 ... 15-16. 15-minute: 9:30-9:45 ... 15:45-16:00.
-    5-minute: 9:30-9:35 ... 15:55-16:00."""
+    5-minute: 9:30-9:35 ... 15:55-16:00. Daily (SESSION_MINUTES or more): the
+    whole session, 9:30-16:00; clock alignment would split it at 13:00."""
     local = ts.astimezone(ET)
     day = local.date()
+    open_dt = datetime.combine(day, RTH_OPEN, tzinfo=ET)
+    close_dt = datetime.combine(day, RTH_CLOSE, tzinfo=ET)
+    if minutes >= SESSION_MINUTES:
+        return open_dt, close_dt
     midnight = datetime.combine(day, time(0, 0), tzinfo=ET)
     mins = local.hour * 60 + local.minute
     start = midnight + timedelta(minutes=mins - mins % minutes)
-    open_dt = datetime.combine(day, RTH_OPEN, tzinfo=ET)
-    close_dt = datetime.combine(day, RTH_CLOSE, tzinfo=ET)
     return max(start, open_dt), min(start + timedelta(minutes=minutes), close_dt)
 
 
@@ -55,7 +59,8 @@ def hourly_bucket(ts: datetime) -> tuple[datetime, datetime]:
 
 
 def session_bar_ends(day: date, minutes: int = 60) -> list[datetime]:
-    """End times of a session's RTH bars (hourly: 10:00, 11:00, ..., 16:00)."""
+    """End times of a session's RTH bars (hourly: 10:00, 11:00, ..., 16:00;
+    daily: 16:00 only)."""
     ends, t = [], datetime.combine(day, RTH_OPEN, tzinfo=ET)
     close_dt = datetime.combine(day, RTH_CLOSE, tzinfo=ET)
     while t < close_dt:

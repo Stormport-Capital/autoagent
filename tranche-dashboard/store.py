@@ -22,6 +22,8 @@ DEFAULT_SETTINGS = {
     "vwap_max_sessions": 10,       # VWAP short: cover at the last check of this session (0 = off)
     "vwap_scale_out_20": 1,        # VWAP short: half at the 10-day MA, rest at the 20-day (0 = all at 10)
     "overnight_borrow_max_pct": 200.0,  # shorts whose borrow rate is above this are flat by 15:55 (0 = off)
+    "daily_at_close": 1,           # daily book: 1 = act at 15:55 on the day's bar as it stands,
+                                   # 0 = act at the next 9:30 open on the finished bar
 }
 
 SCHEMA = """
@@ -42,7 +44,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     eod_close INTEGER NOT NULL DEFAULT 0,   -- 1 = day trades only: flat by the 15:55 close
     borrow_pct REAL,                        -- this symbol's annual borrow fee %; NULL = book default
     live TEXT,                              -- tranches mirrored to the IBKR account, e.g. 'EMA5_10,VWAP'
-    live_side INTEGER                       -- live 5/10: EMA5 side of EMA10 as last judged (+1/-1)
+    live_side INTEGER,                      -- live 5/10: EMA5 side of EMA10 as last judged (+1/-1)
+    close_sides TEXT                        -- daily book at 15:55: JSON {tranche: EMA side as last judged}
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
@@ -179,6 +182,8 @@ class Store:
             self.db.execute("ALTER TABLE symbols ADD COLUMN live TEXT")
         if "live_side" not in scols:  # databases created before the recorded live 5/10 side
             self.db.execute("ALTER TABLE symbols ADD COLUMN live_side INTEGER")
+        if "close_sides" not in scols:  # databases created before the daily book
+            self.db.execute("ALTER TABLE symbols ADD COLUMN close_sides TEXT")
         # One-time: the old flat 10%/yr default understated small-cap borrow (150-630%/yr
         # observed at IBKR, Oct 2026). A book still on that untouched default moves to 250%.
         if not self.db.execute("SELECT 1 FROM settings WHERE key='_borrow_default_v2'").fetchone():
@@ -235,5 +240,5 @@ class Store:
         with self.lock:
             for t in ("tranches", "events", "equity"):
                 self.db.execute(f"DELETE FROM {t}")
-            self.db.execute("UPDATE symbols SET last_bar_end = NULL")
+            self.db.execute("UPDATE symbols SET last_bar_end = NULL, close_sides = NULL")
             self.db.commit()

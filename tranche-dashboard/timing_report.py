@@ -32,7 +32,7 @@ from broker import seconds_after  # noqa: E402
 from indicators import ET  # noqa: E402
 
 BOOKS = (("1h", "Hourly", "tranche.db"), ("15m", "15-min", "tranche_15m.db"),
-         ("5m", "5-min", "tranche_5m.db"))
+         ("5m", "5-min", "tranche_5m.db"), ("1d", "Daily", "tranche_1d.db"))
 TARGET_S = 20.0  # Phase 1 exit criterion: bar close to order sent
 
 

@@ -24,9 +24,10 @@ from datetime import date, datetime, time, timedelta, timezone
 
 import requests
 
-from indicators import ET, RTH_CLOSE, RTH_OPEN, Bar
+from indicators import ET, RTH_CLOSE, RTH_OPEN, SESSION_MINUTES, Bar, resample
 
 FIVE_MIN = timedelta(minutes=5)
+DAILY_HISTORY_DAYS = 400  # calendar days of daily bars: about 275 sessions, so EMA20 has settled
 RTH_FIRST_END = time(9, 35)  # the first regular-hours 5-minute bar ends here
 
 
@@ -36,7 +37,8 @@ class DataError(RuntimeError):
 
 SECRET_ENV = ("POLYGON_API_KEY", "FMP_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
               "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",
-              "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY")
+              "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",
+              "APCA_1D_API_KEY_ID", "APCA_1D_API_SECRET_KEY")
 
 
 def redact(msg: str) -> str:
@@ -161,12 +163,15 @@ class FmpProvider:
     is taken as the bar START. If the Bars table shows every bar shifted by
     5 minutes against your charts, set FMP_BAR_TIME=end in .env.
     Keeps a per-symbol cache and only re-fetches from the last day it holds.
+    Daily bars (the daily book) come from the end-of-day endpoint, one request
+    per symbol per ET day.
     Counts requests and bytes per ET day and prints them to the log once an
     hour and at the end of each day, so FMP's data allowance can be checked.
     """
 
     name = "fmp"
     STABLE = "https://financialmodelingprep.com/stable/historical-chart/{tf}"
+    EOD = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 
     def __init__(self, session=None):
         self.key = os.environ.get("FMP_API_KEY")
@@ -175,6 +180,7 @@ class FmpProvider:
         self.shift = {"start": 0, "end": -1}.get(os.environ.get("FMP_BAR_TIME", "start").lower(), 0)
         self.http = session or requests
         self._bars: dict[str, dict[datetime, Bar]] = {}
+        self._daily: dict[str, tuple[date, list[Bar]]] = {}  # symbol -> (ET day fetched, bars)
         self._lock = threading.Lock()
         self.usage = {"day": None, "hour": None, "calls": 0, "bytes": 0, "errors": 0}
 
@@ -213,10 +219,13 @@ class FmpProvider:
         return f"FMP HTTP {status}: {msg}"
 
     def _rows(self, tf: str, symbol: str, start: date, end: date) -> list[dict]:
+        return self._get(self.STABLE.format(tf=tf), symbol, start, end)
+
+    def _get(self, url: str, symbol: str, start: date, end: date) -> list[dict]:
         params = {"symbol": symbol, "from": start.isoformat(), "to": end.isoformat(),
                   "apikey": self.key}
         try:
-            r = self.http.get(self.STABLE.format(tf=tf), params=params, timeout=20)
+            r = self.http.get(url, params=params, timeout=20)
         except requests.RequestException as e:
             self._count(0, True)
             raise DataError(f"can't reach FMP ({type(e).__name__}) for {symbol}")
@@ -266,6 +275,34 @@ class FmpProvider:
             lo = now - timedelta(days=35)
             return sorted((x for x in have.values() if lo <= x.start and x.end <= now),
                           key=lambda x: x.start)
+
+    def daily_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        """FMP's end-of-day bars (the `full` endpoint) for the sessions before
+        today, oldest first, as 9:30-16:00 ET bars. Today's row is
+        dropped even when FMP has one, since during the session it is partial;
+        the engine builds today's bar from 5-minute bars. Fetched once per
+        symbol per ET day; a failed fetch is not cached."""
+        today = now.astimezone(ET).date()
+        with self._lock:
+            hit = self._daily.get(symbol)
+        if hit and hit[0] == today:
+            return list(hit[1])
+        out = []
+        for r in self._get(self.EOD, symbol, today - timedelta(days=DAILY_HISTORY_DAYS), today):
+            try:
+                d = date.fromisoformat(str(r["date"])[:10])
+                o, h, lo, c = (float(r[k]) for k in ("open", "high", "low", "close"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if d >= today:
+                continue
+            out.append(Bar(datetime.combine(d, RTH_OPEN, tzinfo=ET),
+                           datetime.combine(d, RTH_CLOSE, tzinfo=ET), o, h, lo, c,
+                           float(r.get("volume") or 0)))
+        out.sort(key=lambda b: b.start)  # FMP lists the newest first
+        with self._lock:
+            self._daily[symbol] = (today, out)
+        return list(out)
 
     def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
         try:
@@ -379,6 +416,13 @@ class DemoProvider:
         return [b for b in cached if lo <= b.start and b.end <= now]
 
 
+    def daily_bars(self, symbol: str, now: datetime) -> list[Bar]:
+        """Every generated session before today, as whole-session bars."""
+        self.five_min_bars(symbol, now)  # make sure the history is generated
+        today = now.astimezone(ET).date()
+        return resample([b for b in self._cache.get(symbol, []) if b.session < today],
+                        SESSION_MINUTES)
+
     def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
         self.five_min_bars(symbol, now)  # make sure the day is generated
         for b in self._cache.get(symbol, []):
@@ -439,6 +483,12 @@ class CachedProvider:
     def session_open(self, symbol: str, day: date, now: datetime) -> float | None:
         getter = getattr(self.inner, "session_open", None)
         return getter(symbol, day, now) if getter else None
+
+    @property
+    def daily_bars(self):
+        """The data source's daily bars, if it has its own (None: the daily book
+        builds them from 5-minute bars). The source caches them per day."""
+        return getattr(self.inner, "daily_bars", None)
 
 
 def make_provider(name: str, demo_origin: date | None = None):

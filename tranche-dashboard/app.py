@@ -1,7 +1,8 @@
-"""Tranche dashboard: local web server + schedulers for three books.
+"""Tranche dashboard: local web server + schedulers for four books.
 
-Three independent books run side by side with identical rules: "1h" on hourly
-bars, "15m" on 15-minute bars and "5m" on 5-minute bars. Each has its own
+Four independent books run side by side with identical rules: "1h" on hourly
+bars, "15m" on 15-minute bars, "5m" on 5-minute bars and "1d" on daily bars
+(model and paper only; it can't trade at IBKR). Each has its own
 database, settings, capital, performance and (optionally) its own Alpaca paper
 account.
 
@@ -45,7 +46,7 @@ import ibkr
 from data import make_provider, redact
 from engine import LIVE_SLEEVES, SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
-from indicators import ET, RTH_OPEN, in_rth, session_bar_ends
+from indicators import ET, RTH_OPEN, SESSION_MINUTES, in_rth, session_bar_ends
 from review import ProfileCache, review_payload, save_day_note, save_journal
 from store import Store
 
@@ -62,6 +63,7 @@ BOOKS = (
     ("1h", 60, "Hourly", "APCA", "tranche.db"),
     ("15m", 15, "15-min", "APCA_15M", "tranche_15m.db"),
     ("5m", 5, "5-min", "APCA_5M", "tranche_5m.db"),
+    ("1d", SESSION_MINUTES, "Daily", "APCA_1D", "tranche_1d.db"),
 )
 FASTEST = min(m for _k, m, *_ in BOOKS)
 
@@ -77,6 +79,7 @@ KEYS = ("POLYGON_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY")
 OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
                  "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",  # 15-min book's paper account
                  "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",  # 5-min book's paper account
+                 "APCA_1D_API_KEY_ID", "APCA_1D_API_SECRET_KEY",  # daily book's paper account
                  "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOKS",  # Interactive Brokers (IBKR.md)
                  "IBKR_BOOK")  # older single-book name, still read when IBKR_BOOKS is unset
 
@@ -162,7 +165,8 @@ def boundaries(day: date, delay: timedelta, minutes: int = 60) -> list[datetime]
     intraday bar close - hourly 10:00 ... 15:00, 15-min 9:45 ... 15:45,
     5-min 9:35 ... 15:55, plus a 15:55 check in every book for symbols set to
     close by end of day. The last bar of the day is not checked at 16:00; it
-    executes at the next open."""
+    executes at the next open. The daily book has the 9:30 and 15:55 checks
+    only; at 15:55 it acts on the day's bar as it stands (daily_at_close)."""
     if day.weekday() >= 5:
         return []
     ends = session_bar_ends(day, minutes)[:-1]
@@ -342,9 +346,14 @@ class Scheduler(threading.Thread):
         the first minute after a boundary (the feed is printing the bar), then
         every 3 min for up to 40 min (15-minute-delayed data plans)."""
         t = boundary - self.delay()
-        if t.time() != RTH_OPEN and t not in session_bar_ends(t.date(), self.minutes):
-            return False  # the extra 15:55 check closes no bar of this book
+        ends = session_bar_ends(t.date(), self.minutes)
         window = min(RETRY_WINDOW, timedelta(minutes=self.minutes))
+        if self.minutes >= SESSION_MINUTES and t == eod_cutoff(t.date()):
+            if not self.engine.store.settings()["daily_at_close"]:
+                return False  # the daily bar acts at the next open
+            window = min(window, ends[-1] - boundary)  # the 15:55 bar is only acted on until 16:00
+        elif t.time() != RTH_OPEN and t not in ends:
+            return False  # the extra 15:55 check closes no bar of this book
         every = FAST_RETRY_EVERY if now - boundary <= FAST_RETRY_WINDOW else RETRY_EVERY
         return (now - boundary <= window
                 and self.last_tick is not None and now - self.last_tick >= every
@@ -904,6 +913,10 @@ def bars_page(book: Book, symbol: str, rows: list[dict]) -> str:
     """Plain table of the bars the engine used, newest first, for checking
     against a chart. Signal rows are highlighted."""
     esc = html.escape
+    source = ("Daily bars from the data source's end-of-day data, today's built from 5-minute "
+              "data (through 15:55 between the 15:55 check and 16:00). Signals are judged on "
+              "the bars as they read now; a 15:55 trade was judged on the 15:55 price"
+              if book.minutes >= SESSION_MINUTES else "Regular-hours bars built from 5-minute data")
     cols = list(rows[0]) if rows else []
     head = "".join(f"<th>{esc(c)}</th>" for c in cols)
     body = "".join(
@@ -918,7 +931,7 @@ position:sticky;top:0;background:#fff}}tr.sig{{background:#fff4d6}}td:nth-last-c
 @media (prefers-color-scheme:dark){{body{{background:#0f1115;color:#e8eaee}}th{{background:#0f1115}}
 th,td{{border-color:#2a2f38}}tr.sig{{background:#3a2f12}}}}</style>
 <h2>{esc(symbol)} - {esc(book.label)} bars the engine used (newest first)</h2>
-<p>Regular-hours bars built from 5-minute data; EMAs on bar closes; ATR (Wilder); session VWAP.
+<p>{esc(source)}; EMAs on bar closes; ATR (Wilder); session VWAP.
 Highlighted rows fired a signal. <a href="{esc(symbol)}.csv">Download CSV</a></p>
 <table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"""
 
