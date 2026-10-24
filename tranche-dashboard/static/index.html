@@ -482,7 +482,7 @@ function renderBroker(B, o) {
       ${C.kill ? `<button type="button" id="${o.p}Resume">Resume</button>` : ""}` : ""}</div>`;
   if (a && !B.error && (B.reconciliation || []).length) {
     h += `<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th class="l">Symbol</th><th>Model</th><th>${live ? "Live" : o.shared ? "IBKR" : "Paper"}</th><th>P&amp;L</th></tr></thead><tbody>` +
-      B.reconciliation.map(r => `<tr><td class="l"><span class="sym">${esc(r.symbol)}</span>${o.shared ? `<div class="hint" style="margin:0">${r.book ? `${esc(r.book)} · ${r.sleeves.map(x => SL_SHORT[x] || x).join(" + ")}` : "not live: closing"}</div>` : ""}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}${r.note ? `<div class="err-text" style="max-width:220px">${esc(r.note)}</div>` : ""}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
+      B.reconciliation.map(r => `<tr><td class="l"><span class="sym">${esc(r.symbol)}</span>${o.shared ? `<div class="hint" style="margin:0">${r.book ? `${esc(r.book)} · ${r.sleeves.map(x => SL_SHORT[x] || x).join(" + ")}` : "not live: closing"}</div>` : ""}</td><td>${r.model}</td><td class="${r.match ? "" : "neg"}">${r.paper}${r.note ? `<div class="err-text" style="max-width:220px">${esc(r.note)}</div>` : ""}${o.shared && r.mismatch ? `<button type="button" class="small" data-accept="${esc(r.symbol)}" data-pos="${r.paper}" data-model="${r.model}">Accept IBKR position</button>` : ""}</td><td class="${cls(r.unrealized)}">${r.unrealized == null ? "—" : signed(r.unrealized)}</td></tr>`).join("") +
       `</tbody></table></div>`;
   }
   if (o.shared) {
@@ -493,6 +493,12 @@ function renderBroker(B, o) {
     if (evs.length) h += `<details style="margin-top:4px"><summary>IBKR log</summary><div class="hint">${evs.map(e => `${fmtT(e.ts)} · ${e.symbol ? esc(e.symbol) + ": " : ""}${esc(e.message)}`).join("<br>")}</div></details>`;
   }
   id("Body").innerHTML = h;
+  id("Body").querySelectorAll("[data-accept]").forEach(btn => btn.onclick = async () => {
+    const d = btn.dataset;
+    if (!confirm(`IBKR holds ${d.pos} ${d.accept}. Treat that as the bot's own position and follow the model (${d.model}) in ${d.accept} again from the next check?`)) return;
+    try { await api("/api/live/accept", {symbol: d.accept}); } catch (err) { alert(err.message); }
+    refresh();
+  });
   id("Toggle").onchange = async e => {
     if (e.target.checked) {
       const ok = live

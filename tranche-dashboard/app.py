@@ -866,6 +866,14 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                         threading.Thread(target=live.sync, args=(now,), daemon=True).start()
                 elif rest == "/sync":
                     live.sync(now)
+                elif rest == "/accept":
+                    sym = str(body.get("symbol") or "").strip().upper()
+                    if sym not in live.managed():
+                        raise ValidationError(f"{sym or 'that symbol'} is not traded by the IBKR link")
+                    try:
+                        live.accept_position(sym, now)
+                    except BrokerError as e:
+                        raise ValidationError(str(e))
                 elif rest == "/kill":
                     mode = body.get("mode")
                     try:

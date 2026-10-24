@@ -3210,8 +3210,8 @@ class MultiBookLiveTests(unittest.TestCase):
                             (datetime(2026, 9, 21, 10, tzinfo=ET).isoformat(), sid))
         self.short("1h", sid, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
         self.ib.pos = {"AAA": -1}
-        self.stores["live"].x("""INSERT INTO orders (ts, symbol, side, qty, client_order_id, status)
-                                 VALUES (?, 'AAA', 'sell', 1, 'x', 'filled')""",
+        self.stores["live"].x("""INSERT INTO orders (ts, symbol, side, qty, client_order_id, status,
+                                 filled_qty) VALUES (?, 'AAA', 'sell', 1, 'x', 'filled', 1)""",
                               (datetime(2026, 9, 21, 10, 0, 10, tzinfo=ET).isoformat(),))
         now = {"t": datetime(2026, 9, 21, 10, 24, 50, tzinfo=ET)}
         clock = type("C", (), {"demo": False, "now": lambda s: now["t"]})()
@@ -3334,6 +3334,11 @@ class MultiBookLiveTests(unittest.TestCase):
             self.assertEqual(code, 200)
             state = app.live_state(live)
             self.assertEqual((state["books"], state["book_labels"]), (["5m", "1h"], ["5-min", "Hourly"]))
+            code, body = call("/api/live/accept", {"symbol": "ZZZ"})        # not traded here
+            self.assertEqual(code, 400)
+            code, _b = call("/api/live/accept", {"symbol": "aaa"})          # Live in the 5-min book
+            self.assertEqual(code, 200)
+            self.assertTrue(self.stores["live"].q("SELECT 1 FROM events WHERE kind='broker-accept'"))
         finally:
             srv.shutdown()
             srv.server_close()
@@ -3381,6 +3386,89 @@ class LinkDownWarningTests(unittest.TestCase):
         self.assertEqual(st["last_positions"], {"AAA": -1})  # still shown: what may be open
         self.assertIsNotNone(st["positions_at"])
         self.assertEqual([(r["symbol"], r["model"]) for r in st["reconciliation"]], [("AAA", -1)])
+
+
+class PositionGuardTests(unittest.TestCase):
+    """A Live symbol whose IBKR position this link's own fills don't explain
+    (a manual trade, a split, a buy-in) is not traded until they agree or the
+    position is accepted on the dashboard."""
+    NOW = datetime(2026, 9, 21, 11, 32, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.stores = {k: Store(f"{self.dir.name}/{k}.db") for k in ("1h", "15m", "5m", "live")}
+        self.ib = FakeIB()
+        self.b = ibkr.IBKRBroker(ib_cfg(), ib=self.ib, api=FakeApi)
+        labels = {"1h": "Hourly", "15m": "15-min", "5m": "5-min"}
+        self.live = LiveSync(self.stores["live"], self.b, {k: (labels[k], self.stores[k]) for k in labels},
+                             live_book="5m", sleeves=LIVE_SLEEVES, fill_wait_s=0, max_shares=1,
+                             daily_loss_limit=100)
+        eng = Engine(self.stores["5m"], ScriptedProvider([]), 5)
+        eng.add_symbols("AAA", "short_only", 1.0, self.NOW)
+        self.sid = self.stores["5m"].q("SELECT id FROM symbols")[0]["id"]
+        eng.set_live(self.sid, ["EMA5_10"], self.NOW)
+
+    def tearDown(self):
+        for st in self.stores.values():
+            st.db.close()
+        self.dir.cleanup()
+
+    def model_short(self):
+        self.stores["5m"].x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+                               entry_price, stop_price, risk_dollars, fee_through, trigger)
+                               VALUES (?,?,?,?,?,?,10,11,100,'2026-09-21','cross')""",
+                            (self.sid, "AAA", "EMA5_10", "short", 100, self.NOW.isoformat()))
+
+    def test_the_bots_own_fills_explain_its_position_and_it_trades_normally(self):
+        self.model_short()
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.assertEqual(self.live.expected("AAA"), -1)
+        self.stores["5m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=9, "
+                            "exit_reason='5/10 EMA crossed up', gross_pnl=1", (self.NOW.isoformat(),))
+        self.live.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(self.ib.pos, {})                      # covered as usual
+        self.assertEqual(self.live.expected("AAA"), 0)
+
+    def test_a_split_that_empties_the_short_is_not_shorted_again(self):
+        self.model_short()
+        self.live.sync(self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.ib.pos = {}                                       # 1-for-10 reverse split: cash in lieu
+        n = len(self.ib.placed)
+        self.live.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(len(self.ib.placed), n)               # model still short: not re-sent
+        st = self.live.status(max_age_s=0)
+        row = {r["symbol"]: r for r in st["reconciliation"]}["AAA"]
+        self.assertTrue(row["mismatch"])
+        self.assertIn("own fills add up to -1", row["note"])
+        self.assertTrue(self.stores["live"].q("SELECT 1 FROM events WHERE kind='broker-skip' "
+                                              "AND message LIKE '%outside the bot%'"))
+
+    def test_a_manual_cover_is_not_fought_until_it_is_accepted(self):
+        self.model_short()
+        self.live.sync(self.NOW)
+        self.ib.pos = {}                                       # covered by hand in the IBKR app
+        self.live.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(self.ib.pos, {})
+        self.assertEqual(self.live.accept_position("AAA", self.NOW), 0)
+        self.assertEqual(self.live.expected("AAA"), 0)
+        self.live.sync(self.NOW + timedelta(minutes=10))      # accepted: follows the model again
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.assertTrue(self.stores["live"].q("SELECT 1 FROM events WHERE kind='broker-accept'"))
+
+    def test_the_kill_switch_flatten_still_closes_a_mismatched_symbol(self):
+        self.model_short()
+        self.live.sync(self.NOW)
+        self.ib.pos = {"AAA": -1}
+        self.stores["live"].x("DELETE FROM orders")            # e.g. history cleared while short
+        self.live.set_kill("flatten", self.NOW)
+        self.live.sync(self.NOW + timedelta(minutes=5))
+        self.assertEqual(self.ib.pos, {})
+
+    def test_paper_accounts_have_no_guard(self):
+        sync = BrokerSync(self.stores["5m"], AlpacaPaper.__new__(AlpacaPaper))
+        self.assertIsNone(sync._position_hold("AAA", -5))
 
 
 class TimingReportTests(unittest.TestCase):

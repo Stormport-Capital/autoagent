@@ -200,6 +200,12 @@ class BrokerSync:
         """The book recorded on an order for `sym`."""
         return self.book
 
+    def _position_hold(self, sym: str, cur: int) -> str | None:
+        """Why `sym` must not be traded because the broker's position is not the
+        one this link's own fills explain (None = go ahead). Off for the paper
+        accounts; the IBKR link checks it."""
+        return None
+
     def _seen_positions(self, pos: dict[str, int]) -> None:
         """Remember the broker's positions from a good read, so the dashboard
         can say what may still be open when the link goes down."""
@@ -268,6 +274,11 @@ class BrokerSync:
                 self.needs_followup = True
                 self._reprice(now, sym, busy[sym])
                 continue
+            if not flatten:
+                why = self._position_hold(sym, cur)
+                if why:
+                    self._log_skip(now, sym, why)
+                    continue
             why = self._held_back(now, sym, opens_short=False)
             if why:
                 self._log_skip(now, sym, why)
@@ -715,5 +726,66 @@ class LiveSync(BrokerSync):
 
     def _recon_extra(self, sym: str) -> dict:
         sel = self.selections().get(sym)
+        exp = self.expected(sym)
         return {"book": sel["label"] if sel else None,
-                "sleeves": sel["sleeves"] if sel else []}
+                "sleeves": sel["sleeves"] if sel else [],
+                "expected": exp,
+                "mismatch": self.positions_at is not None
+                and self.last_positions.get(sym, 0) != exp}
+
+    # ---- the position IBKR holds vs the one this link's fills explain
+    def _fills(self, sym: str) -> int:
+        """Net shares this link's own filled orders in `sym` add up to."""
+        n = 0
+        for r in self.store.q("SELECT side, filled_qty FROM orders WHERE symbol=? "
+                              "AND filled_qty > 0", (sym,)):
+            q = int(round(float(r["filled_qty"])))
+            n += q if r["side"] == "buy" else -q
+        return n
+
+    def expected(self, sym: str) -> int:
+        """The IBKR position this link expects in `sym`: its fills, plus any
+        difference accepted on the dashboard (Accept IBKR position)."""
+        off = self._ctl(f"offset:{sym}")
+        return self._fills(sym) + (int(off) if off else 0)
+
+    @staticmethod
+    def _mismatch_text(sym: str, cur: int, exp: int) -> str:
+        return (f"IBKR holds {cur:+d} {sym} but this link's own fills add up to {exp:+d}: "
+                f"something outside the bot changed it (a manual trade, a split, a buy-in). "
+                f"Not traded until they agree; fix it in the IBKR app or press Accept IBKR position")
+
+    def _position_hold(self, sym: str, cur: int) -> str | None:
+        """A Live symbol whose IBKR position this link's fills don't explain is
+        not traded: a manual trade in the IBKR app, a reverse split or a buy-in
+        would otherwise make the bot send orders to put back a position IBKR
+        no longer holds (a 1-for-10 split of a 1-share short leaves 0 shares
+        while the model is still short). A fill can land between this sync's
+        order refresh and its position read, so the orders are refreshed once
+        more before a symbol is held back."""
+        if cur == self.expected(sym):
+            return None
+        self._refresh_orders()
+        exp = self.expected(sym)
+        return None if cur == exp else self._mismatch_text(sym, cur, exp)
+
+    def blocked(self, now: datetime) -> dict[str, str]:
+        out = super().blocked(now)
+        if self.positions_at is not None:
+            for sym in self.managed():
+                cur, exp = self.last_positions.get(sym, 0), self.expected(sym)
+                if cur != exp:
+                    out[sym] = self._mismatch_text(sym, cur, exp)
+        return out
+
+    def accept_position(self, sym: str, now: datetime) -> int:
+        """Treat IBKR's current position in `sym` as this link's own, so it
+        follows the model there again. Returns that position."""
+        pos = self.broker.positions()
+        cur = int(float(pos[sym]["qty"])) if sym in pos else 0
+        fills = self._fills(sym)
+        self._set_ctl(f"offset:{sym}", str(cur - fills))
+        self.store.log(now, "broker-accept", f"accepted IBKR's {sym} position {cur:+d} (this "
+                       f"link's fills add up to {fills:+d}); it follows the model in {sym} again "
+                       f"from the next check", sym)
+        return cur

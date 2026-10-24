@@ -176,6 +176,15 @@ $S $D/tranche_live.db "SELECT symbol, count(*) bars,
   reported and when. Stops and the 15:55 flat can't be sent until IB Gateway
   is back, so the banner says to check the gateway (2FA on IBKR Mobile) or
   manage the position in the IBKR app.
+- **Position guard:** a Live symbol whose IBKR position this link's own fills
+  don't explain is not traded. That catches a manual trade in the IBKR app,
+  a reverse split (a 1-for-10 split of a 1-share short leaves 0 shares while
+  the model is still short, and the bot would short it again) and a buy-in.
+  The IBKR card marks the symbol and shows **Accept IBKR position**: pressing
+  it treats IBKR's position as the bot's own, and the link follows the model
+  in that symbol again from the next check. The kill switch's Flatten and the
+  daily loss limit still close a held-back symbol. The paper accounts have
+  no guard.
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.
