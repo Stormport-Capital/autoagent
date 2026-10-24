@@ -170,6 +170,12 @@ $S $D/tranche_live.db "SELECT symbol, count(*) bars,
   round(max((julianday(first_seen_at)-julianday(bar_end))*86400),1) worst_s
   FROM bar_arrivals WHERE bar_end >= date('now') GROUP BY symbol;"
 ```
+- **Link-down warning:** when the IBKR link can't reach the account while a
+  position may be open (IBKR held one at the last good read, or the model
+  wants one), every tab shows a red banner with the last positions IBKR
+  reported and when. Stops and the 15:55 flat can't be sent until IB Gateway
+  is back, so the banner says to check the gateway (2FA on IBKR Mobile) or
+  manage the position in the IBKR app.
 - **Daily loss limit** (`IBKR_DAILY_LOSS_LIMIT`, default **$100**):
   - The first account reading of each ET day is that day's starting value. It
     is IBKR's net liquidation value.
