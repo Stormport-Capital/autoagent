@@ -3084,5 +3084,50 @@ class FastPipelineTests(unittest.TestCase):
         self.assertIsNone(seconds_after(bar, "not a time"))
 
 
+class TimingReportTests(unittest.TestCase):
+    """timing_report.py: the Monday read-out of the Phase 1 timing record."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.folder = Path(self.dir.name)
+        self.live = Store(str(self.folder / "tranche_live.db"))
+        self.five = Store(str(self.folder / "tranche_5m.db"))
+        self.five.save_settings({"bar_close_delay_min": 10 / 60})
+
+    def tearDown(self):
+        self.live.db.close()
+        self.five.db.close()
+        self.dir.cleanup()
+
+    def test_report_reads_orders_checks_and_arrivals(self):
+        import timing_report
+        bar = "2026-10-26T10:05:00-04:00"
+        self.live.x("""INSERT INTO orders (ts, symbol, side, qty, client_order_id, status, bar_end,
+                       sent_at, acked_at, filled_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    ("2026-10-26T10:05:10-04:00", "AAA", "sell", 1, "x", "filled", bar,
+                     "2026-10-26T10:05:11.4-04:00", "2026-10-26T10:05:11.9-04:00",
+                     "2026-10-26T14:05:12.6+00:00"))
+        self.five.x("""INSERT INTO checks (kind, bar_end, started_at, data_at, ibkr_start, ibkr_done,
+                       done_at, symbols, live, behind) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    ("check", bar, "2026-10-26T10:05:10-04:00", "2026-10-26T10:05:10.6-04:00",
+                     "2026-10-26T10:05:10.7-04:00", "2026-10-26T10:05:12-04:00",
+                     "2026-10-26T10:05:12.5-04:00", 3, 1, 1))
+        self.live.x("INSERT INTO bar_arrivals VALUES (?,?,?)", ("AAA", bar, "2026-10-26T10:05:10.5-04:00"))
+        self.live.x("INSERT INTO bar_arrivals VALUES (?,?,?)",
+                    ("BBB", bar, "2026-10-26T10:05:25-04:00"))          # 15 s late past the check
+        text = timing_report.report(self.folder, "2026-10-26")
+        self.assertIn("AAA    sell 1  filled    sent  11.4 s  filled  12.6 s", text)
+        self.assertIn("5-min: 1 checks, 0 retries; 1 check(s) left a symbol waiting", text)
+        self.assertIn("IBKR done     median 12.0 s, worst 12.0 s", text)
+        self.assertIn("BBB    1 bars, median 25.0 s, worst 25.0 s; 1 after the 10 s check", text)
+        self.assertIn("Phase 1 verdict: PASS - 1 order(s) sent, worst 11.4 s", text)
+
+    def test_report_on_a_day_with_nothing(self):
+        import timing_report
+        text = timing_report.report(self.folder, "2026-10-26")
+        self.assertIn("IBKR orders\n  none", text)
+        self.assertIn("Phase 1 verdict: not yet", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -133,7 +133,16 @@ checked against the target (15-30 s on 5-min bars).
   a bar already there at a check's first fetch shows the check's time, a late
   one shows the 5-second retry that found it. Kept 30 days.
 
-Queries on the droplet (5-min book, today):
+**The report** (read-only; today, or a date given as YYYY-MM-DD) prints every
+IBKR order's seconds from bar close to sent and to fill, each book's check
+timings, how late each symbol's bars came in, and the Phase 1 verdict (bar
+close to order sent under 20 s):
+
+```
+cd /opt/tranche/autoagent/tranche-dashboard && sudo -u tranche /opt/tranche/venv/bin/python -I timing_report.py
+```
+
+The same data with plain SQL (5-min book, today):
 
 ```
 D=/opt/tranche/autoagent/tranche-dashboard; S="sudo -u tranche sqlite3 -header"
