@@ -54,6 +54,8 @@ else
   S2=$(asks "APCA_15M_API_SECRET_KEY (15-min paper account, optional)")
   A3=$(asks "APCA_5M_API_KEY_ID (5-min paper account, optional)")
   S3=$(asks "APCA_5M_API_SECRET_KEY (5-min paper account, optional)")
+  A4=$(asks "APCA_1D_API_KEY_ID (daily paper account, optional)")
+  S4=$(asks "APCA_1D_API_SECRET_KEY (daily paper account, optional)")
   while :; do
     PW=$(asks "Choose a dashboard password")
     [ -n "$PW" ] && break
@@ -71,6 +73,8 @@ APCA_15M_API_KEY_ID=$A2
 APCA_15M_API_SECRET_KEY=$S2
 APCA_5M_API_KEY_ID=$A3
 APCA_5M_API_SECRET_KEY=$S3
+APCA_1D_API_KEY_ID=$A4
+APCA_1D_API_SECRET_KEY=$S4
 TRANCHE_PASSWORD=$PW
 TRANCHE_BACKUP_DIR=$ROOT/backups
 ENV

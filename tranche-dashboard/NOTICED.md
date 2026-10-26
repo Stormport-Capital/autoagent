@@ -84,7 +84,10 @@ Added after the first live refusals (2026-10-16, XLAB):
     trigger still judge each bar once from the bars as served at that moment,
     so the same feed behaviour can still lose one of their signals. Extending
     the record to them changes the model's results; not done without a
-    decision.
+    decision. Exception since Phase 4: the daily book at 15:55 judges both EMA
+    tranches against the side read at the previous 15:55 check
+    (`symbols.close_sides`), because there the gap between the 15:55 price and
+    the official close is built in, not a feed accident.
 18. **The feed's bars are not recorded as judged.** The engine keeps only the
     EMA side it judged (`symbols.live_side`), not the close and EMAs the bar
     had at the check, and the snapshot is overwritten at the next check. So
@@ -112,3 +115,9 @@ Added after the first live refusals (2026-10-16, XLAB):
     250 MB for 10 symbols, well inside FMP Starter's 20 GB a month. Treating
     a bar still missing after `STALE_WAIT` as not behind, or a holiday
     calendar, would end the loop sooner; not built.
+20. **The Closed-trades export bar shows on every tab.** `index.html` sets
+    `#exportBar.hidden` when the tab isn't Closed trades, but the `.export`
+    rule (`display: flex`) overrides the browser's `hidden` style, so the bar
+    stays visible (checked headlessly 2026-10-24: `hidden` true, element
+    visible). A `[hidden] { display: none }` rule would fix it; not changed,
+    since it alters what the page shows.

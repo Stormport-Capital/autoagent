@@ -1,6 +1,7 @@
 """Offline tests: indicator math, the Russo VWAP-fail trigger, and the engine's
 entries, sizing, stops, borrow fees and gating. Run: python test_tranche.py"""
 
+import json
 import math
 import os
 import tempfile
@@ -1301,8 +1302,10 @@ class BrokerSyncTests(unittest.TestCase):
     def test_books_never_share_a_paper_account(self):
         env = {"APCA_API_KEY_ID": "PKSAME", "APCA_API_SECRET_KEY": "s1",
                "APCA_15M_API_KEY_ID": "PKSAME", "APCA_15M_API_SECRET_KEY": "s2"}
-        old = {k: os.environ.get(k) for k in (*env, "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY")}
-        for k in ("APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY"):
+        later = ("APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",
+                 "APCA_1D_API_KEY_ID", "APCA_1D_API_SECRET_KEY")
+        old = {k: os.environ.get(k) for k in (*env, *later)}
+        for k in later:
             os.environ.pop(k, None)
         os.environ.update(env)
         try:
@@ -1318,6 +1321,13 @@ class BrokerSyncTests(unittest.TestCase):
             self.assertIsNone(links["5m"][0])
             self.assertIn("same as the 15-min book's", links["5m"][1])
             os.environ["APCA_5M_API_KEY_ID"] = "PKTHIRD"
+            links = app.link_papers(demo=False)
+            self.assertIsNotNone(links["5m"][0])
+            self.assertIsNone(links["1d"][0])  # the daily book has no keys yet
+            self.assertIn("APCA_1D_API_KEY_ID", links["1d"][1])
+            os.environ.update({"APCA_1D_API_KEY_ID": "PKTHIRD", "APCA_1D_API_SECRET_KEY": "s4"})
+            self.assertIn("same as the 5-min book's", app.link_papers(demo=False)["1d"][1])
+            os.environ["APCA_1D_API_KEY_ID"] = "PKFOURTH"
             self.assertTrue(all(v[0] for v in app.link_papers(demo=False).values()))
         finally:
             for k, v in old.items():
@@ -3514,6 +3524,273 @@ class TimingReportTests(unittest.TestCase):
         text = timing_report.report(self.folder, "2026-10-26")
         self.assertIn("IBKR orders\n  none", text)
         self.assertIn("Phase 1 verdict: not yet", text)
+
+
+def daily_bar(d: date, o, h, l, c, vol=1e6) -> Bar:
+    return Bar(datetime.combine(d, time(9, 30), tzinfo=ET), datetime.combine(d, time(16, 0), tzinfo=ET),
+               o, h, l, c, vol)
+
+
+def session_five(d: date, closes: list[float]) -> list[Bar]:
+    """78 regular-hours 5-minute bars with these closes (each opens at the last close)."""
+    out, prev = [], closes[0]
+    for k, c in enumerate(closes):
+        t = datetime.combine(d, time(9, 30), tzinfo=ET) + k * FIVE
+        out.append(Bar(t, t + FIVE, prev, max(prev, c) + 0.05, min(prev, c) - 0.05, c, 1000.0))
+        prev = c
+    return out
+
+
+class DailyProvider(ScriptedProvider):
+    """5-minute bars plus the data source's own daily bars (sessions before today)."""
+
+    def __init__(self, five, daily):
+        super().__init__(five)
+        self.daily = sorted(daily, key=lambda b: b.start)
+        self.daily_calls = 0
+
+    def daily_bars(self, symbol, now):
+        self.daily_calls += 1
+        return [b for b in self.daily if b.session < now.astimezone(ET).date()]
+
+
+class DailyBookTests(unittest.TestCase):
+    """Phase 4: the daily book. History from the source's daily bars; today's
+    bar from 5-minute bars; signals at 15:55 on the bar as it stands
+    (daily_at_close, the default) or at the next open."""
+
+    D = date(2026, 10, 21)  # a Wednesday
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.store = Store(self.path)
+        self.store.save_settings({"slippage_bps": 0.0, "bar_close_delay_min": 0})
+        days = weekdays(self.D - timedelta(days=60), 60)
+        self.hist_days = [d for d in days if d < self.D][-30:]
+        # a steady uptrend, 50 -> 64.5: EMA5 above EMA10 above EMA20, no crosses
+        self.history = [daily_bar(d, 50 + 0.5 * k - 0.2, 50 + 0.5 * k + 0.3, 50 + 0.5 * k - 0.4,
+                                  50 + 0.5 * k) for k, d in enumerate(self.hist_days)]
+        self.next = weekdays(self.D + timedelta(days=1), 1)[0]
+
+    def tearDown(self):
+        self.store.db.close()
+        os.remove(self.path)
+
+    def at(self, d, h, m, s=0):
+        return datetime.combine(d, time(h, m, s), tzinfo=ET)
+
+    def engine(self, five, daily=None):
+        from indicators import SESSION_MINUTES
+        prov = DailyProvider(five, self.history if daily is None else daily)
+        return Engine(self.store, prov, SESSION_MINUTES), prov
+
+    def drop_day(self, last_close):
+        """D: slides from 64.5 to 55 by the 15:55 close, then the last bar closes at last_close."""
+        return session_five(self.D, [64.5 - 9.5 * (k + 1) / 77 for k in range(77)] + [last_close])
+
+    def tranches(self):
+        return self.store.q("SELECT * FROM tranches ORDER BY id")
+
+    def test_whole_session_bucket_and_schedule(self):
+        from indicators import SESSION_MINUTES
+        d = self.D
+        self.assertEqual(bar_bucket(self.at(d, 13, 5), SESSION_MINUTES), (self.at(d, 9, 30), self.at(d, 16, 0)))
+        self.assertEqual(session_bar_ends(d, SESSION_MINUTES), [self.at(d, 16, 0)])
+        five = self.drop_day(60.0)
+        q = resample(five, SESSION_MINUTES)
+        self.assertEqual(len(q), 1)  # not split into 9:30-13:00 and 13:00-16:00
+        self.assertEqual((q[0].open, q[0].close, q[0].volume), (five[0].open, 60.0, 78000.0))
+        self.assertEqual((q[0].high, q[0].low), (max(b.high for b in five), min(b.low for b in five)))
+        got = [b.strftime("%H:%M:%S") for b in boundaries(d, timedelta(seconds=10), SESSION_MINUTES)]
+        self.assertEqual(got, ["09:30:10", "15:55:10"])
+
+    def test_signal_acts_at_1555_on_the_bar_as_it_stands(self):
+        eng, _ = self.engine(self.drop_day(64.0))
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 15, 54, 59))
+        self.assertEqual(self.tranches(), [])                  # nothing before the 15:55 check
+        eng.tick(self.at(self.D, 15, 55, 1))
+        t = self.tranches()
+        self.assertEqual(len(t), 1)
+        self.assertEqual((t[0]["sleeve"], t[0]["side"], t[0]["status"]), ("EMA5_10", "short", "open"))
+        self.assertEqual(_dt(t[0]["entry_time"]), self.at(self.D, 15, 55))
+        self.assertAlmostEqual(t[0]["entry_price"], 55.0)      # the 15:50-15:55 close
+        sym = self.store.q("SELECT * FROM symbols")[0]
+        self.assertEqual(_dt(sym["last_bar_end"]), self.at(self.D, 16, 0))
+        self.assertEqual(json.loads(sym["close_sides"]), {"EMA5_10": -1, "EMA10_20": 1})
+        ev = self.store.q("SELECT message FROM events WHERE kind='entry'")
+        self.assertIn("15:55 5-min close 55", ev[0]["message"])
+        eng.tick(self.at(self.D, 16, 30))                      # the full-session bar is not re-traded
+        self.assertEqual(len(self.tranches()), 1)
+
+    def test_next_day_judged_against_the_1555_side(self):
+        """The close undid the 15:55 cross (64 at 16:00). On the official bars the
+        5 EMA never left the 10, so the short would never see an up-cross; judged
+        against the side read at 15:55 it covers at the next 15:55 check."""
+        five = self.drop_day(64.0) + session_five(self.next, [64.0] * 78)
+        official = daily_bar(self.D, 64.5, 64.6, 54.9, 64.0)
+        eng, _ = self.engine(five, self.history + [official])
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 15, 55, 1))
+        eng.tick(self.at(self.next, 9, 30, 10))
+        self.assertEqual(self.tranches()[0]["status"], "open")
+        eng.tick(self.at(self.next, 15, 55, 1))
+        t = self.tranches()[0]
+        self.assertEqual(t["status"], "closed")
+        self.assertEqual(_dt(t["exit_time"]), self.at(self.next, 15, 55))
+        self.assertAlmostEqual(t["exit_price"], 64.0)
+        self.assertIn("judged against the side recorded at the previous 15:55 check", t["exit_reason"])
+        # the bars alone show no 5/10 cross on either day
+        s = self.store.settings()
+        _f, bars, ind = eng._load("DLY", self.at(self.next, 15, 55, 1), s)
+        n = len(bars) - 1
+        self.assertEqual([ema_cross(ind["e5"], ind["e10"], k, 0.01) for k in (n - 1, n)], [0, 0])
+
+    def test_next_open_mode(self):
+        self.store.save_settings({"daily_at_close": 0})
+        five = self.drop_day(55.0) + session_five(self.next, [55.0] * 78)
+        official = daily_bar(self.D, 64.5, 64.6, 54.9, 55.0)
+        eng, _ = self.engine(five, self.history + [official])
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 15, 55, 1))
+        eng.tick(self.at(self.D, 16, 30))
+        self.assertEqual(self.tranches(), [])
+        eng.tick(self.at(self.next, 9, 30, 10))                # the 9:30 open check
+        t = self.tranches()
+        self.assertEqual(len(t), 1)
+        self.assertEqual(_dt(t[0]["entry_time"]), self.at(self.next, 9, 30))
+        self.assertAlmostEqual(t[0]["entry_price"], 55.0)
+        self.assertIsNone(self.store.q("SELECT close_sides FROM symbols")[0]["close_sides"])
+
+    def test_name_added_before_the_open_acts_on_yesterdays_bar_at_the_open(self):
+        """As on the other books: the bar before the name was added acts at the
+        9:30 open; the 15:55 rule applies from the first bar after that."""
+        prev = self.hist_days[-1]
+        hist = self.history[:-1] + [daily_bar(prev, 64.5, 64.6, 54.9, 55.0)]  # yesterday crossed down
+        eng, _ = self.engine(session_five(self.D, [55.0] * 78), hist)
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 9, 30, 10))
+        t = self.tranches()
+        self.assertEqual(len(t), 1)
+        self.assertEqual(_dt(t[0]["entry_time"]), self.at(self.D, 9, 30))
+        self.assertAlmostEqual(t[0]["entry_price"], 55.0)
+
+    def test_no_1555_bar_without_its_last_print(self):
+        five = [b for b in self.drop_day(64.0) if b.end != self.at(self.D, 15, 55)]
+        eng, _ = self.engine(five)
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 15, 59))
+        self.assertEqual(self.tranches(), [])
+        self.assertTrue(eng.behind(self.at(self.D, 15, 55), self.at(self.D, 15, 55)))
+
+    def test_old_daily_signal_never_fills_at_todays_open(self):
+        """A cross deep in the daily history must not be filled at the first
+        5-minute open there is (today's) just because the 5-minute bars start later."""
+        hist = [daily_bar(d, 60, 60.5, 59.5, 60) for d in self.hist_days[:20]]
+        hist += [daily_bar(d, 50, 50.5, 49.5, 50) for d in self.hist_days[20:]]  # a cross 10 days ago
+        eng, _ = self.engine(session_five(self.D, [50.0] * 78), hist)
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 9, 31))
+        self.assertEqual(self.tranches(), [])
+
+    def test_close_by_end_of_day_takes_no_daily_entry_at_1555(self):
+        eng, _ = self.engine(self.drop_day(64.0))
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0), eod_close=True)
+        eng.tick(self.at(self.D, 15, 55, 1))
+        self.assertEqual(self.tranches(), [])
+        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE kind='skip' AND message LIKE "
+                                     "'%no new entries from 15:55%'"))
+
+    def test_changing_the_mode_or_a_reset_forgets_the_record(self):
+        eng, _ = self.engine(self.drop_day(64.0))
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        eng.tick(self.at(self.D, 15, 55, 1))
+        side = lambda: self.store.q("SELECT close_sides FROM symbols")[0]["close_sides"]
+        self.assertIsNotNone(side())
+        eng.update_settings({"daily_at_close": 1})              # unchanged: kept
+        self.assertIsNotNone(side())
+        eng.update_settings({"daily_at_close": 0})
+        self.assertIsNone(side())
+        eng.update_settings({"daily_at_close": 1})
+        eng.tick(self.at(self.D, 15, 55, 30))
+        eng.reset(self.at(self.D, 15, 56))
+        self.assertIsNone(side())
+        with self.assertRaises(ValidationError):
+            eng.update_settings({"daily_at_close": 2})
+
+    def test_fetches_daily_bars_outside_the_lock(self):
+        eng, prov = self.engine(self.drop_day(64.0))
+        eng.add_symbols("DLY AAA", "short_only", 1.0, self.at(self.D, 9, 0))
+        got = eng._fetch_all(["DLY", "AAA"], self.at(self.D, 10, 0))
+        self.assertEqual(set(got), {"DLY", "AAA"})
+        self.assertEqual(prov.daily_calls, 2)
+
+    def test_scheduler_retries_the_1555_check_until_1600(self):
+        eng, _ = self.engine([b for b in self.drop_day(64.0) if b.end != self.at(self.D, 15, 55)])
+        eng.add_symbols("DLY", "short_only", 1.0, self.at(self.D, 9, 0))
+        clock = type("C", (), {"demo": False, "now": lambda self_: self.at(self.D, 15, 55, 30)})()
+        sched = app.Scheduler(eng, clock)
+        b = self.at(self.D, 15, 55)                             # delay 0: the boundary is 15:55
+        sched.last_tick = self.at(self.D, 15, 55, 20)
+        self.assertTrue(sched.retry_due(self.at(self.D, 15, 55, 30), b))
+        sched.last_tick = self.at(self.D, 15, 56, 30)              # after the first minute: every 3 min
+        self.assertFalse(sched.retry_due(self.at(self.D, 15, 58), b))
+        self.assertTrue(sched.retry_due(self.at(self.D, 15, 59, 50), b))
+        sched.last_tick = self.at(self.D, 15, 59, 50)
+        self.assertFalse(sched.retry_due(self.at(self.D, 16, 3), b))    # the market has closed
+        self.store.save_settings({"daily_at_close": 0})
+        sched.last_tick = self.at(self.D, 15, 55, 20)
+        self.assertFalse(sched.retry_due(self.at(self.D, 15, 55, 30), b))
+
+    def test_fmp_daily_bars(self):
+        from data import DataError, FmpProvider
+        os.environ["FMP_API_KEY"] = "fmpsecret123"
+        try:
+            rows = [{"symbol": "SPY", "date": d, "open": 1.0 + k, "high": 2.0 + k, "low": 0.5 + k,
+                     "close": 1.5 + k, "volume": 100 + k, "change": 0, "changePercent": 0, "vwap": 1}
+                    for k, d in enumerate(["2026-10-19", "2026-10-20", "2026-10-21"])]
+            fake = FakeFmp(rows)
+            fmp = FmpProvider(session=fake)
+            now = self.at(self.D, 10, 0)                         # Oct 21: its row is partial
+            bars = fmp.daily_bars("SPY", now)
+            self.assertEqual([b.session for b in bars], [date(2026, 10, 19), date(2026, 10, 20)])
+            self.assertEqual((bars[0].start, bars[0].end), (self.at(date(2026, 10, 19), 9, 30),
+                                                            self.at(date(2026, 10, 19), 16, 0)))
+            self.assertEqual((bars[1].open, bars[1].close, bars[1].volume), (2.0, 2.5, 101.0))
+            url, params = fake.calls[0]
+            self.assertEqual(url, "https://financialmodelingprep.com/stable/historical-price-eod/full")
+            self.assertEqual((params["symbol"], params["from"], params["to"]),
+                             ("SPY", "2025-09-16", "2026-10-21"))
+            fmp.daily_bars("SPY", self.at(self.D, 15, 55))
+            self.assertEqual(len(fake.calls), 1)                 # once per symbol per day
+            self.assertEqual(len(fmp.daily_bars("SPY", self.at(date(2026, 10, 22), 9, 30))), 3)
+            self.assertEqual(len(fake.calls), 2)
+            bad = FmpProvider(session=FakeFmp(rows, fail=(429, {"Error Message": "Limit Reach"})))
+            for _ in range(2):
+                with self.assertRaises(DataError):
+                    bad.daily_bars("SPY", now)
+            self.assertEqual(len(bad.http.calls), 2)              # a failure is not cached
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_cached_provider_passes_daily_bars_through(self):
+        from data import CachedProvider
+        inner = DailyProvider([], self.history)
+        self.assertIs(CachedProvider(inner).daily_bars.__self__, inner)
+        self.assertIsNone(CachedProvider(ScriptedProvider([])).daily_bars)
+
+    def test_daily_paper_keys_are_redacted(self):
+        from data import redact
+        old = os.environ.get("APCA_1D_API_SECRET_KEY")
+        os.environ["APCA_1D_API_SECRET_KEY"] = "dailysecret42"
+        try:
+            self.assertEqual(redact("key dailysecret42 here"), "key *** here")
+        finally:
+            if old is None:
+                os.environ.pop("APCA_1D_API_SECRET_KEY", None)
+            else:
+                os.environ["APCA_1D_API_SECRET_KEY"] = old
 
 
 if __name__ == "__main__":
