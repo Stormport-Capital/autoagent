@@ -5,7 +5,10 @@
 #
 # Run from the deployed tranche-dashboard directory (its .env is read). Prints
 # OK/FAIL for the gateway connection, the $2,000 short minimum, market data,
-# borrow (tick 236) and IBKR's own order checks for SELL 1 SYMBOL.
+# borrow (tick 236) and IBKR's own order checks for SELL 1 SYMBOL, then a one-line
+# VERDICT naming the kind of block: closing-only (nobody may open it at IBKR), an
+# account restriction (IBKR compliance flag), not shortable (IBKR lends none of it),
+# no borrow now (IBKR lends it but has none at the moment), or tradeable.
 import asyncio, dataclasses, math, sys, time
 from pathlib import Path
 APP = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parent
@@ -87,6 +90,31 @@ try:
     other = [(code, m) for _, code, m in errs[:n0] if code not in INFO | NO_DATA]
     for code, m in other:
         print(f"     note {code}: {m}")
+    # One line on which kind of block this is, so a broker question can be told from a
+    # timing one. IBKR's refusal (if any) wins over the borrow reading: a stock nobody
+    # may open, or this account may not, is blocked whatever the borrow says.
+    msgs = " ".join(m for _c, m in refusals)
+    if "closing-only" in msgs:
+        why = ("CLOSING-ONLY at IBKR: its risk desk lets nobody open a position in this stock "
+               "today, whatever the borrow. Only waiting it out or another broker helps")
+    elif "No Trading Permission" in msgs or "Compliance Restriction" in msgs:
+        why = ("ACCOUNT RESTRICTION: this account may not open positions in this stock (IBKR "
+               "compliance flag). An IBKR ticket or call, not a borrow problem")
+    elif refusals:
+        why = f"REFUSED by IBKR: {refusals[0][1][:120]}"
+    elif lvl is None:
+        why = "UNKNOWN: IBKR sent no borrow data; an order would face IBKR's own locate check"
+    elif lvl <= 1.5:
+        why = ("NOT SHORTABLE: IBKR has no lending in this name at all. A locate broker might, "
+               "at a per-share fee; no IBKR setting changes it")
+    elif lvl <= 2.5:
+        why = ("NO BORROW NOW: IBKR lends this name but has none at the moment. Timing and "
+               "broker: recheck after 9:30, or a locate broker could fill it")
+    elif good:
+        why = "TRADEABLE: easy to borrow and IBKR accepts the short"
+    else:
+        why = "UNANSWERED: IBKR did not answer the what-if; run the check again"
+    print(f"VERDICT {SYM}: {why}")
     print("Nothing was ordered. Done.")
 finally:
     try:
