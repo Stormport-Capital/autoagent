@@ -538,6 +538,18 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             eng.add_symbols("BAD", "short_only", 1, now, grade="Z")
 
+    def test_check_delay_keeps_seconds(self):
+        """The dashboard sends the delay as minutes with a fraction (10 s = 1/6 min).
+        Until 2026-11-04 the int default made update_settings cast it to int, so
+        10 s saved as 0 and 90 s as 1 minute, whatever the form showed."""
+        eng = self.engine([])
+        got = eng.update_settings({"bar_close_delay_min": 10 / 60})["bar_close_delay_min"]
+        self.assertAlmostEqual(got, 10 / 60)
+        self.assertEqual(round(got * 60), 10)                 # what the form shows back
+        self.assertEqual(round(eng.update_settings({"bar_close_delay_min": 90 / 60})
+                               ["bar_close_delay_min"] * 60), 90)
+        self.assertEqual(Store(self.path).settings()["bar_close_delay_min"], 1.5)  # survives a reload
+
     def test_choppy_history_sizes_from_past_crosses(self):
         # a sine-wave price gives plenty of past 5/10 crosses -> history-based sizing
         ds = weekdays(date(2026, 8, 3), 12)
