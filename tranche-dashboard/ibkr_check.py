@@ -94,9 +94,12 @@ try:
     # timing one. IBKR's refusal (if any) wins over the borrow reading: a stock nobody
     # may open, or this account may not, is blocked whatever the borrow says.
     msgs = " ".join(m for _c, m in refusals)
-    if "closing-only" in msgs:
-        why = ("CLOSING-ONLY at IBKR: its risk desk lets nobody open a position in this stock "
-               "today, whatever the borrow. Only waiting it out or another broker helps")
+    if "closing-only" in msgs and "regulatory" in msgs.lower():
+        why = ("CLOSING-ONLY (regulatory): nobody may open a position in this stock, and a "
+               "regulatory restriction is likely the same at every broker. Only waiting it out helps")
+    elif "closing-only" in msgs:
+        why = ("CLOSING-ONLY (IBKR risk management): IBKR lets nobody open a position in this "
+               "stock today, whatever the borrow. Waiting it out or another broker helps")
     elif "No Trading Permission" in msgs or "Compliance Restriction" in msgs:
         why = ("ACCOUNT RESTRICTION: this account may not open positions in this stock (IBKR "
                "compliance flag). An IBKR ticket or call, not a borrow problem")
