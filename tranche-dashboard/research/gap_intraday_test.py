@@ -35,7 +35,14 @@ Rules simulated per event day (parameters below are flags):
     ("conservative"). A second column judges the stop on bar CLOSES above the
     level, which is how the dashboard's live stop works;
   * otherwise flat at the close of the 15:50-15:55 bar, as the dashboard is;
-  * slippage --slip-bps against the trade on each side.
+  * slippage --slip-bps against the trade on each side;
+  * --news: each stock event's headlines from FMP's stock-news endpoint (the
+    event day and the day before), keeping those published before 9:35 ET on
+    the day (FMP stamps appear to be New York time), typed by keyword rules
+    (NEWS_RULES) into one news_type; the summary then splits returns by type
+    and reports headline coverage by year. --grade-sample N writes
+    grading_sheet.csv: N events with their pre-open headlines and an empty
+    your_type column, outcomes withheld, for a human to grade blind.
 """
 
 from __future__ import annotations
@@ -61,6 +68,21 @@ except ImportError:  # the droplet's venv has it; a bare python may not
 
 FMP = "https://financialmodelingprep.com/stable"
 LEVERAGED = re.compile(r"\b(2x|3x|-1x|1\.5x|bull|bear|ultra(?:short|pro)?|daily|leveraged|inverse)\b", re.I)
+NEWS_CUTOFF = "09:35:00"  # headlines at or after this (New York time) on the event day are hindsight
+# news types, first match wins: the kinds a gap-down short cares about
+NEWS_RULES = (
+    ("regulatory_legal_fraud", r"\b(sec\b|doj\b|ftc\b|investigat|subpoena|lawsuit|class action|fraud|restat|accounting"
+                               r"|auditor|delist|deficien|short report|hindenburg|muddy waters|citron|halt(?:ed|s)?\b)"),
+    ("fda_clinical", r"\b(fda\b|clinical|trial|phase [1-3i]|topline|top-line|endpoint|efficacy|complete response"
+                     r"|crl\b|adcom|pdufa|discontinu)"),
+    ("offering_financing", r"\b(offering|priced|pricing of|registered direct|private placement|pipe\b|convertible"
+                           r"|at-the-market|warrant|dilut|raise[sd]? \$|capital raise|notes due)"),
+    ("earnings_guidance", r"\b(earnings|quarter|q[1-4]\b|fiscal|results|guidance|outlook|forecast|revenue|eps\b"
+                          r"|miss(?:es|ed)?\b|beat(?:s)?\b|margin|preliminary)"),
+    ("executive_exit", r"\b(resign|steps down|step down|departure|terminat|replaces? (?:ceo|cfo)|interim (?:ceo|cfo))"),
+    ("deal", r"\b(merger|acqui|takeover|buyout|spac\b|de-spac|deal\b|tender offer|strategic alternatives)"),
+    ("analyst_downgrade", r"\b(downgrade|price target|underperform|sell rating|initiat)"),
+)
 
 
 # ----------------------------------------------------------------- fetching
@@ -122,6 +144,35 @@ def five_min(fx: Fetcher, symbol: str, day: str) -> list[dict]:
                   {"symbol": symbol, "from": day, "to": day, "extended": "true"})
     return sorted((r for r in rows or [] if isinstance(r, dict) and r.get("date", "")[:10] == day),
                   key=lambda r: r["date"])
+
+
+def news(fx: Fetcher, symbol: str, day: str) -> list[dict]:
+    """FMP stock news for the event day and the day before, oldest first."""
+    before = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+    rows = fx.get(f"news_{symbol}_{day}", "news/stock", {"symbol": symbol, "symbols": symbol,
+                                                           "from": before, "to": day, "limit": 100})
+    return sorted((r for r in rows or [] if isinstance(r, dict) and r.get("publishedDate")),
+                  key=lambda r: r["publishedDate"])
+
+
+def preopen_news(items: list[dict], day: str) -> list[dict]:
+    """Headlines known before the 9:35 bar on `day` (the day before counts)."""
+    return [r for r in items if r["publishedDate"] < f"{day} {NEWS_CUTOFF}"
+            and r["publishedDate"][:10] <= day]
+
+
+def news_type(items: list[dict]) -> tuple[str, str]:
+    """(type, the headline that decided it). Rules in priority order; an item
+    list with no match is 'other'; no items is 'no_news_found'."""
+    if not items:
+        return "no_news_found", ""
+    for kind, pat in NEWS_RULES:
+        rx = re.compile(pat, re.I)
+        for r in items:
+            blob = f"{r.get('title') or ''} {(r.get('text') or '')[:400]}"
+            if rx.search(blob):
+                return kind, (r.get("title") or "")[:120]
+    return "other", (items[-1].get("title") or "")[:120]
 
 
 def daily(fx: Fetcher, symbol: str, start: str, end: str) -> list[dict]:
@@ -351,6 +402,21 @@ def summarize(trades: list[dict], macro_days: set, args) -> str:
             byy[t["date"][:4]].append(t["ret_pct"])
         for y in sorted(byy):
             out.append(line(f"{y}, intrabar stop", byy[y]))
+        if any(t.get("news_type") for t in ts):
+            out.append("")
+            for kind in [k for k, _p in NEWS_RULES] + ["other", "no_news_found"]:
+                sub = [t for t in ts if t.get("news_type") == kind]
+                if sub:
+                    out.append(line(f"news {kind}, intrabar stop", [t["ret_pct"] for t in sub], days(sub, "ret_pct")))
+                    top = [t for t in sub if (t.get("pace") or 0) >= 4]
+                    if len(top) >= 5:
+                        out.append(line(f"  and pace >=4", [t["ret_pct"] for t in top]))
+            cov = defaultdict(lambda: [0, 0])
+            for t in ts:
+                cov[t["date"][:4]][0] += 1
+                cov[t["date"][:4]][1] += 1 if (t.get("news_count") or 0) > 0 else 0
+            out.append("headline coverage (events with a pre-open headline): " + ", ".join(
+                f"{y} {c[1]}/{c[0]}" for y, c in sorted(cov.items())))
         pairs = [(t["pace"], t["eod_mult"]) for t in ts if t.get("pace") is not None and t.get("eod_mult") is not None]
         if len(pairs) > 10:
             xs, ys = zip(*pairs)
@@ -408,6 +474,15 @@ def run_event(fx: Fetcher, ev: dict, args, eod_start: str, eod_end: str) -> dict
     t["gap_pct"] = round((open_px - ev["csv_prev_close"]) / ev["csv_prev_close"] * 100, 2)
     t.update(simulate(reg, open_px, breakdown=args.breakdown, limit_guard=args.limit_guard,
                       stop=args.stop, deadline=args.entry_deadline, slip_bps=args.slip_bps))
+    if args.news and ev["kind"] == "stock":
+        try:
+            items = preopen_news(news(fx, ev["symbol"], ev["date"]), ev["date"])
+        except RuntimeError as e:
+            t["note"] = (t.get("note") or "") + f" news: {str(e)[:60]}"
+            items = []
+        t["news_count"] = len(items)
+        t["news_type"], t["news_headline"] = news_type(items)
+        t["_headlines"] = [f"{r['publishedDate']} | {(r.get('title') or '')[:140]}" for r in items[-6:]]
     return t
 
 
@@ -417,6 +492,9 @@ def main(argv=None) -> None:
     ap.add_argument("--env", help=".env file holding FMP_API_KEY (else the environment)")
     ap.add_argument("--out", default="gap_out")
     ap.add_argument("--etfs", action="store_true", help="also find and test ETF gap-downs")
+    ap.add_argument("--news", action="store_true", help="fetch and type each stock event's pre-open headlines")
+    ap.add_argument("--grade-sample", type=int, default=0,
+                    help="with --news: write grading_sheet.csv with N events for a human to type blind")
     ap.add_argument("--limit", type=int, default=0, help="only the first N stock events (smoke run)")
     ap.add_argument("--rate", type=float, default=250, help="FMP requests per minute")
     ap.add_argument("--price-min", type=float, default=15)
@@ -481,11 +559,27 @@ def main(argv=None) -> None:
 
     cols = ["symbol", "date", "kind", "name", "gap_pct", "open", "adv20", "vol_pm", "vol_930", "vol_935", "pace",
             "eod_mult", "frac_935", "entry_time", "entry_px", "stop_px", "exit_time", "exit_px", "exit_reason",
-            "ret_pct", "ret_pct_close_stop", "ret_pct_no_stop", "close_1600", "skip", "note", "csv_vol_multiple"]
+            "ret_pct", "ret_pct_close_stop", "ret_pct_no_stop", "close_1600", "news_count", "news_type",
+            "news_headline", "skip", "note", "csv_vol_multiple"]
     with open(out / "trades.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(trades)
+    if args.news and args.grade_sample:
+        import random
+        pool = [t for t in trades if t["kind"] == "stock" and not t.get("skip")]
+        random.Random(7).shuffle(pool)
+        with open(out / "grading_sheet.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["symbol", "date", "gap_pct", "open", "rule_type", "your_type", "your_note",
+                        "headline_1", "headline_2", "headline_3", "headline_4", "headline_5", "headline_6"])
+            w.writerow(["# types: " + ", ".join(k for k, _p in NEWS_RULES) + ", other, no_news_found; "
+                        "outcomes are withheld on purpose"])
+            for t in pool[:args.grade_sample]:
+                hl = t.get("_headlines") or []
+                w.writerow([t["symbol"], t["date"], t.get("gap_pct"), t.get("open"), t.get("news_type"), "", ""]
+                           + hl + [""] * (6 - len(hl)))
+        log(f"grading sheet: {min(args.grade_sample, len(pool))} events -> {out / 'grading_sheet.csv'}")
     text = summarize(trades, macro, args)
     (out / "summary.txt").write_text(text + "\n")
     print("\n" + text)
