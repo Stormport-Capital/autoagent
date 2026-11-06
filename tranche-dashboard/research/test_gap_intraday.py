@@ -100,6 +100,23 @@ class VolumeTests(unittest.TestCase):
         self.assertIsNone(g.adv20(eod[:15], "2026-01-22"))
 
 
+class NewsTests(unittest.TestCase):
+    def test_preopen_window_and_rules(self):
+        day = "2025-08-14"
+        items = [{"publishedDate": "2025-08-13 18:05:00", "title": "Advance Auto Parts prices $1.5B notes offering"},
+                 {"publishedDate": "2025-08-14 06:30:00", "title": "Advance Auto Parts Reports Second Quarter 2025 Results"},
+                 {"publishedDate": "2025-08-14 13:26:30", "title": "Why Advance Auto Parts Crashed Today"}]
+        pre = g.preopen_news(items, day)
+        self.assertEqual([r["publishedDate"][11:16] for r in pre], ["18:05", "06:30"])  # 13:26 is hindsight
+        self.assertEqual(g.news_type(pre), ("offering_financing", "Advance Auto Parts prices $1.5B notes offering"))
+        self.assertEqual(g.news_type(pre[1:]), ("earnings_guidance", items[1]["title"]))
+        self.assertEqual(g.news_type([]), ("no_news_found", ""))
+        self.assertEqual(g.news_type([{"publishedDate": "2025-08-14 08:00:00", "title": "Company opens new store"}])[0], "other")
+        self.assertEqual(g.news_type([{"publishedDate": "x", "title": "FDA issues complete response letter"}])[0], "fda_clinical")
+        self.assertEqual(g.news_type([{"publishedDate": "x", "title": "SEC opens investigation into revenue"}])[0],
+                         "regulatory_legal_fraud")  # regulatory outranks earnings words
+
+
 class EndToEndTests(unittest.TestCase):
     """The whole run from cached FMP answers: no network."""
 
@@ -130,10 +147,13 @@ class EndToEndTests(unittest.TestCase):
             w.writerow(["AAA", day, 120, 100, 94, 100, 94, -16.7, -21.7, -6, -6, 0, 10.0, ""])
             w.writerow(["BAD", day, 1.5, 1.2, 1.1, 1.3, 1.2, -20, -20, 0, -8, 8, 3, ""])   # below $15: out
             w.writerow(["FLG", day, 120, 100, 94, 100, 94, -16.7, -21.7, -6, -6, 0, 10.0, "REVIEW"])
+        (cache / f"news_AAA_{day}.json").write_text(json.dumps([
+            {"publishedDate": f"{day} 07:00:00", "title": "AAA cuts full-year guidance", "text": "", "url": "u"},
+            {"publishedDate": f"{day} 11:00:00", "title": "Why AAA crashed today", "text": "", "url": "u"}]))
         os.environ["FMP_API_KEY"] = "testkey"
         try:
-            g.main(["--csv", str(csvp), "--out", str(d / "out"), "--etfs", "--slip-bps", "0",
-                    "--start", "2026-02-01", "--end", "2026-03-05"])
+            g.main(["--csv", str(csvp), "--out", str(d / "out"), "--etfs", "--slip-bps", "0", "--news",
+                    "--grade-sample", "5", "--start", "2026-02-01", "--end", "2026-03-05"])
         finally:
             os.environ.pop("FMP_API_KEY")
         rows = list(csv.DictReader(open(d / "out" / "trades.csv")))
@@ -144,7 +164,15 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(a["adv20"], "500000")
         self.assertAlmostEqual(float(a["pace"]), 133_000 / (0.08 * 500_000), places=2)
         self.assertEqual(a["eod_mult"], "10.0")
+        self.assertEqual((a["news_count"], a["news_type"]), ("1", "earnings_guidance"))
+        sheet = list(csv.reader(open(d / "out" / "grading_sheet.csv")))
+        self.assertEqual(sheet[2][0:2], ["AAA", day])
+        self.assertEqual(sheet[2][5], "")                       # your_type is blank
+        self.assertNotIn("ret_pct", sheet[0])                   # outcomes withheld
+        self.assertIn("AAA cuts full-year guidance", sheet[2][7])
         text = (d / "out" / "summary.txt").read_text()
+        self.assertIn("news earnings_guidance", text)
+        self.assertIn("headline coverage", text)
         self.assertIn("=== stock ===", text)
         self.assertIn("=== lev_etf ===", text)
         self.assertIn("2026, intrabar stop", text)
