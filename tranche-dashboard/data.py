@@ -38,7 +38,8 @@ class DataError(RuntimeError):
 SECRET_ENV = ("POLYGON_API_KEY", "FMP_API_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY",
               "APCA_15M_API_KEY_ID", "APCA_15M_API_SECRET_KEY",
               "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",
-              "APCA_1D_API_KEY_ID", "APCA_1D_API_SECRET_KEY")
+              "APCA_1D_API_KEY_ID", "APCA_1D_API_SECRET_KEY",
+              "TZ_API_KEY_ID", "TZ_API_SECRET_KEY")
 
 
 def redact(msg: str) -> str:

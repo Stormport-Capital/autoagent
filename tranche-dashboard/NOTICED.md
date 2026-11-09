@@ -10,7 +10,10 @@ changed. Each needs a decision before anyone works on it.
    price is ever found. If IBKR sends no bid, ask or last (for example, no
    market data subscription and `IBKR_MARKET_DATA_TYPE=1`), every IBKR order
    is refused with "no price to check the order against". This could block
-   the first live one-share test.
+   the first live one-share test. *Fixed with the TradeZero link (2026-11-09):
+   `LiveSync._ref_price` reads the price from the book where the symbol is
+   Live. IBKR still prefers its own bid/ask/last; TradeZero, whose API has no
+   quotes, uses this price for the order-value cap and any limit price.*
 2. **Only the stop cover is a market order.** The 15:55 flat, the reverse
    cross, Live off, the kill switch and the loss limit all cover with a
    marketable limit order (3% collar). An unfilled order is cancelled after
@@ -121,3 +124,33 @@ Added after the first live refusals (2026-10-16, XLAB):
     stays visible (checked headlessly 2026-10-24: `hidden` true, element
     visible). A `[hidden] { display: none }` rule would fix it; not changed,
     since it alters what the page shows.
+
+Added with the TradeZero link (2026-11-09):
+
+21. **The TradeZero locate flow has only run against a fake.** `tradezero.py`
+    follows TradeZero's documentation (quote → history row 65 → accept within
+    30 s → inventory) and `test_tradezero.py` exercises it against an
+    in-memory API. No live TradeZero account has been used yet. The first live
+    locate purchase is a test of the documentation as much as of the code;
+    the caps (`TZ_LOCATE_MAX_PER_SHARE`, `TZ_LOCATE_MAX_USD_DAY`) bound what
+    it can cost.
+22. **TradeZero orders are market orders.** The API has no quotes, so the
+    marketable-limit path of the IBKR link has nothing to price from except
+    the model's last price (`TZ_ORDER_TYPE=limit` does that). At one share the
+    difference is cents; at any real size this needs a quote source.
+23. **The model's last price is up to one bar old** when it is used as the
+    reference for the order-value cap and a TradeZero limit price. A name
+    that moved a lot since the bar close could pass or fail the cap wrongly.
+24. **Paper TradeZero proves the order path, not the borrow.** Its
+    `is-easy-to-borrow` says true for every symbol and it has no locate
+    inventory, so a paper run cannot show what a live short would cost or
+    whether it would be refused.
+25. **TradeZero's symbol spelling for class shares** (`BRK.B` style) is not
+    verified; the dashboard sends its own tickers unchanged.
+26. **The engine's log lines no longer say "IBKR".** `Engine.set_live`,
+    `day_only` and the 15:55 skip now say "live symbol" / "the live account",
+    because the engine does not know which venue is linked. Older rows in the
+    books' event logs keep the old wording.
+27. **`checks.ibkr_start` / `ibkr_done` and the `ibkr_s` timing fields** keep
+    their names whichever venue is linked; the dashboard labels them with the
+    venue's name. Renaming the columns would need a migration.

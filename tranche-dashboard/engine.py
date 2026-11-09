@@ -278,7 +278,7 @@ class Engine:
         if sym.get("eod_close"):
             return "close by end of day"
         if sym.get("live"):
-            return "close by end of day (IBKR live symbol)"
+            return "close by end of day (live symbol)"
         # Only a rate entered for this symbol can force it flat: the book default is
         # a cost estimate, not an observed fee, so it never changes how a trade is held.
         lim = float(s.get("overnight_borrow_max_pct") or 0)
@@ -306,7 +306,7 @@ class Engine:
         # a fresh mark forgets the recorded EMA side: the first bar judged uses the bars alone
         self.store.x("UPDATE symbols SET live=?, live_side=NULL WHERE id=?",
                      (",".join(sleeves) or None, symbol_id))
-        self.store.log(now, "live", f"{sym['symbol']}: IBKR follows " + (
+        self.store.log(now, "live", f"{sym['symbol']}: the live account follows " + (
             " + ".join(SLEEVE_LABELS[s] for s in sleeves) if sleeves else "nothing (live off)"),
             sym["symbol"])
         return sleeves
@@ -1077,7 +1077,7 @@ class Engine:
             return
         late = self.day_only(sym, side, s)
         if sym.get("live") and f.when.astimezone(ET).time() == RTH_OPEN:
-            self.store.log(f.when, "skip", f"{why}: IBKR live symbol - the signal came from the "
+            self.store.log(f.when, "skip", f"{why}: live symbol - the signal came from the "
                            f"15:55-16:00 bar, after the 15:55 cutoff; not entered at the next open",
                            name, sleeve)
             return

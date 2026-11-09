@@ -2,7 +2,7 @@
 
 Four independent books run side by side with identical rules: "1h" on hourly
 bars, "15m" on 15-minute bars, "5m" on 5-minute bars and "1d" on daily bars
-(model and paper only; it can't trade at IBKR). Each has its own
+(model and paper only; it can't trade live). Each has its own
 database, settings, capital, performance and (optionally) its own Alpaca paper
 account.
 
@@ -13,9 +13,10 @@ account.
 
 The model is simulated. Orders go only to a linked broker account, only when
 switched on in the dashboard: an Alpaca PAPER account per book (broker.py /
-SETUP.md), and one Interactive Brokers account, paper or live, shared by all
-books, trading only the symbols and tranches marked Live, with a share cap, a
-daily loss limit and a kill switch (ibkr.py / IBKR.md).
+SETUP.md), and one live-venue account, paper or live, shared by all books,
+trading only the symbols and tranches marked Live, with a share cap, a daily
+loss limit and a kill switch: Interactive Brokers (ibkr.py / IBKR.md) or
+TradeZero (tradezero.py / TRADEZERO.md), one at a time (LIVE_BROKER).
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from urllib.parse import parse_qs, urlparse
 from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync, seconds_after
 import ibkr
+import tradezero
 from data import make_provider, redact
 from engine import LIVE_SLEEVES, SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
@@ -81,7 +83,9 @@ OPTIONAL_KEYS = ("FMP_API_KEY",  # second data source, compared at startup
                  "APCA_5M_API_KEY_ID", "APCA_5M_API_SECRET_KEY",  # 5-min book's paper account
                  "APCA_1D_API_KEY_ID", "APCA_1D_API_SECRET_KEY",  # daily book's paper account
                  "IBKR_ACCOUNT", "IBKR_MODE", "IBKR_BOOKS",  # Interactive Brokers (IBKR.md)
-                 "IBKR_BOOK")  # older single-book name, still read when IBKR_BOOKS is unset
+                 "IBKR_BOOK",  # older single-book name, still read when IBKR_BOOKS is unset
+                 "TZ_ACCOUNT", "TZ_MODE", "TZ_BOOKS",  # TradeZero (TRADEZERO.md)
+                 "LIVE_BROKER")  # ibkr | tradezero, when both accounts are in .env
 
 
 def load_dotenv(path: Path) -> list[str]:
@@ -548,7 +552,7 @@ def connection_check(provider, papers: list, now: datetime) -> list[str]:
 
 def live_check(live: "LiveSync | None", note: str | None) -> str:
     if live is None:
-        return f"IBKR: not linked - {note}"
+        return f"live broker: not linked - {note}"
     b = live.broker
     try:
         a = b.account()
@@ -624,7 +628,7 @@ def broker_state(book: Book) -> dict:
     return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
 
 
-LIVE_NOTE = "set IBKR_ACCOUNT in .env (see IBKR.md)"
+LIVE_NOTE = "set IBKR_ACCOUNT (IBKR.md) or TZ_ACCOUNT (TRADEZERO.md) in .env"
 
 
 def live_state(live, demo=False) -> dict:
@@ -633,6 +637,7 @@ def live_state(live, demo=False) -> dict:
     if live is None:
         return {"configured": False, "reason": LIVE_NOTE}
     return {"configured": True, "endpoint": live.broker.endpoint, "enabled": live.enabled(),
+            "name": getattr(live.broker, "name", "IBKR"),  # the venue's short name, for labels
             "book": live.live_book, "book_label": live.book_label,
             "books": list(live.live_books), "book_labels": live.book_labels,
             **live.status(),
@@ -810,19 +815,21 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                     return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/live", rest):
                     if live is None:
-                        raise ValidationError(f"IBKR is not linked: {LIVE_NOTE}")
+                        raise ValidationError(f"no live broker is linked: {LIVE_NOTE}")
                     sleeves = body.get("sleeves") or []
+                    bname = getattr(live.broker, "name", "IBKR")
                     if sleeves and book.key not in live.live_books:
                         raise ValidationError(
                             f"Live trading is only in the {', '.join(live.book_labels)} "
-                            f"book{'s' if len(live.book_labels) > 1 else ''} (IBKR_BOOKS in .env)")
+                            f"book{'s' if len(live.book_labels) > 1 else ''} "
+                            f"({getattr(live.broker, 'books_var', 'IBKR_BOOKS')} in .env)")
                     if sleeves:
                         ticker = engine._symbol(int(m.group(1)))["symbol"]
                         other = live.conflict(ticker, book.key)
                         if other:
                             raise ValidationError(
-                                f"{ticker} is already Live in the {other} book. One IBKR account "
-                                f"holds one position per symbol: turn it off there first")
+                                f"{ticker} is already Live in the {other} book. One {bname} "
+                                f"account holds one position per symbol: turn it off there first")
                     engine.set_live(int(m.group(1)), sleeves, now)
                     # forced end-of-day close and the live stop take effect at the next check
                     threading.Thread(target=sched.run_tick, daemon=True).start()
@@ -863,7 +870,7 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
         def _live_post(self, rest: str):
             try:
                 if live is None:
-                    raise ValidationError(f"IBKR is not linked: {LIVE_NOTE}")
+                    raise ValidationError(f"no live broker is linked: {LIVE_NOTE}")
                 body = self._body()
                 now = ordered[0].sched.clock.now()
                 if rest == "/settings":
@@ -878,7 +885,8 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                 elif rest == "/accept":
                     sym = str(body.get("symbol") or "").strip().upper()
                     if sym not in live.managed():
-                        raise ValidationError(f"{sym or 'that symbol'} is not traded by the IBKR link")
+                        raise ValidationError(f"{sym or 'that symbol'} is not traded by the "
+                                              f"{getattr(live.broker, 'name', 'IBKR')} link")
                     try:
                         live.accept_position(sym, now)
                     except BrokerError as e:
@@ -964,18 +972,41 @@ def link_papers(demo: bool) -> dict[str, tuple]:
     return out
 
 
+def live_broker_choice(env=None) -> str | None:
+    """'ibkr', 'tradezero' or None (no live venue configured). With both
+    accounts in .env, LIVE_BROKER must say which; anything unclear links
+    nothing (one live venue at a time: LiveSync drives one account)."""
+    env = os.environ if env is None else env
+    pick = (env.get("LIVE_BROKER") or "").strip().lower()
+    has = {"ibkr": bool((env.get("IBKR_ACCOUNT") or "").strip()),
+           "tradezero": bool((env.get("TZ_ACCOUNT") or "").strip())}
+    if pick:
+        if pick not in has:
+            raise BrokerError("LIVE_BROKER must be ibkr or tradezero")
+        if not has[pick]:
+            raise BrokerError(f"LIVE_BROKER={pick} but "
+                              f"{'IBKR_ACCOUNT' if pick == 'ibkr' else 'TZ_ACCOUNT'} is not set")
+        return pick
+    if has["ibkr"] and has["tradezero"]:
+        raise BrokerError("both IBKR_ACCOUNT and TZ_ACCOUNT are set; add LIVE_BROKER=ibkr or "
+                          "LIVE_BROKER=tradezero to .env (one live venue at a time)")
+    return "ibkr" if has["ibkr"] else "tradezero" if has["tradezero"] else None
+
+
 def link_live(demo: bool) -> tuple:
-    """(IBKRBroker | None, note). Bad IBKR settings leave it unlinked, never
-    half-linked; the paper books keep running."""
+    """(IBKRBroker | TradeZeroBroker | None, note). Bad settings leave it
+    unlinked, never half-linked; the paper books keep running."""
     if demo:
         return None, "disabled in demo mode"
     try:
-        cfg = ibkr.config_from_env()
-        if cfg is None:
+        which = live_broker_choice()
+        if which is None:
             return None, LIVE_NOTE
-        return ibkr.IBKRBroker(cfg), None
+        if which == "ibkr":
+            return ibkr.IBKRBroker(ibkr.config_from_env()), None
+        return tradezero.TradeZeroBroker(tradezero.config_from_env()), None
     except BrokerError as e:
-        return None, f"IBKR settings in .env are not valid: {e}"
+        return None, f"live broker settings in .env are not valid: {e}"
 
 
 def main() -> None:
@@ -1075,7 +1106,7 @@ def main() -> None:
                        for b in books.values())
     print(f"Tranche dashboard on {url}  (provider={provider.name}"
           f"{', DEMO clock' if args.demo else ''}; alpaca paper: {linked}; "
-          f"ibkr: {live.broker.venue if live else 'not linked'})")
+          f"live: {live.broker.venue if live else 'not linked'})")
     if args.open:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     try:

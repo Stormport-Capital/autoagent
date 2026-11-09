@@ -19,6 +19,10 @@ One Interactive Brokers account, paper or live, trades the books listed in
 
 The Alpaca paper accounts are not affected; each book keeps its own.
 
+The same scope can trade at **TradeZero** instead (`TRADEZERO.md`): one live
+venue is linked at a time, chosen by which account is in `.env` or by
+`LIVE_BROKER=ibkr|tradezero` when both are.
+
 ## The live 5/10 short, exactly
 
 All bars are regular-hours 5-minute bars (9:30-16:00 ET). The EMAs are the

@@ -2359,7 +2359,7 @@ class LiveSelectionTests(unittest.TestCase):
         sid = self.add("5m", "AAA")
         self.engines["5m"].set_live(sid, ["EMA5_10"], self.NOW)
         for reason, kind in (("stop: 5-min close 10.5 above the day's high 10.2", "MKT"),
-                             ("close by end of day (IBKR live symbol): flat at 15:55", "LMT")):
+                             ("close by end of day (live symbol): flat at 15:55", "LMT")):
             tid = self.tranche("5m", "AAA", "EMA5_10", "short", 100)
             t0 = self.NOW if kind == "MKT" else self.NOW + timedelta(hours=1)
             self.live.sync(t0)
