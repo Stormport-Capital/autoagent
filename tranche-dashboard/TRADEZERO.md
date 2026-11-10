@@ -5,8 +5,9 @@ One TradeZero account, paper or live, trades the books listed in `TZ_BOOKS`
 TradeZero's REST Trading API. It is a second live venue next to Interactive
 Brokers (`IBKR.md`); **one of the two is linked at a time** (`LIVE_BROKER`).
 Everything in `IBKR.md` about *what* trades live applies unchanged: the Live
-button on the listed books' tabs, one book per symbol, the 5/10 EMA tranche
-only, short only, one share, the fixed entry stop checked at every 5-minute
+button on the listed books' tabs (a symbol may be Live in several books; the
+account holds the sum of their positions), the 5/10 EMA tranche only, short
+only, the share cap per book, the fixed entry stop checked at every 5-minute
 close, flat by 15:55, at most two entries a day, the daily loss limit and the
 kill switch. This file covers only what is different at TradeZero.
 

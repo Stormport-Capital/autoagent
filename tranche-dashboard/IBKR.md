@@ -7,7 +7,7 @@ One Interactive Brokers account, paper or live, trades the books listed in
 | Rule | Where it is enforced |
 |---|---|
 | Only the listed books' symbols can be Live; the Live button exists only on those tabs, and the server refuses it elsewhere | `app.py` live route, `LiveSync.selections` |
-| **One book per symbol.** A symbol Live in one book can't be marked Live in another: one IBKR account holds one position per symbol | `app.py` live route, `LiveSync.conflict` |
+| **A symbol may be Live in several books.** Each book's 5/10 tranche is its own position, short only and capped at the share cap per book; the account holds the sum (5-min and 15-min both short at a 1-share cap = 2 shares; the 5-min stop covers one). Order rows record the books (`5m,15m`) | `LiveSync._net`, `LiveSync._cap`; the adapter refuses more than the cap × the number of listed books |
 | Only the **5/10 EMA tranche** can be Live. VWAP-fail and 10/20 are refused | `Engine.set_live` (`LIVE_SLEEVES`), `LiveSync.selections` |
 | **Short only.** The account never goes above 0 shares; a long signal in the model means flat | `LiveSync.desired`; the adapter refuses any buy that would open a long |
 | **1 share** (`IBKR_MAX_SHARES`, the only size setting) | `BrokerSync.desired` and the adapter |

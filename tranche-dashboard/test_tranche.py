@@ -3176,7 +3176,7 @@ class MultiBookLiveTests(unittest.TestCase):
         self.short("1h", a, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
         self.short("15m", b, "BBB", datetime(2026, 9, 21, 10, tzinfo=ET))
         sel = live.selections()
-        self.assertEqual({k: v["book"] for k, v in sel.items()}, {"AAA": "1h", "BBB": "15m"})
+        self.assertEqual({k: [s["book"] for s in v] for k, v in sel.items()}, {"AAA": ["1h"], "BBB": ["15m"]})
         live.sync(self.NOW, self.NOW)
         self.assertEqual(self.ib.pos, {"AAA": -1, "BBB": -1})
         books = {r["symbol"]: r["book"] for r in self.stores["live"].q("SELECT * FROM orders")}
@@ -3184,15 +3184,60 @@ class MultiBookLiveTests(unittest.TestCase):
         recon = {r["symbol"]: r["book"] for r in live.status()["reconciliation"]}
         self.assertEqual(recon, {"AAA": "Hourly", "BBB": "15-min"})
 
-    def test_a_book_not_listed_is_ignored_and_a_symbol_is_live_in_one_book(self):
+    def test_a_book_not_listed_is_ignored(self):
         live = self.link(("5m", "1h"))
         _e, f = self.add_live("15m", "AAA")                 # 15-min isn't listed
         self.short("15m", f, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
         self.assertEqual(live.selections(), {})
-        _e, h = self.add_live("1h", "CCC")
-        self.assertEqual(live.conflict("CCC", "5m"), "Hourly")
-        self.assertIsNone(live.conflict("CCC", "1h"))      # its own book is no conflict
-        self.assertIsNone(live.conflict("ZZZ", "5m"))
+
+    def test_a_symbol_live_in_two_books_holds_each_books_trade(self):
+        """Dean, 2026-11-10: the same symbol Live in several time frames. Each
+        book's 5/10 short is its own 1-share position; the account holds the
+        sum, and one book's stop covers only its share."""
+        live = self.link(("5m", "15m", "1h"))
+        _e, a5 = self.add_live("5m", "AAA")
+        _e, a15 = self.add_live("15m", "AAA")
+        self.assertEqual([s["book"] for s in live.selections()["AAA"]], ["5m", "15m"])
+        self.assertEqual(live._cap("AAA"), 2)
+        self.assertEqual(live._cap("ZZZ"), 1)
+        self.short("5m", a5, "AAA", datetime(2026, 9, 21, 10, tzinfo=ET))
+        self.assertEqual(live.desired(), {"AAA": -1})
+        live.sync(self.NOW, self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        t15 = self.short("15m", a15, "AAA", datetime(2026, 9, 21, 10, 15, tzinfo=ET))
+        self.assertEqual(live.desired(), {"AAA": -2})
+        live.sync(self.NOW, self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -2})  # the adapter's cap allowed 2: two books
+        rows = self.stores["live"].q("SELECT book, side, qty FROM orders ORDER BY id")
+        self.assertEqual([(r["book"], r["side"], r["qty"]) for r in rows],
+                         [("5m,15m", "sell", 1), ("5m,15m", "sell", 1)])  # the books it is Live in
+        st = live.status()
+        rec = st["reconciliation"][0]
+        self.assertEqual((rec["model"], rec["paper"], rec["match"], rec["book"], rec["by_book"]),
+                         (-2, -2, True, "5-min, 15-min", {"5-min": -100, "15-min": -100}))
+        # the 15-min stop: cover one share at market, the 5-min share stays
+        self.stores["15m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=11.5, "
+                             "exit_reason='stop: 5-min close 11.5 above the day''s high 11' WHERE id=?",
+                             (datetime(2026, 9, 21, 10, 30, tzinfo=ET).isoformat(), t15))
+        live.sync(self.NOW + timedelta(minutes=1), self.NOW)
+        self.assertEqual(self.ib.pos, {"AAA": -1})
+        self.assertEqual(self.ib.placed[-1][1].orderType, "MKT")
+        # a 15-min long signal means flat for that book, the 5-min short stays
+        self.stores["15m"].x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time,
+            entry_price, stop_price, risk_dollars, fee_through) VALUES (?,?,?,?,?,?,10,9,100,'2026-09-21')""",
+            (a15, "AAA", "EMA5_10", "long", 100, self.NOW.isoformat()))
+        self.assertEqual(live.desired(), {"AAA": -1})
+        # Live off in the 5-min book: its share is covered, nothing else
+        Engine(self.stores["5m"], ScriptedProvider([]), 5).set_live(a5, [], self.NOW)
+        self.assertEqual(live._cap("AAA"), 1)
+        live.sync(self.NOW + timedelta(minutes=2), self.NOW)
+        self.assertEqual(self.ib.pos, {})
+
+    def test_the_adapter_never_allows_more_than_the_cap_times_the_listed_books(self):
+        b = ibkr.IBKRBroker(ib_cfg(IBKR_BOOKS="5m,15m"), ib=FakeIB(pos={"AAA": -2}), api=FakeApi)
+        with self.assertRaisesRegex(BrokerError, "cap is 2"):
+            b.submit("AAA", 1, "sell", "c1", cap=5)  # asks for 5; two books allow 2
+        b.submit("AAA", 1, "buy", "c2", cap=5)        # reducing is always fine
 
     # ---- the 5-minute stop watch
     def test_an_hourly_live_stop_is_taken_at_the_5_minute_close_not_the_hour(self):
@@ -3347,13 +3392,12 @@ class MultiBookLiveTests(unittest.TestCase):
             self.assertIn("IBKR_BOOKS", _json.dumps(body))
             code, _b = call(f"/api/1h/symbols/{ids['1h']}/live", {"sleeves": ["EMA5_10"]})
             self.assertEqual(code, 200)
-            code, body = call(f"/api/5m/symbols/{ids['5m']}/live", {"sleeves": ["EMA5_10"]})
-            self.assertEqual(code, 400)
-            self.assertIn("already Live in the Hourly book", _json.dumps(body))
-            code, _b = call(f"/api/1h/symbols/{ids['1h']}/live", {"sleeves": []})   # off there...
+            code, _b = call(f"/api/5m/symbols/{ids['5m']}/live", {"sleeves": ["EMA5_10"]})
+            self.assertEqual(code, 200)  # the same symbol Live in two books is allowed
+            self.assertEqual([s["book"] for s in live.selections()["AAA"]], ["5m", "1h"])
+            code, _b = call(f"/api/1h/symbols/{ids['1h']}/live", {"sleeves": []})   # off in one...
             self.assertEqual(code, 200)
-            code, _b = call(f"/api/5m/symbols/{ids['5m']}/live", {"sleeves": ["EMA5_10"]})  # ...then here
-            self.assertEqual(code, 200)
+            self.assertEqual([s["book"] for s in live.selections()["AAA"]], ["5m"])
             state = app.live_state(live)
             self.assertEqual((state["books"], state["book_labels"]), (["5m", "1h"], ["5-min", "Hourly"]))
             code, body = call("/api/live/accept", {"symbol": "ZZZ"})        # not traded here
