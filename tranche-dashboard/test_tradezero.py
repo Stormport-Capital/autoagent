@@ -652,6 +652,56 @@ class SyncTests(unittest.TestCase):
                             in m for m in msgs), msgs)
         self.assertEqual(live.status()["venue"], "TradeZero LIVE")
 
+    def test_another_venues_day_start_and_halt_do_not_carry_over(self):
+        """The live store is shared across venues. Today's start equity latched
+        by the IBKR link ($4,971) must not make TradeZero's $2,500 look like a
+        $2,471 loss (2026-11-10), and IBKR's halt is IBKR's; an untagged halt
+        from an older version still halts."""
+        day = self.NOW.date().isoformat()
+        sid = self.add_live("AAA")
+        self.short(sid, "AAA")
+        ib_tag = "IB Gateway 127.0.0.1:4001, account U1 (live)"
+        self.stores["live"].x("INSERT OR REPLACE INTO broker_control VALUES ('day_start', ?)",
+                              (f"{day}|4971.0|{ib_tag}",))
+        self.stores["live"].x("INSERT OR REPLACE INTO broker_control VALUES ('halt', ?)",
+                              (f"{day}|{ib_tag}|daily loss limit hit: IBKR LIVE day P&L -101.00 vs -100",))
+        live = self.link()
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {"AAA": -1})  # traded: neither latch was ours
+        self.assertEqual(live.day_start(self.NOW), 50001.5)
+        self.assertIsNone(live.stop_reason(self.NOW))
+        self.assertEqual(self.stores["live"].q("SELECT value FROM broker_control WHERE key='day_start'")
+                         [0]["value"], f"{day}|50001.5|{self.b.endpoint}")
+        # (status() reads the latch against the real clock's date, so it is not checked here)
+        # an untagged day_start (older version) is stale too: re-latched, no halt
+        self.stores["live"].x("UPDATE broker_control SET value=? WHERE key='day_start'", (f"{day}|4971.0",))
+        live.sync(self.NOW)
+        self.assertEqual(live.day_start(self.NOW), 50001.5)
+        self.assertIsNone(live.stop_reason(self.NOW))
+        # an untagged halt still halts, and our own tagged halt halts
+        self.stores["live"].x("UPDATE broker_control SET value=? WHERE key='halt'", (f"{day}|old-style halt",))
+        self.assertEqual(live.stop_reason(self.NOW), ("flatten", "old-style halt; orders resume tomorrow"))
+        self.stores["live"].x("UPDATE broker_control SET value=? WHERE key='halt'",
+                              (f"{day}|{self.b.endpoint}|daily loss limit hit: ours",))
+        self.assertEqual(live.stop_reason(self.NOW)[1], "daily loss limit hit: ours; orders resume tomorrow")
+        self.stores["live"].x("UPDATE broker_control SET value=? WHERE key='halt'", ("2026-11-08|x|yesterday",))
+        self.assertIsNone(live.stop_reason(self.NOW))
+
+    def test_the_loss_limit_still_trips_and_latches_with_the_tag(self):
+        sid = self.add_live("AAA")
+        self.short(sid, "AAA")
+        live = self.link()
+        live.sync(self.NOW)
+        self.b.fake.equity = 50001.5 - 1.5 - 150  # accountValue drops $150
+        self.b._pnl = None
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {})  # flattened
+        why = live.stop_reason(self.NOW)
+        self.assertEqual(why[0], "flatten")
+        self.assertIn("daily loss limit hit: TradeZero paper day P&L -150.00 vs -100", why[1])
+        self.assertTrue(self.stores["live"].q("SELECT value FROM broker_control WHERE key='halt'")
+                        [0]["value"].startswith(f"{self.NOW.date().isoformat()}|{self.b.endpoint}|"))
+
     def test_a_tradezero_rejection_holds_back_new_shorts_for_the_day(self):
         sid = self.add_live("HTB")
         self.short(sid, "HTB")
