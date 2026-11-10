@@ -8,7 +8,8 @@
 # OK/FAIL for the API keys and account, the account type against TZ_MODE, the
 # account status, equity and buying power, positions, the live route, whether
 # SYMBOL is easy to borrow, any located shares, and a one-line VERDICT.
-import sys, time
+import os, sys, time
+from datetime import datetime
 from pathlib import Path
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -16,6 +17,21 @@ APP = Path(args[1]) if len(args) > 1 else Path(__file__).resolve().parent
 sys.path.insert(0, str(APP))
 import app, tradezero  # noqa: E402
 from broker import BrokerError  # noqa: E402
+from data import make_provider  # noqa: E402
+from indicators import ET  # noqa: E402
+
+
+def share_price(sym):
+    """(last 5-minute close, source) from the dashboard's own data provider - the
+    reference the locate fee cap is a percent of. (None, why) when it has none."""
+    name = ((os.environ.get("TRANCHE_PROVIDER") or "").strip().lower()
+            or ("polygon" if os.environ.get("POLYGON_API_KEY") else
+                "fmp" if os.environ.get("FMP_API_KEY") else "yahoo"))
+    try:
+        bars = make_provider(name).five_min_bars(sym, datetime.now(ET))
+    except Exception as e:  # the check goes on without a price
+        return None, f"{name}: {type(e).__name__}"
+    return (bars[-1].close, name) if bars else (None, f"{name}: no bars")
 
 SYM = (args[0] if args else "F").upper()
 mark = lambda good: "OK  " if good else "FAIL"
@@ -42,6 +58,9 @@ print(f"     equity {usd(a['equity'])}, cash {usd(a['cash'])}, buying power {usd
 print(f"{mark(a['equity'] >= 2000)} equity {usd(a['equity'])} (shorting at a US broker needs $2,000 or more)")
 pos = b.positions()
 print("     positions: " + (", ".join(f"{s} {p['qty']}" for s, p in pos.items()) or "none"))
+print(f"     size: " + (f"{cfg.shares} shares per symbol, fixed (TZ_SHARES)" if cfg.shares else
+                        f"the model's size, at most {cfg.max_shares} share(s) (TZ_MAX_SHARES)")
+      + f"; order value cap {usd(cfg.max_order_usd)}; daily loss limit {usd(cfg.daily_loss_limit)}")
 if b.live:
     try:
         print(f"OK   live route: {b._route_name()}")
@@ -58,8 +77,11 @@ if b.live:
     print(f"     located shares of {SYM} on the account: {inv}")
     spent = b.locate_spend_today()
     print(f"     locates bought today: {usd(spent)} (cap TZ_LOCATE_MAX_USD_DAY "
-          f"{usd(cfg.locate_max_usd_day)}; per share cap {cfg.locate_max_per_share:.4f}"
-          + (", locates OFF" if cfg.locate_max_per_share <= 0 else "") + ")")
+          f"{usd(cfg.locate_max_usd_day)}; fee cap TZ_LOCATE_MAX_PCT {cfg.locate_max_pct:.2f}% "
+          f"of the share price" + (", locates OFF" if cfg.locate_max_pct <= 0 else "") + ")")
+px, src = share_price(SYM)
+print(f"     {SYM} share price: " + (f"${px:,.2f} (last 5-minute close, {src})" if px
+                                     else f"none ({src}) - the bot refuses a locate without one"))
 offer = None
 if "--locate-quote" in flags and b.live and etb is False and inv == 0:
     qid = f"tzcheck-{SYM}-{int(time.time())}"
@@ -78,6 +100,8 @@ if "--locate-quote" in flags and b.live and etb is False and inv == 0:
               + (f", {r.get('text')}" if r.get("text") else ""))
     if offers:
         offer = min(float(r["locatePrice"]) for r in offers)
+        if px:
+            print(f"     = {offer / px * 100:.2f}% of the ${px:,.2f} share price, ${offer * 100:.2f} per 100")
     print("     (quote only - nothing accepted, nothing bought; the offer lapses in 30 s)")
 elif "--locate-quote" in flags and not b.live:
     print("     --locate-quote ignored: paper accounts have no locates")
@@ -90,13 +114,17 @@ elif inv > 0:
     why = f"TRADEABLE: {inv} located shares already on the account"
 elif not b.live:
     why = "NOT EASY TO BORROW on paper: paper can't locate, so the dashboard skips the short"
-elif cfg.locate_max_per_share <= 0:
-    why = ("NOT EASY TO BORROW: needs a locate and locates are off (TZ_LOCATE_MAX_PER_SHARE=0); "
+elif cfg.locate_max_pct <= 0:
+    why = ("NOT EASY TO BORROW: needs a locate and locates are off (TZ_LOCATE_MAX_PCT=0); "
            "the dashboard skips the short")
+elif offer is not None and not px:
+    why = (f"LOCATE AVAILABLE at ${offer:.4f}/share (${offer * 100:.2f} per 100), but no share "
+           f"price to judge it against; the bot would not buy it until the model has one")
 elif offer is not None:
-    why = (f"LOCATE AVAILABLE at ${offer:.4f}/share (${offer * 100:.2f} per 100): "
-           + ("within" if offer <= cfg.locate_max_per_share else "ABOVE")
-           + f" the cap TZ_LOCATE_MAX_PER_SHARE {cfg.locate_max_per_share:.4f}")
+    pct = offer / px * 100
+    why = (f"LOCATE AVAILABLE at ${offer:.4f}/share = {pct:.2f}% of the ${px:,.2f} share price "
+           f"(${offer * 100:.2f} per 100): " + ("within" if pct <= cfg.locate_max_pct else "ABOVE")
+           + f" the cap TZ_LOCATE_MAX_PCT {cfg.locate_max_pct:.2f}%")
 elif "--locate-quote" in flags:
     why = "NO BORROW NOW: TradeZero offered no shares to locate; try again later"
 else:

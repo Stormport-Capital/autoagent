@@ -132,7 +132,7 @@ Added with the TradeZero link (2026-11-09):
     30 s → inventory) and `test_tradezero.py` exercises it against an
     in-memory API. No live TradeZero account has been used yet. The first live
     locate purchase is a test of the documentation as much as of the code;
-    the caps (`TZ_LOCATE_MAX_PER_SHARE`, `TZ_LOCATE_MAX_USD_DAY`) bound what
+    the caps (`TZ_LOCATE_MAX_PCT`, `TZ_LOCATE_MAX_USD_DAY`) bound what
     it can cost.
 22. **TradeZero orders are market orders.** The API has no quotes, so the
     marketable-limit path of the IBKR link has nothing to price from except

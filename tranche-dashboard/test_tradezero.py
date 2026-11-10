@@ -219,7 +219,7 @@ class ConfigTests(unittest.TestCase):
     def test_defaults(self):
         c = tz_cfg()
         self.assertEqual((c.mode, c.book, c.books, c.max_shares, c.daily_loss_limit,
-                          c.max_order_usd, c.order_type, c.route, c.locate_max_per_share,
+                          c.max_order_usd, c.order_type, c.route, c.locate_max_pct,
                           c.locate_max_usd_day), ("paper", "5m", ("5m",), 1, 100.0, 1000.0,
                                                   "market", None, 0.0, 5.0))
 
@@ -236,6 +236,15 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(BrokerError):
             tz_cfg(TZ_MAX_SHARES="0")
         self.assertEqual(tz_cfg(TZ_ROUTE=" ARCA ").route, "ARCA")
+        self.assertEqual(tz_cfg(TZ_LOCATE_MAX_PCT="0.5").locate_max_pct, 0.5)
+        self.assertEqual((tz_cfg().shares, tz_cfg().max_shares), (None, 1))
+        c = tz_cfg(TZ_SHARES="100")
+        self.assertEqual((c.shares, c.max_shares), (100, 100))  # TZ_SHARES alone sets the cap too
+        self.assertEqual(tz_cfg(TZ_SHARES="100", TZ_MAX_SHARES="300").max_shares, 300)
+        with self.assertRaisesRegex(BrokerError, "above TZ_MAX_SHARES"):
+            tz_cfg(TZ_SHARES="100", TZ_MAX_SHARES="1")
+        with self.assertRaisesRegex(BrokerError, "replaced by TZ_LOCATE_MAX_PCT"):
+            tz_cfg(TZ_LOCATE_MAX_PER_SHARE="0.05")  # the old per-share cap: refuse, don't ignore
 
     def test_only_the_tradezero_host(self):
         import dataclasses
@@ -449,7 +458,13 @@ class BorrowTests(unittest.TestCase):
 
     def test_live_without_a_locate_budget_skips(self):
         b = mk(TZ_MODE="live", acct_type="Margin", etb={"HTB": False})
-        self.assertIn("TZ_LOCATE_MAX_PER_SHARE", b.short_check("HTB", 1))
+        self.assertIn("TZ_LOCATE_MAX_PCT", b.short_check("HTB", 1))
+        self.assertFalse(any("quote" in p for _m, p, _j in b.fake.calls))
+
+    def test_no_model_price_means_no_locate(self):
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="1", acct_type="Margin", etb={"HTB": False})
+        self.assertIn("no price for it yet", b.short_check("HTB", 1))
+        self.assertIn("no price for it yet", b.short_check("HTB", 1, ref_price=0))
         self.assertFalse(any("quote" in p for _m, p, _j in b.fake.calls))
 
     def test_existing_inventory_is_enough(self):
@@ -457,9 +472,9 @@ class BorrowTests(unittest.TestCase):
         self.assertIsNone(b.short_check("HTB", 1))
 
     def test_live_buys_a_locate_within_the_caps(self):
-        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PER_SHARE="0.02", acct_type="Margin",
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="0.5", acct_type="Margin",
                etb={"HTB": False}, locate_price=0.01, offer_after=2)
-        self.assertIsNone(b.short_check("HTB", 1))
+        self.assertIsNone(b.short_check("HTB", 1, ref_price=5.0))  # 0.2% of $5
         quote = [j for m, p, j in b.fake.calls if p == "/accounts/locates/quote"][0]
         self.assertEqual((quote["account"], quote["symbol"], quote["quantity"]), ("TZP1", "HTB", 100))
         accept = [j for m, p, j in b.fake.calls if p == "/accounts/locates/accept"][0]
@@ -467,38 +482,44 @@ class BorrowTests(unittest.TestCase):
         self.assertEqual(b.fake.inventory, {"HTB": 100})
         notes = b.drain_notes()
         self.assertEqual(len(notes), 1)
-        self.assertIn("bought a locate for 100 HTB at $0.0100/share ($1.00)", notes[0][1])
+        self.assertIn("bought a locate for 100 HTB at $0.0100/share (0.20% of the $5.00 price; "
+                      "$1.00)", notes[0][1])
         self.assertEqual(b.drain_notes(), [])
         self.assertEqual(b.locate_spend_today(), 1.0)
 
-    def test_locate_above_the_per_share_cap_is_not_bought(self):
-        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PER_SHARE="0.02", acct_type="Margin",
+    def test_locate_fee_cap_is_a_percent_of_the_share_price(self):
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="0.5", acct_type="Margin",
                etb={"HTB": False}, locate_price=0.05)
-        why = b.short_check("HTB", 1)
-        self.assertIn("$0.0500/share ($5.00 for 100), above TZ_LOCATE_MAX_PER_SHARE $0.0200", why)
+        why = b.short_check("HTB", 1, ref_price=5.0)  # 1% of a $5 stock: too dear
+        self.assertIn("$0.0500/share = 1.00% of the $5.00 share price, above TZ_LOCATE_MAX_PCT 0.50% "
+                      "($5.00 for 100)", why)
         self.assertFalse(any(p == "/accounts/locates/accept" for _m, p, _j in b.fake.calls))
         self.assertEqual(b.fake.inventory, {})
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="0.5", acct_type="Margin",
+               etb={"EXP": False}, locate_price=0.05)
+        self.assertIsNone(b.short_check("EXP", 1, ref_price=200.0))  # the same 5 cents on $200: 0.025%
+        self.assertEqual(b.fake.inventory, {"EXP": 100})
 
     def test_daily_locate_budget(self):
-        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PER_SHARE="0.05", TZ_LOCATE_MAX_USD_DAY="1.5",
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="1", TZ_LOCATE_MAX_USD_DAY="1.5",
                acct_type="Margin", etb={"HTB": False, "HTC": False}, locate_price=0.01)
-        self.assertIsNone(b.short_check("HTB", 1))  # $1.00
-        why = b.short_check("HTC", 1)                # another $1.00 would pass $1.50
+        self.assertIsNone(b.short_check("HTB", 1, ref_price=5.0))  # $1.00
+        why = b.short_check("HTC", 1, ref_price=5.0)                # another $1.00 would pass $1.50
         self.assertIn("TZ_LOCATE_MAX_USD_DAY", why)
         self.assertEqual(b.fake.inventory, {"HTB": 100})
 
     def test_no_shares_offered(self):
-        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PER_SHARE="0.05", acct_type="Margin",
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="1", acct_type="Margin",
                etb={"HTB": False}, no_inventory={"HTB"})
-        why = b.short_check("HTB", 1)
+        why = b.short_check("HTB", 1, ref_price=5.0)
         self.assertIn("offered no shares of HTB", why)
         self.assertIn("No shares available", why)
 
     def test_one_quote_per_symbol_per_30s(self):
-        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PER_SHARE="0.05", acct_type="Margin",
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="1", acct_type="Margin",
                etb={"HTB": False}, no_inventory={"HTB"})
-        b.short_check("HTB", 1)
-        self.assertIn("one per 30 s", b.short_check("HTB", 1))
+        b.short_check("HTB", 1, ref_price=5.0)
+        self.assertIn("one per 30 s", b.short_check("HTB", 1, ref_price=5.0))
         self.assertEqual(len([p for _m, p, _j in b.fake.calls if p.endswith("locates/quote")]), 1)
 
 
@@ -562,6 +583,39 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.b.fake.pos, {})
         self.assertEqual(posted(self.b.fake)[1]["openClose"], "Close")
 
+    def test_fixed_size_trades_the_locate_lot_whatever_the_model_holds(self):
+        """TZ_SHARES=100: the model short 37 or 150, TradeZero short exactly 100,
+        the locate is one 100-share lot, and the cover is the whole 100."""
+        sid = self.add_live("HTB", last_price=8.0)
+        self.short(sid, "HTB", qty=37)
+        live = self.link(TZ_SHARES="100", TZ_MAX_ORDER_USD="2500", TZ_LOCATE_MAX_PCT="1",
+                         TZ_MODE="live", acct_type="Margin", etb={"HTB": False}, locate_price=0.02)
+        self.assertEqual(live.desired(), {"HTB": -100})
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {"HTB": -100})
+        body = posted(self.b.fake)[0]
+        self.assertEqual((body["orderQuantity"], body["side"], body["openClose"]), (100, "Sell", "Open"))
+        quote = [j for m, p, j in self.b.fake.calls if p == "/accounts/locates/quote"][0]
+        self.assertEqual(quote["quantity"], 100)
+        self.assertEqual(live.status()["control"]["max_shares"], 100)
+        self.assertTrue(all(r["match"] for r in live.status()["reconciliation"]))
+        self.stores["5m"].x("UPDATE tranches SET qty=150")  # the model's size never matters
+        live.sync(self.NOW)
+        self.assertEqual(len(posted(self.b.fake)), 1)
+        self.close_all()
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {})
+        self.assertEqual((posted(self.b.fake)[1]["orderQuantity"], posted(self.b.fake)[1]["openClose"]),
+                         (100, "Close"))
+
+    def test_fixed_size_still_obeys_the_order_value_cap(self):
+        sid = self.add_live("BIG", last_price=40.0)  # 100 x $40 = $4,000 > $2,500
+        self.short(sid, "BIG")
+        live = self.link(TZ_SHARES="100", TZ_MAX_ORDER_USD="2500")
+        live.sync(self.NOW)
+        self.assertEqual(posted(self.b.fake), [])
+        self.assertIn("TZ_MAX_ORDER_USD", self.stores["live"].q("SELECT message FROM orders")[0]["message"])
+
     def test_an_entry_without_a_model_price_is_refused_and_logged_not_sent(self):
         sid = self.add_live("AAA", last_price=None)
         self.short(sid, "AAA")
@@ -588,13 +642,14 @@ class SyncTests(unittest.TestCase):
     def test_a_bought_locate_is_in_the_dashboard_log(self):
         sid = self.add_live("HTB")
         self.short(sid, "HTB")
-        live = self.link(TZ_MODE="live", TZ_LOCATE_MAX_PER_SHARE="0.05", acct_type="Margin",
+        live = self.link(TZ_MODE="live", TZ_LOCATE_MAX_PCT="0.5", acct_type="Margin",
                          etb={"HTB": False}, locate_price=0.01)
-        live.sync(self.NOW)
+        live.sync(self.NOW)  # the book's last price ($10) is the reference: 0.1%
         self.assertEqual(self.b.fake.pos, {"HTB": -1})
         self.assertEqual(posted(self.b.fake)[0]["route"], "SMART")
         msgs = [e["message"] for e in self.stores["live"].q("SELECT message FROM events WHERE kind='broker'")]
-        self.assertTrue(any("bought a locate for 100 HTB" in m for m in msgs), msgs)
+        self.assertTrue(any("bought a locate for 100 HTB at $0.0100/share (0.10% of the $10.00 price"
+                            in m for m in msgs), msgs)
         self.assertEqual(live.status()["venue"], "TradeZero LIVE")
 
     def test_a_tradezero_rejection_holds_back_new_shorts_for_the_day(self):
