@@ -482,7 +482,7 @@ function renderBroker(B, o) {
   let h = `<label class="switch"><input type="checkbox" id="${o.p}Toggle" ${on ? "checked" : ""}> Send ${o.shared ? "the Live symbols' trades" : "the model's trades"} to ${V}</label>
     <div class="hint">${esc(B.endpoint)}. ${o.shared ? `${esc((B.book_labels || [B.book_label]).join(", "))} book${(B.book_labels || []).length > 1 ? "s" : ""}: mark symbols with the <b>Live</b> button on that tab's watchlist, one book per symbol. 5/10 EMA short only, flat by 3:55 PM. Orders go out after each check of the symbol's book; stops are checked on every 5-minute close.` : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
   if (C.max_shares || C.daily_loss_limit)
-    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol (${o.shared ? "short only: the 5/10 short's direction, not its size" : "the model's direction, not its size"})` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
+    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol${o.shared ? " and book" : ""} (${o.shared ? "short only: the 5/10 short's direction, not its size; a symbol Live in two books may hold two" : "the model's direction, not its size"})` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
   if (a) h += `<div class="bk-kpis">
       <div><span>${o.shared ? "Net liquidation" : "Equity"}</span>${usd(a.equity)}</div><div><span>Today${C.daily_loss_limit ? ` (limit −${usd(C.daily_loss_limit)})` : ""}</span><b class="${cls(a.day_pl)}">${a.day_pl == null ? "—" : signed(a.day_pl)}</b></div>
       <div><span>Buying power</span>${a.buying_power == null ? "—" : usd(a.buying_power)}</div><div><span>Cash</span>${a.cash == null ? "—" : usd(a.cash)}</div></div>`;
@@ -777,7 +777,7 @@ setInterval(refresh, 5000);
 <dialog id="liveDlg">
   <form method="dialog">
     <h3 style="margin:0 0 6px"><span class="lvName">IBKR</span> live: <span id="liveSym"></span></h3>
-    <div class="hint" style="margin:0 0 8px"><span class="lvName">IBKR</span> follows this symbol's 5/10 EMA tranche, short only (a long signal means flat), <span id="liveCap"></span> share(s). <span id="liveEntry"></span> Exit: a 5-minute close above the stop (checked at every 5-minute close; market order), the up-cross, or the 3:55 PM close. One book per symbol. Turning Live on applies these rules to the model's 5/10 tranche for this symbol and makes the symbol flat by 3:55. VWAP-fail and 10/20 can't trade live.</div>
+    <div class="hint" style="margin:0 0 8px"><span class="lvName">IBKR</span> follows this symbol's 5/10 EMA tranche, short only (a long signal means flat), <span id="liveCap"></span> share(s). <span id="liveEntry"></span> Exit: a 5-minute close above the stop (checked at every 5-minute close; market order), the up-cross, or the 3:55 PM close. A symbol may be Live in several books: each book's trade is its own position and the account holds the sum. Turning Live on applies these rules to the model's 5/10 tranche for this symbol and makes the symbol flat by 3:55. VWAP-fail and 10/20 can't trade live.</div>
     <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross (short)</label>
     <div class="row" style="margin-top:12px"><button value="save" class="primary">Save</button> <button value="off">Live off</button> <button value="cancel">Cancel</button></div>
   </form>

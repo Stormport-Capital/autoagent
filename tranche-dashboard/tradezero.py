@@ -14,7 +14,9 @@ Safety, enforced here independently of BrokerSync:
     type. The first call of every request checks this; a mismatch sends
     nothing. The account must also be "Active".
   * No order may take a symbol's position beyond TZ_MAX_SHARES (default 1)
-    in either direction. Orders that only reduce a position are always allowed.
+    for each book it is Live in (BrokerSync passes the count; this adapter
+    never allows more than TZ_MAX_SHARES x the number of books in TZ_BOOKS).
+    Orders that only reduce a position are always allowed.
     TZ_SHARES=100 makes the position a fixed 100 shares whenever the model's
     tranche is short (and sets the cap to 100 unless TZ_MAX_SHARES says more):
     a locate covers 100 shares at minimum, so a 100-share short uses what the
@@ -403,11 +405,15 @@ class TradeZeroBroker:
         return self._route
 
     def submit(self, symbol: str, qty: int, side: str, client_order_id: str,
-               ref_price: float | None = None, order_type: str | None = None) -> dict:
+               ref_price: float | None = None, order_type: str | None = None,
+               cap: int | None = None) -> dict:
+        """`cap`: BrokerSync's share cap for this symbol (max_shares for each
+        book it is Live in); never above max_shares x the number of books."""
         cfg = self.cfg
         qty = int(qty)
         if qty < 1 or side not in ("buy", "sell"):
             raise BrokerError(f"TradeZero: bad order {side} {qty}")
+        limit = min(int(cap or cfg.max_shares), cfg.max_shares * max(1, len(cfg.books)))
         if not client_order_id or len(client_order_id) > 36:
             raise BrokerError("TradeZero: clientOrderId must be 1-36 characters")
         row = self._account_row()
@@ -418,9 +424,10 @@ class TradeZeroBroker:
         symbol = symbol.upper()
         cur = self._position(symbol)
         new = cur + (qty if side == "buy" else -qty)
-        if abs(new) > cfg.max_shares and abs(new) > abs(cur):
+        if abs(new) > limit and abs(new) > abs(cur):
             raise BrokerError(f"TradeZero: refused, {symbol} would go from {cur:+d} to {new:+d} "
-                              f"shares; the cap is {cfg.max_shares} (TZ_MAX_SHARES)")
+                              f"shares; the cap is {limit} ({cfg.max_shares} per book, "
+                              f"TZ_MAX_SHARES)")
         if new > 0:
             raise BrokerError(f"TradeZero: refused, a buy would take {symbol} from {cur:+d} to "
                               f"{new:+d}; this link is short only")

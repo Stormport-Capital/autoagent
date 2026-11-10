@@ -406,17 +406,22 @@ class IBKRBroker:
         return None
 
     def submit(self, symbol: str, qty: int, side: str, client_order_id: str,
-               ref_price: float | None = None, order_type: str | None = None) -> dict:
+               ref_price: float | None = None, order_type: str | None = None,
+               cap: int | None = None) -> dict:
+        """`cap`: BrokerSync's share cap for this symbol (max_shares for each
+        book it is Live in); never above max_shares x the number of books."""
         self._ensure()
         cfg = self.cfg
         qty = int(qty)
         if qty < 1 or side not in ("buy", "sell"):
             raise BrokerError(f"IBKR: bad order {side} {qty}")
+        limit = min(int(cap or cfg.max_shares), cfg.max_shares * max(1, len(cfg.books)))
         cur = self._position(symbol)
         new = cur + (qty if side == "buy" else -qty)
-        if abs(new) > cfg.max_shares and abs(new) > abs(cur):
+        if abs(new) > limit and abs(new) > abs(cur):
             raise BrokerError(f"IBKR: refused, {symbol} would go from {cur:+d} to {new:+d} "
-                              f"shares; the cap is {cfg.max_shares} (IBKR_MAX_SHARES)")
+                              f"shares; the cap is {limit} ({cfg.max_shares} per book, "
+                              f"IBKR_MAX_SHARES)")
         if new > 0:
             raise BrokerError(f"IBKR: refused, a buy would take {symbol} from {cur:+d} to "
                               f"{new:+d}; this link is short only")

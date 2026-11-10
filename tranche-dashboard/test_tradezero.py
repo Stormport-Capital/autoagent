@@ -346,6 +346,16 @@ class OrderTests(unittest.TestCase):
         b.submit("LNG", 1, "sell", "c4")  # closing the long is allowed, with no price
         self.assertEqual(posted(b.fake)[0]["openClose"], "Close")
 
+    def test_cap_per_book_from_brokersync_bounded_by_the_listed_books(self):
+        b = mk(TZ_BOOKS="5m,15m", pos={"AAA": -1})
+        b.submit("AAA", 1, "sell", "c1", ref_price=5.0, cap=2)  # two books: -2 is allowed
+        self.assertEqual(b.fake.pos, {"AAA": -2})
+        with self.assertRaisesRegex(BrokerError, "cap is 2 \\(1 per book"):
+            b.submit("AAA", 1, "sell", "c2", ref_price=5.0, cap=9)  # never above cap x books
+        b = mk(pos={"AAA": -1})
+        with self.assertRaisesRegex(BrokerError, "cap is 1"):
+            b.submit("AAA", 1, "sell", "c3", ref_price=5.0, cap=3)  # one listed book
+
     def test_order_value_cap_uses_the_reference_price(self):
         b = mk()
         with self.assertRaisesRegex(BrokerError, "TZ_MAX_ORDER_USD"):

@@ -819,19 +819,11 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                     if live is None:
                         raise ValidationError(f"no live broker is linked: {LIVE_NOTE}")
                     sleeves = body.get("sleeves") or []
-                    bname = getattr(live.broker, "name", "IBKR")
                     if sleeves and book.key not in live.live_books:
                         raise ValidationError(
                             f"Live trading is only in the {', '.join(live.book_labels)} "
                             f"book{'s' if len(live.book_labels) > 1 else ''} "
                             f"({getattr(live.broker, 'books_var', 'IBKR_BOOKS')} in .env)")
-                    if sleeves:
-                        ticker = engine._symbol(int(m.group(1)))["symbol"]
-                        other = live.conflict(ticker, book.key)
-                        if other:
-                            raise ValidationError(
-                                f"{ticker} is already Live in the {other} book. One {bname} "
-                                f"account holds one position per symbol: turn it off there first")
                     engine.set_live(int(m.group(1)), sleeves, now)
                     # forced end-of-day close and the live stop take effect at the next check
                     threading.Thread(target=sched.run_tick, daemon=True).start()
