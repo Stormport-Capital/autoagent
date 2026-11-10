@@ -556,8 +556,10 @@ def live_check(live: "LiveSync | None", note: str | None) -> str:
     b = live.broker
     try:
         a = b.account()
+        size = (f"{b.fixed_shares} shares per symbol (fixed)" if getattr(b, "fixed_shares", None)
+                else f"cap {b.max_shares} share(s) per symbol")
         return (f"{b.venue}: OK - {a['account_id']} net liquidation ${float(a['equity']):,.2f}; "
-                f"cap {b.max_shares} share(s) per symbol, daily loss limit "
+                f"{size}, daily loss limit "
                 f"${b.daily_loss_limit:,.0f}; {', '.join(live.book_labels)} "
                 f"book{'s' if len(live.book_labels) > 1 else ''}, 5/10 EMA short only, "
                 f"flat by 15:55; {len(live.selections())} live symbol(s)")

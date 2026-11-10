@@ -214,6 +214,9 @@ class BrokerSync:
 
     def desired(self) -> dict[str, int]:
         want = self._net()
+        fixed = getattr(self.broker, "fixed_shares", None)
+        if fixed:  # the model's direction, always exactly `fixed` shares (TradeZero TZ_SHARES)
+            want = {s: (fixed if q > 0 else -fixed if q < 0 else 0) for s, q in want.items()}
         if self.max_shares:  # same direction as the model, at most max_shares
             want = {s: max(-self.max_shares, min(self.max_shares, q)) for s, q in want.items()}
         return want
@@ -310,7 +313,10 @@ class BrokerSync:
         check = getattr(self.broker, "short_check", None)
         if check is None:
             return None
-        why = check(sym, qty)
+        kw = {}
+        if getattr(self.broker, "uses_ref_price", False):  # TradeZero: the locate fee cap is a % of price
+            kw["ref_price"] = self._ref_price(sym)
+        why = check(sym, qty, **kw)
         notes = getattr(self.broker, "drain_notes", None)
         if notes is not None:  # TradeZero: a locate bought, for the log
             for note_sym, msg in notes():

@@ -15,6 +15,11 @@ Safety, enforced here independently of BrokerSync:
     nothing. The account must also be "Active".
   * No order may take a symbol's position beyond TZ_MAX_SHARES (default 1)
     in either direction. Orders that only reduce a position are always allowed.
+    TZ_SHARES=100 makes the position a fixed 100 shares whenever the model's
+    tranche is short (and sets the cap to 100 unless TZ_MAX_SHARES says more):
+    a locate covers 100 shares at minimum, so a 100-share short uses what the
+    locate fee bought. The order-value cap (TZ_MAX_ORDER_USD) still applies to
+    the whole order.
   * Short only: a buy that would leave any position above zero is refused.
   * No order worth more than TZ_MAX_ORDER_USD (default 1,000). TradeZero's
     API has no quotes, so the model's last price is the reference (passed in
@@ -29,10 +34,11 @@ Safety, enforced here independently of BrokerSync:
     TZ_REPRICE_S seconds.
   * Borrow: GET is-easy-to-borrow before every opening short. Not easy to
     borrow on paper = skipped (paper has no locates). On live, a locate is
-    bought only when TZ_LOCATE_MAX_PER_SHARE is above 0 and the offered price
-    is at or below it, and today's locate spend (from TradeZero's own locate
-    history) stays within TZ_LOCATE_MAX_USD_DAY. Lots of 100 shares, the
-    API's minimum.
+    bought only when TZ_LOCATE_MAX_PCT is above 0 and the offered fee per
+    share is at or below that percent of the share price (the model's last
+    price; no price = no locate), and today's locate spend (from TradeZero's
+    own locate history) stays within TZ_LOCATE_MAX_USD_DAY. Lots of 100
+    shares, the API's minimum.
   * Live orders need a route. TZ_ROUTE, or SMART when the account offers it,
     or the only route offered; anything else refuses. Paper routes itself.
   * One HTTP call at a time, spaced per TradeZero's published per-endpoint
@@ -88,13 +94,14 @@ class TZConfig:
     book: str = "5m"
     books: tuple = ("5m",)
     max_shares: int = 1
+    shares: int | None = None  # TZ_SHARES: a fixed position size; None = the model's size, capped
     daily_loss_limit: float = 100.0
     max_order_usd: float = 1000.0
     order_type: str = "market"  # market | limit
     collar_pct: float = 3.0
     reprice_s: int = 45
     route: str | None = None    # live only: a route name from GET /routes
-    locate_max_per_share: float = 0.0  # 0 = never buy a locate
+    locate_max_pct: float = 0.0  # locate fee cap, % of the share price; 0 = never buy one
     locate_max_usd_day: float = 5.0
     base_url: str = BASE_URL
 
@@ -127,16 +134,25 @@ def config_from_env(env=None) -> TZConfig | None:
     if mode == "live" and loss <= 0:
         raise BrokerError("TZ_DAILY_LOSS_LIMIT must be above 0 for a live account")
     route = (env.get("TZ_ROUTE") or "").strip() or None
+    shares = _num(env, "TZ_SHARES", 0, int, 0) or None
+    max_shares = _num(env, "TZ_MAX_SHARES", shares or 1, int, 1)
+    if shares and shares > max_shares:
+        raise BrokerError(f"TZ_SHARES={shares} is above TZ_MAX_SHARES={max_shares}; raise the cap "
+                          f"or drop it (TZ_SHARES alone sets both)")
+    if (env.get("TZ_LOCATE_MAX_PER_SHARE") or "").strip():
+        raise BrokerError("TZ_LOCATE_MAX_PER_SHARE was replaced by TZ_LOCATE_MAX_PCT, the locate "
+                          "fee as a percent of the share price (0.5 = half a percent); "
+                          "replace the line in .env")
     return TZConfig(
         account=account, mode=mode, key_id=key_id, secret=secret, book=books[0], books=books,
-        max_shares=_num(env, "TZ_MAX_SHARES", 1, int, 1),
+        max_shares=max_shares, shares=shares,
         daily_loss_limit=loss,
         max_order_usd=_num(env, "TZ_MAX_ORDER_USD", 1000.0, float, 1),
         order_type=order_type,
         collar_pct=_num(env, "TZ_LIMIT_COLLAR_PCT", 3.0, float, 0),
         reprice_s=_num(env, "TZ_REPRICE_S", 45, int, 0),
         route=route,
-        locate_max_per_share=_num(env, "TZ_LOCATE_MAX_PER_SHARE", 0.0, float, 0),
+        locate_max_pct=_num(env, "TZ_LOCATE_MAX_PCT", 0.0, float, 0),
         locate_max_usd_day=_num(env, "TZ_LOCATE_MAX_USD_DAY", 5.0, float, 0),
     )
 
@@ -171,6 +187,7 @@ class TradeZeroBroker:
         self.venue = "TradeZero LIVE" if self.live else "TradeZero paper"
         self.endpoint = f"TradeZero API ({HOST}), account {cfg.account} ({cfg.mode})"
         self.max_shares, self.daily_loss_limit = cfg.max_shares, cfg.daily_loss_limit
+        self.fixed_shares = cfg.shares  # BrokerSync.desired: exactly this many, or none
         self.reprice_s = cfg.reprice_s if cfg.order_type == "limit" else 0
         self.http = session or requests.Session()
         self.http.headers.update({"TZ-API-KEY-ID": cfg.key_id, "TZ-API-SECRET-KEY": cfg.secret,
@@ -499,10 +516,11 @@ class TradeZeroBroker:
                    for r in rows if r.get("locateStatus") == LOC_FILLED
                    and (_f(r.get("locateShares")) or 0) > 0)
 
-    def short_check(self, symbol: str, qty: int) -> str | None:
+    def short_check(self, symbol: str, qty: int, ref_price: float | None = None) -> str | None:
         """Why a new short of `qty` can't be opened (None = go ahead). Easy to
         borrow: go. Otherwise paper skips (it has no locates) and live buys a
-        locate within the caps, or says why not."""
+        locate within the caps, or says why not. `ref_price` is the model's
+        last price, which the fee cap is a percent of."""
         symbol = symbol.upper()
         self._account_row()
         etb = self.easy_to_borrow(symbol)
@@ -512,13 +530,17 @@ class TradeZeroBroker:
             return "TradeZero lists it as not easy to borrow (paper accounts can't locate)"
         if self.inventory(symbol) >= qty:
             return None
-        if self.cfg.locate_max_per_share <= 0:
+        if self.cfg.locate_max_pct <= 0:
             return ("TradeZero lists it as not easy to borrow and locates are off "
-                    "(TZ_LOCATE_MAX_PER_SHARE)")
-        return self._locate(symbol, qty)
+                    "(TZ_LOCATE_MAX_PCT)")
+        return self._locate(symbol, qty, ref_price)
 
-    def _locate(self, symbol: str, qty: int) -> str | None:
+    def _locate(self, symbol: str, qty: int, ref_price: float | None) -> str | None:
         cfg = self.cfg
+        px = _f(ref_price)
+        if px is None or px <= 0:
+            return (f"a locate for {symbol} would be needed, but the model has no price for it "
+                    f"yet to judge the fee against; not bought")
         last = self._quoted.get(symbol)
         if last is not None and _time.monotonic() - last < LOCATE_COOLDOWN_S:
             return (f"a locate quote for {symbol} went out {_time.monotonic() - last:.0f}s ago; "
@@ -548,9 +570,11 @@ class TradeZeroBroker:
         best = min(offered, key=lambda r: _f(r.get("locatePrice")) or 0)
         price = _f(best.get("locatePrice")) or 0.0
         cost = price * lot
-        if price > cfg.locate_max_per_share:
-            return (f"a locate for {symbol} costs ${price:.4f}/share (${cost:.2f} for {lot}), "
-                    f"above TZ_LOCATE_MAX_PER_SHARE ${cfg.locate_max_per_share:.4f}; not bought")
+        pct = price / px * 100
+        if pct > cfg.locate_max_pct:
+            return (f"a locate for {symbol} costs ${price:.4f}/share = {pct:.2f}% of the "
+                    f"${px:.2f} share price, above TZ_LOCATE_MAX_PCT {cfg.locate_max_pct:.2f}% "
+                    f"(${cost:.2f} for {lot}); not bought")
         if spent + cost > cfg.locate_max_usd_day:
             return (f"a locate for {symbol} (${cost:.2f}) would take today's locate spend from "
                     f"${spent:.2f} past TZ_LOCATE_MAX_USD_DAY ${cfg.locate_max_usd_day:.2f}; "
@@ -559,7 +583,8 @@ class TradeZeroBroker:
                   json={"accountId": cfg.account, "quoteReqID": best.get("quoteReqID")})
         kind = {3: "pre-borrow", 4: "single-use"}.get(best.get("locateType"), "locate")
         self._notes.append((symbol, f"bought a {kind} for {lot} {symbol} at ${price:.4f}/share "
-                                    f"(${cost:.2f}); today's locate spend ${spent + cost:.2f}"))
+                                    f"({pct:.2f}% of the ${px:.2f} price; ${cost:.2f}); today's "
+                                    f"locate spend ${spent + cost:.2f}"))
         for _ in range(6):
             self._sleep(1.0)
             if self.inventory(symbol) >= qty:
