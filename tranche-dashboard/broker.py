@@ -372,13 +372,31 @@ class BrokerSync:
             "flatten": f"kill switch: FLATTEN, closing managed {self.venue} positions; "
                        "nothing else is sent"}[mode])
 
+    def _tag(self) -> str:
+        """Names the account this link drives. The live store is shared when the
+        venue is switched (IBKR -> TradeZero), so a day start or a halt latched
+        for another account must not carry over: on 2026-11-10 TradeZero's
+        $2,500 was compared with IBKR's $4,971 start and halted for the day."""
+        return str(getattr(self.broker, "endpoint", None) or self.venue)
+
     def day_start(self, now: datetime) -> float | None:
         r = self._ctl("day_start")
         if r:
-            day, eq = r.split("|")
-            if day == now.astimezone(ET).date().isoformat():
-                return float(eq)
+            parts = r.split("|", 2)  # day|equity|account; an untagged (older) row is stale
+            if parts[0] == now.astimezone(ET).date().isoformat() and len(parts) == 3 \
+                    and parts[2] == self._tag():
+                return float(parts[1])
         return None
+
+    def _halt_today(self, now: datetime) -> str | None:
+        """Why this link is halted for today, or None. day|account|why; an
+        untagged (older) day|why row still counts: a halt errs on staying halted."""
+        parts = (self._ctl("halt") or "").split("|", 2)
+        if parts[0] != now.astimezone(ET).date().isoformat():
+            return None
+        if len(parts) == 3:
+            return parts[2] if parts[1] == self._tag() else None
+        return parts[1] if len(parts) == 2 else None
 
     def _check_loss(self, now: datetime, equity: float) -> bool:
         """Latch the day's start equity; halt for the day at the loss limit.
@@ -386,9 +404,9 @@ class BrokerSync:
         day = now.astimezone(ET).date().isoformat()
         start = self.day_start(now)
         if start is None:
-            self._set_ctl("day_start", f"{day}|{equity}")
+            self._set_ctl("day_start", f"{day}|{equity}|{self._tag()}")
             start = equity
-        if not self.daily_loss_limit or (self._ctl("halt") or "").startswith(day + "|"):
+        if not self.daily_loss_limit or self._halt_today(now):
             return False
         pl = equity - start
         own = getattr(self.broker, "day_pnl", None)
@@ -400,7 +418,7 @@ class BrokerSync:
             return False
         why = (f"daily loss limit hit: {self.venue} day P&L {pl:+,.2f} vs "
                f"-{self.daily_loss_limit:,.0f}")
-        self._set_ctl("halt", f"{day}|{why}")
+        self._set_ctl("halt", f"{day}|{self._tag()}|{why}")
         self.store.log(now, "broker-halt", why + "; closing managed positions, no more orders "
                        "today (the model keeps trading)")
         return True
@@ -409,10 +427,9 @@ class BrokerSync:
         kill = self._ctl("kill")
         if kill:
             return kill, f"kill switch is on ({kill}); Resume on the dashboard to send orders"
-        halt = self._ctl("halt") or ""
-        day = now.astimezone(ET).date().isoformat()
-        if halt.startswith(day + "|"):
-            return "flatten", halt.split("|", 1)[1] + "; orders resume tomorrow"
+        halt = self._halt_today(now)
+        if halt:
+            return "flatten", halt + "; orders resume tomorrow"
         return None
 
     def watch(self, now: datetime) -> None:
