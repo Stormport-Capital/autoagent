@@ -33,8 +33,12 @@ jobs:
 
       - name: Compile
         working-directory: tranche-dashboard
-        run: python -m py_compile app.py backup.py broker.py engine.py indicators.py data.py store.py test_tranche.py
+        run: python -m py_compile app.py backup.py broker.py engine.py indicators.py data.py store.py ibkr.py tradezero.py tz_check.py test_tranche.py test_tradezero.py
 
       - name: Run tests
         working-directory: tranche-dashboard
         run: python test_tranche.py
+
+      - name: Run TradeZero link tests
+        working-directory: tranche-dashboard
+        run: python test_tradezero.py

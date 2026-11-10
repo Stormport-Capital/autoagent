@@ -35,6 +35,13 @@ VWAP-fail and 10/20 can't trade live. Guards for real money:
 A live account ID and `IBKR_MODE=live` must agree. Setup and details:
 [IBKR.md](IBKR.md).
 
+**TradeZero (paper or LIVE), same scope:** set `TZ_ACCOUNT` and the TradeZero
+API key pair instead, and the same Live selections trade at TradeZero over its
+REST API: market orders in regular hours, an easy-to-borrow check before every
+short and, on live, locates bought within a per-share and per-day cap. One
+live venue at a time (`LIVE_BROKER` when both are configured). Setup and
+differences: [TRADEZERO.md](TRADEZERO.md).
+
 **How to use the dashboard:** click **Guide** in the dashboard header
 (`static/guide.html`): every button, the daily routine, and how-tos.
 
@@ -53,6 +60,7 @@ python app.py --provider yahoo  # no key: prices from Yahoo
 python app.py --provider alpaca # Alpaca market data: set APCA_API_KEY_ID / APCA_API_SECRET_KEY
 python app.py --demo            # synthetic prices on a fast simulated clock (no network)
 python test_tranche.py          # offline test suite
+python test_tradezero.py        # offline tests for the TradeZero link
 ```
 
 Keep it running during market hours. After a restart it catches up on any hourly
@@ -213,12 +221,14 @@ closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&
 - `ibkr.py` — Interactive Brokers client (ib_async via IB Gateway), paper or live;
   its orders, log, kill switch and loss latch are kept in `tranche_live.db`
 - `deploy/ib-gateway/compose.yml` — IB Gateway + IBC in Docker for the server
+- `tradezero.py` — TradeZero client (REST API), paper or live, same interface as
+  `ibkr.py`; `tz_check.py` — read-only account / borrow check for one symbol
 - `store.py` — SQLite state (`tranche.db`), including settings defaults
 - `app.py` — web server and the hourly scheduler
 - `static/index.html` — the dashboard page
 - `review.py`, `static/review.html` — the Trade Review page (stats, calendar, journal)
 - `static/guide.html` — the in-app Guide
-- `test_tranche.py` — offline tests
+- `test_tranche.py` — offline tests; `test_tradezero.py` — the TradeZero link's
 
 Locally the server binds to `127.0.0.1`. Set `TRANCHE_PASSWORD` in `.env` to
 require a password (HTTP Basic auth, any user name). The cloud setup does this

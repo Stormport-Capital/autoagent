@@ -21,8 +21,9 @@ paper account's position in each watched symbol to the model's NET quantity
     session; a trading halt pauses it for 10 minutes. Covers and long exits are
     never held back by a short refusal. Each skip is logged once per day.
 
-The same BrokerSync drives the IBKR link (ibkr.py), with three extra guards
-that are on whenever max_shares / daily_loss_limit are given:
+The same BrokerSync drives the IBKR link (ibkr.py) and the TradeZero link
+(tradezero.py), with three extra guards that are on whenever max_shares /
+daily_loss_limit are given:
   * Share cap: the account mirrors the SIGN of the model's net position, capped
     at max_shares per symbol (1 = one-share tests).
   * Daily loss limit: the first equity reading of each ET day is the day's
@@ -84,9 +85,9 @@ def seconds_after(start, end) -> float | None:
     return round((b - a).total_seconds(), 1)
 
 
-def _msg(e: Exception) -> str:
+def _msg(e: Exception, venue: str = "Alpaca paper") -> str:
     if isinstance(e, requests.RequestException):
-        return f"can't reach Alpaca paper ({type(e).__name__}); will retry on the next check"
+        return f"can't reach {venue} ({type(e).__name__}); will retry on the next check"
     return redact(e)
 
 
@@ -239,7 +240,7 @@ class BrokerSync:
                              (now.isoformat(), float(acct["equity"])))
                 self.last_error = None
             except (BrokerError, requests.RequestException) as e:
-                self.last_error = _msg(e)
+                self.last_error = _msg(e, self.venue)
                 self.store.log(now, "broker-error", self.last_error[:300])
             self.last_sync = now
             self._bar_end = None
@@ -310,6 +311,10 @@ class BrokerSync:
         if check is None:
             return None
         why = check(sym, qty)
+        notes = getattr(self.broker, "drain_notes", None)
+        if notes is not None:  # TradeZero: a locate bought, for the log
+            for note_sym, msg in notes():
+                self.store.log(now, "broker", msg, note_sym)
         if why:
             self.short_notes[sym] = (now.astimezone(ET).date(), why)
         else:
@@ -468,6 +473,12 @@ class BrokerSync:
                 out[sym] = why
         return out
 
+    def _ref_price(self, sym: str) -> float | None:
+        """The model's last price for `sym` (None if it has none yet)."""
+        r = self.store.q("SELECT last_price FROM symbols WHERE symbol=? AND last_price IS NOT "
+                         "NULL ORDER BY id DESC LIMIT 1", (sym,))
+        return float(r[0]["last_price"]) if r else None
+
     def _submit(self, now: datetime, sym: str, delta: int, reason: str,
                 order_type: str | None = None) -> dict | None:
         side = "buy" if delta > 0 else "sell"
@@ -478,11 +489,12 @@ class BrokerSync:
             (now.isoformat(), sym, side, abs(delta), reason, cid, self._book_for(sym),
              self._bar_end))
         kw = {"order_type": order_type} if order_type else {}
-        if hasattr(self.broker, "quote"):  # IBKR: the model's last price as a fallback reference
-            r = self.store.q("SELECT last_price FROM symbols WHERE symbol=? AND last_price IS NOT "
-                             "NULL ORDER BY id DESC LIMIT 1", (sym,))
-            if r:
-                kw["ref_price"] = r[0]["last_price"]
+        if hasattr(self.broker, "quote") or getattr(self.broker, "uses_ref_price", False):
+            # IBKR: the model's last price as a fallback reference; TradeZero (no quotes
+            # in its API): the reference for the order-value cap and any limit price
+            px = self._ref_price(sym)
+            if px is not None:
+                kw["ref_price"] = px
         sent = _wall()
         try:
             o = self.broker.submit(sym, abs(delta), side, cid, **kw)
@@ -535,7 +547,7 @@ class BrokerSync:
                 self.snapshot = {"account": acct, "positions": pos, "error": None}
                 self._seen_positions({s: int(float(p["qty"])) for s, p in pos.items()})
             except (BrokerError, requests.RequestException) as e:
-                self.snapshot = {"account": None, "positions": {}, "error": _msg(e)}
+                self.snapshot = {"account": None, "positions": {}, "error": _msg(e, self.venue)}
             self.snapshot_at = _time.monotonic()
         want = self.desired()
         pos = self.snapshot["positions"]
@@ -703,6 +715,18 @@ class LiveSync(BrokerSync):
     def _book_for(self, sym: str) -> str | None:
         sel = self.selections().get(sym)
         return sel["book"] if sel else None  # None: a symbol no longer Live, being closed
+
+    def _ref_price(self, sym: str) -> float | None:
+        """The model's last price from the book where `sym` is Live (the live
+        store has no symbols); for a symbol being closed, any book that has it."""
+        sel = self.selections().get(sym)
+        stores = [sel["store"]] if sel else [st for _k, _l, st in self._stores()]
+        for st in stores:
+            r = st.q("SELECT last_price FROM symbols WHERE symbol=? AND last_price IS NOT NULL "
+                     "AND status != 'removed' ORDER BY id DESC LIMIT 1", (sym,))
+            if r:
+                return float(r[0]["last_price"])
+        return None
 
     def _order_type(self, sym: str, target: int, cur: int) -> str | None:
         """Market for the cover of a short the model just stopped out: its most
