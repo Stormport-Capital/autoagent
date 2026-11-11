@@ -58,7 +58,7 @@ import threading
 import time as _time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -85,6 +85,9 @@ RECENT_S = 30.0               # a 404 within this long of a submit is "not regis
 LOCATE_LOT = 100
 LOC_OFFERED, LOC_FILLED, LOC_PENDING, LOC_REJECTED, LOC_EXPIRED = 65, 50, 54, 56, 67
 LOCATE_COOLDOWN_S = 30.0      # TradeZero: one quote per symbol per 30 s
+LOCATE_RETRY_S = 240.0        # after a refused locate, no new quote for this long (one per bar check,
+                              # not per 5-second retry pass; locate prices do move: STAK 6.75c -> 3.75c)
+LONG_ONLY = re.compile(r"R158|only eligible for long", re.I)  # TradeZero allows no short in it today
 
 
 @dataclass
@@ -201,6 +204,7 @@ class TradeZeroBroker:
         self._sent: dict[str, float] = {}      # clientOrderId -> monotonic time it was sent
         self._pnl: tuple[float, dict] | None = None
         self._quoted: dict[str, float] = {}    # symbol -> monotonic time of the last locate quote
+        self._locate_hold: dict[str, tuple] = {}  # symbol -> (until: monotonic or ET day, why)
         self._notes: list[tuple[str, str]] = []  # (symbol, message) for the dashboard log
 
     # ------------------------------------------------------------ plumbing
@@ -230,7 +234,7 @@ class TradeZeroBroker:
         if r.status_code == 404 and ok404:
             return None
         if r.status_code >= 400:
-            raise BrokerError(f"TradeZero {r.status_code}: {self._error_text(r)}")
+            raise BrokerError(f"TradeZero {r.status_code} on {method} {path}: {self._error_text(r)}")
         ctype = (r.headers.get("Content-Type") or "").lower()
         if not r.content:
             return None
@@ -252,9 +256,8 @@ class TradeZeroBroker:
             msg = (r.text or "").strip()
         msg = msg[:300]
         if r.status_code in (401, 404) and (not msg or msg.lower() in ("not found", "unauthorized")):
-            msg = (f"{msg or 'refused'} - TradeZero answers like this when the API keys are "
-                   f"wrong or the account isn't theirs; check TZ_API_KEY_ID, TZ_API_SECRET_KEY "
-                   f"and TZ_ACCOUNT in .env")
+            msg = (f"{msg or 'refused'} - a one-off is TradeZero's side (seen at the open); if it "
+                   f"persists, check TZ_API_KEY_ID, TZ_API_SECRET_KEY and TZ_ACCOUNT in .env")
         return msg
 
     def drain_notes(self) -> list[tuple[str, str]]:
@@ -333,10 +336,14 @@ class TradeZeroBroker:
                   for r in _rows(pnl, "pnl") if r.get("positionId") is not None}
         out: dict[str, dict] = {}
         for p in lots:
-            shares = int(round(_f(p.get("shares")) or 0))
+            raw = _f(p.get("shares")) or 0.0
+            shares = int(round(abs(raw)))
             if not shares:
                 continue
-            q = -shares if str(p.get("side") or "").lower() == "short" else shares
+            # side is the direction; shares "may come back as a signed number" (TradeZero docs).
+            # On 2026-11-11 a 1-share STAK short read as +1 and the position guard froze it.
+            short = "short" in str(p.get("side") or "").lower() or raw < 0
+            q = -shares if short else shares
             sym = str(p["symbol"]).upper()
             cur = out.setdefault(sym, {"qty": 0, "cost": 0.0, "shares": 0, "unreal": 0.0})
             cur["qty"] += q
@@ -540,7 +547,39 @@ class TradeZeroBroker:
         if self.cfg.locate_max_pct <= 0:
             return ("TradeZero lists it as not easy to borrow and locates are off "
                     "(TZ_LOCATE_MAX_PCT)")
+        held = self._locate_held(symbol)
+        if held:
+            return held
         return self._locate(symbol, qty, ref_price)
+
+    def _locate_held(self, symbol: str) -> str | None:
+        """Why no new locate quote goes out for `symbol` right now: a refusal
+        earlier today for R158 (long only) holds for the day, any other
+        refusal for LOCATE_RETRY_S. None once that has passed."""
+        h = self._locate_hold.get(symbol)
+        if not h:
+            return None
+        until, why = h
+        if isinstance(until, str):
+            if until == datetime.now(ET).date().isoformat():
+                return why
+        elif _time.monotonic() < until:
+            return why
+        self._locate_hold.pop(symbol, None)
+        return None
+
+    def _refuse(self, symbol: str, why: str, text: str = "") -> str:
+        """Record a refused locate so the next checks don't re-quote at once;
+        stable wording, so the dashboard logs it once."""
+        if LONG_ONLY.search(text) or LONG_ONLY.search(why):
+            why = (f"TradeZero allows no short position in {symbol} today "
+                   f"(R158: only eligible for long positions)")
+            self._locate_hold[symbol] = (datetime.now(ET).date().isoformat(), why)
+        else:
+            nxt = datetime.now(ET) + timedelta(seconds=LOCATE_RETRY_S)
+            why = f"{why}; next locate quote after {nxt:%H:%M}"
+            self._locate_hold[symbol] = (_time.monotonic() + LOCATE_RETRY_S, why)
+        return why
 
     def _locate(self, symbol: str, qty: int, ref_price: float | None) -> str | None:
         cfg = self.cfg
@@ -550,8 +589,8 @@ class TradeZeroBroker:
                     f"yet to judge the fee against; not bought")
         last = self._quoted.get(symbol)
         if last is not None and _time.monotonic() - last < LOCATE_COOLDOWN_S:
-            return (f"a locate quote for {symbol} went out {_time.monotonic() - last:.0f}s ago; "
-                    f"TradeZero allows one per 30 s - next check")
+            return (f"a locate quote for {symbol} is still pending at TradeZero (one per 30 s); "
+                    f"next check")
         lot = max(LOCATE_LOT, -(-qty // LOCATE_LOT) * LOCATE_LOT)
         spent = self.locate_spend_today()
         qid = f"td-{symbol}-{uuid.uuid4().hex[:10]}"
@@ -572,20 +611,21 @@ class TradeZeroBroker:
             if mine and all(r.get("locateStatus") in (LOC_REJECTED, LOC_EXPIRED) for r in mine):
                 break
         if not offered:
-            why = next((str(r.get("text")) for r in mine if r.get("text")), "")
-            return f"TradeZero offered no shares of {symbol} to borrow" + (f" ({why[:80]})" if why else "")
+            text = next((str(r.get("text")) for r in mine if r.get("text")), "")
+            return self._refuse(symbol, f"TradeZero offered no shares of {symbol} to borrow"
+                                + (f" ({text[:80]})" if text else ""), text)
         best = min(offered, key=lambda r: _f(r.get("locatePrice")) or 0)
         price = _f(best.get("locatePrice")) or 0.0
         cost = price * lot
         pct = price / px * 100
         if pct > cfg.locate_max_pct:
-            return (f"a locate for {symbol} costs ${price:.4f}/share = {pct:.2f}% of the "
-                    f"${px:.2f} share price, above TZ_LOCATE_MAX_PCT {cfg.locate_max_pct:.2f}% "
-                    f"(${cost:.2f} for {lot}); not bought")
+            return self._refuse(symbol, f"a locate for {symbol} costs ${price:.4f}/share = {pct:.2f}% "
+                                f"of the ${px:.2f} share price, above TZ_LOCATE_MAX_PCT "
+                                f"{cfg.locate_max_pct:.2f}% (${cost:.2f} for {lot}); not bought")
         if spent + cost > cfg.locate_max_usd_day:
-            return (f"a locate for {symbol} (${cost:.2f}) would take today's locate spend from "
-                    f"${spent:.2f} past TZ_LOCATE_MAX_USD_DAY ${cfg.locate_max_usd_day:.2f}; "
-                    f"not bought")
+            return self._refuse(symbol, f"a locate for {symbol} (${cost:.2f}) would take today's "
+                                f"locate spend from ${spent:.2f} past TZ_LOCATE_MAX_USD_DAY "
+                                f"${cfg.locate_max_usd_day:.2f}; not bought")
         self._req("loc_accept", "POST", "/accounts/locates/accept",
                   json={"accountId": cfg.account, "quoteReqID": best.get("quoteReqID")})
         kind = {3: "pre-borrow", 4: "single-use"}.get(best.get("locateType"), "locate")

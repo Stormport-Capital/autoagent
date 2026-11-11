@@ -58,6 +58,10 @@ print(f"     equity {usd(a['equity'])}, cash {usd(a['cash'])}, buying power {usd
 print(f"{mark(a['equity'] >= 2000)} equity {usd(a['equity'])} (shorting at a US broker needs $2,000 or more)")
 pos = b.positions()
 print("     positions: " + (", ".join(f"{s} {p['qty']}" for s, p in pos.items()) or "none"))
+raw = tradezero._rows(b._req("positions", "GET", f"/accounts/{cfg.account}/positions"), "positions")
+for p in raw:
+    print(f"     raw row: {p.get('symbol')} side={p.get('side')!r} shares={p.get('shares')!r} "
+          f"priceAvg={p.get('priceAvg')!r} type={p.get('securityType')!r}")
 print(f"     size: " + (f"{cfg.shares} shares per symbol, fixed (TZ_SHARES)" if cfg.shares else
                         f"the model's size, at most {cfg.max_shares} share(s) (TZ_MAX_SHARES)")
       + f"; order value cap {usd(cfg.max_order_usd)}; daily loss limit {usd(cfg.daily_loss_limit)}")
