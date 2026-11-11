@@ -831,11 +831,12 @@ class LiveSync(BrokerSync):
         off = self._ctl(f"offset:{sym}")
         return self._fills(sym) + (int(off) if off else 0)
 
-    @staticmethod
-    def _mismatch_text(sym: str, cur: int, exp: int) -> str:
-        return (f"IBKR holds {cur:+d} {sym} but this link's own fills add up to {exp:+d}: "
+    def _mismatch_text(self, sym: str, cur: int, exp: int) -> str:
+        name = getattr(self.broker, "name", "IBKR")
+        return (f"{name} holds {cur:+d} {sym} but this link's own fills add up to {exp:+d}: "
                 f"something outside the bot changed it (a manual trade, a split, a buy-in). "
-                f"Not traded until they agree; fix it in the IBKR app or press Accept IBKR position")
+                f"Not traded until they agree; fix it in the {name} app or press Accept "
+                f"{name} position")
 
     def _position_hold(self, sym: str, cur: int) -> str | None:
         """A Live symbol whose IBKR position this link's fills don't explain is

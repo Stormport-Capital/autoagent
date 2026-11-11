@@ -43,7 +43,9 @@ class FakeTZ:
     def __init__(self, account="TZP1", acct_type="Paper", status="Active", equity=50000.0,
                  pos=None, lots=None, hold=False, reject=(), reject_text=REJECT, etb=None,
                  routes=("SMART", "ARCA"), locate_price=0.01, offer_after=1, no_inventory=(),
-                 lag=0, rate429=0, inventory=None, auth_ok=True, day_pnl=-3.25):
+                 lag=0, rate429=0, inventory=None, auth_ok=True, day_pnl=-3.25, long_only=(),
+                 signed_shorts=False):
+        self.long_only, self.signed_shorts = set(long_only), signed_shorts
         self.account, self.acct_type, self.status, self.equity = account, acct_type, status, equity
         self.pos = dict(pos or {})
         self.lots = lots  # explicit raw position rows, if given
@@ -70,7 +72,8 @@ class FakeTZ:
         if self.lots is not None:
             return self.lots
         return [{"positionId": f"p-{s}", "symbol": s, "securityType": "Stock",
-                 "side": "Short" if q < 0 else "Long", "shares": abs(q), "priceAvg": 4.0}
+                 "side": "Short" if q < 0 else "Long",
+                 "shares": q if (self.signed_shorts and q < 0) else abs(q), "priceAvg": 4.0}
                 for s, q in self.pos.items() if q]
 
     def fill(self, cid):
@@ -171,7 +174,10 @@ class FakeTZ:
                 if row["locateStatus"] == 81:
                     self.polls[q] = self.polls.get(q, 0) + 1
                     if self.polls[q] >= self.offer_after:
-                        if row["symbol"] in self.no_inventory:
+                        if row["symbol"] in self.long_only:
+                            row.update(locateStatus=56, locateError=158,
+                                       text="R158: This symbol is only eligible for long positions.")
+                        elif row["symbol"] in self.no_inventory:
                             row.update(locateStatus=56, locateError=11,
                                        text="11 No shares available.  Please try again later.")
                         else:
@@ -275,8 +281,24 @@ class AccountTests(unittest.TestCase):
     def test_keys_that_dont_see_the_account(self):
         with self.assertRaisesRegex(BrokerError, "don't see account TZP1 .*TZP9"):
             mk(account="TZP9").account()
-        with self.assertRaisesRegex(BrokerError, "TZ_API_KEY_ID"):
+        with self.assertRaisesRegex(BrokerError, "404 on GET /accounts: .*if it persists.*TZ_API_KEY_ID"):
             mk(auth_ok=False).account()
+
+    def test_a_short_reads_short_whether_shares_come_signed_or_not(self):
+        """2026-11-11: TradeZero sent the 1-share STAK short in a way the adapter read
+        as +1, and the position guard froze the symbol. side is the direction;
+        shares may be signed (docs) - both spellings must give -1."""
+        self.assertEqual(mk(pos={"STAK": -1}).positions()["STAK"]["qty"], "-1")
+        self.assertEqual(mk(pos={"STAK": -1}, signed_shorts=True).positions()["STAK"]["qty"], "-1")
+        lots = [{"positionId": "1", "symbol": "STAK", "securityType": "Stock", "side": "Short",
+                 "shares": -1, "priceAvg": 2.44},
+                {"positionId": "2", "symbol": "LNG", "securityType": "Stock", "side": "Long",
+                 "shares": 2, "priceAvg": 5.0}]
+        self.assertEqual({s: p["qty"] for s, p in mk(lots=lots).positions().items()},
+                         {"STAK": "-1", "LNG": "2"})
+        b = mk(lots=lots[:1])
+        b.submit("STAK", 1, "buy", "cover")  # the cover is a Close, not a refused long
+        self.assertEqual(posted(b.fake)[0]["openClose"], "Close")
 
     def test_positions_sum_lots_in_alpaca_shape(self):
         b = mk(pos={"AAA": -1, "BBB": 2})
@@ -525,10 +547,35 @@ class BorrowTests(unittest.TestCase):
         self.assertIn("offered no shares of HTB", why)
         self.assertIn("No shares available", why)
 
+    def test_a_refused_locate_is_not_requoted_until_the_next_bar_check(self):
+        """2026-11-11: the 5-second retry passes re-quoted OMH and SMX every check and
+        logged a countdown line each time. A refusal now holds the symbol for
+        LOCATE_RETRY_S with one stable reason; R158 (long only) holds all day."""
+        b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="1", acct_type="Margin",
+               etb={"OMH": False, "SMX": False}, locate_price=0.05, long_only={"SMX"})
+        why1 = b.short_check("OMH", 1, ref_price=1.0)  # 5% of $1: above the cap
+        self.assertIn("above TZ_LOCATE_MAX_PCT", why1)
+        self.assertIn("next locate quote after", why1)
+        why2 = b.short_check("OMH", 1, ref_price=1.0)
+        self.assertEqual(why1, why2)  # same wording: the dashboard logs it once
+        quotes = lambda: len([p for _m, p, j in b.fake.calls if p.endswith("locates/quote") and j["symbol"] == "OMH"])
+        self.assertEqual(quotes(), 1)
+        b._locate_hold["OMH"] = (0.0, why1)  # the hold (and the 30-s rule) have passed: quote again
+        b._quoted.pop("OMH", None)
+        b.short_check("OMH", 1, ref_price=1.0)
+        self.assertEqual(quotes(), 2)
+        why = b.short_check("SMX", 1, ref_price=5.0)
+        self.assertEqual(why, "TradeZero allows no short position in SMX today (R158: only eligible "
+                              "for long positions)")
+        self.assertEqual(b.short_check("SMX", 1, ref_price=5.0), why)
+        self.assertEqual(len([p for _m, p, j in b.fake.calls if p.endswith("locates/quote") and j["symbol"] == "SMX"]), 1)
+        self.assertIsInstance(b._locate_hold["SMX"][0], str)  # held for the ET day
+
     def test_one_quote_per_symbol_per_30s(self):
         b = mk(TZ_MODE="live", TZ_LOCATE_MAX_PCT="1", acct_type="Margin",
                etb={"HTB": False}, no_inventory={"HTB"})
         b.short_check("HTB", 1, ref_price=5.0)
+        b._locate_hold.pop("HTB")  # the refusal hold aside, the 30-s rule alone still applies
         self.assertIn("one per 30 s", b.short_check("HTB", 1, ref_price=5.0))
         self.assertEqual(len([p for _m, p, _j in b.fake.calls if p.endswith("locates/quote")]), 1)
 
