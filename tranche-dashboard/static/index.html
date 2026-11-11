@@ -242,10 +242,11 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
       </div>
     </h2>
     <div class="export" id="exportBar" hidden>
-      <span>Export for TradesViz (this book, trades opened</span>
+      <span>Trades opened</span>
       <label>from <input type="date" id="exFrom"></label>
-      <label>to <input type="date" id="exTo"></label>)
-      <label><input type="checkbox" id="exOpen"> include open positions (entry only)</label>
+      <label>to <input type="date" id="exTo"></label>
+      <span class="hint" style="margin:0">(filters this table and the TradesViz export; ET dates, inclusive)</span>
+      <label><input type="checkbox" id="exOpen"> include open positions in the export (entry only)</label>
       <a id="exLink" class="small" href="#">Download CSV</a>
     </div>
     <div class="tfilter" id="tabFilter">
@@ -562,7 +563,11 @@ function exportLink() {
   if ($("#exOpen").checked) q.set("open", "1");
   $("#exLink").href = `/api/${BOOK}/export/tradesviz.csv` + (q.toString() ? "?" + q : "");
 }
-["#exFrom", "#exTo", "#exOpen"].forEach(id => $(id).onchange = exportLink);
+["#exFrom", "#exTo", "#exOpen"].forEach(id => $(id).onchange = () => { exportLink(); if (TAB === "closed") renderTab(); });
+// the ET calendar date a trade was opened on, as the export counts it (inclusive from/to)
+const etDay = iso => iso ? new Date(iso).toLocaleDateString("en-CA", {timeZone: "America/New_York"}) : "";
+const inDates = r => { const f = $("#exFrom").value, t = $("#exTo").value; if (!f && !t) return true;
+  const d = etDay(r.entry_time); return (!f || d >= f) && (!t || d <= t); };
 
 // Table filters (symbol / strategy / side / P&L) and click-to-sort; kept across refreshes and tabs.
 const FLT = {sym: "", sleeve: "", side: "", pnl: ""};
@@ -577,6 +582,7 @@ const on = k => (TAB_FILTERS[TAB] || []).includes(k) && FLT[k] && (k !== "side" 
 
 function applyFilters(rows) {
   const out = rows.filter(r =>
+    (TAB !== "closed" || inDates(r)) &&
     (!on("sym") || r.symbol === FLT.sym) && (!on("sleeve") || r.sleeve === FLT.sleeve) &&
     (!on("side") || r.side === FLT.side) &&
     (!on("pnl") || (FLT.pnl === "win" ? pnlOf(r) > 0 : pnlOf(r) < 0)));
@@ -664,7 +670,8 @@ function renderTab() {
 
 for (const [id, key] of [["#fSym", "sym"], ["#fSleeve", "sleeve"], ["#fSide", "side"], ["#fPnl", "pnl"]])
   $(id).onchange = e => { FLT[key] = e.target.value; e.target.blur(); renderTab(); };
-$("#fClear").onclick = () => { Object.keys(FLT).forEach(k => FLT[k] = ""); TSORT = {k: null, dir: -1}; renderTab(); };
+$("#fClear").onclick = () => { Object.keys(FLT).forEach(k => FLT[k] = ""); TSORT = {k: null, dir: -1};
+  $("#exFrom").value = ""; $("#exTo").value = ""; exportLink(); renderTab(); };
 $("#tabBody").addEventListener("click", e => {
   const th = e.target.closest("th[data-sort]"); if (!th) return;
   const k = th.dataset.sort;
