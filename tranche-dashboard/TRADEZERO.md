@@ -8,7 +8,8 @@ Everything in `IBKR.md` about *what* trades live applies unchanged: the Live
 button on the listed books' tabs (a symbol may be Live in several books; the
 account holds the sum of their positions), the 5/10 EMA tranche only, short
 only, the share cap per book, the fixed entry stop checked at every 5-minute
-close, flat by 15:55, at most two entries a day, the daily loss limit and the
+close, flat by 15:55 when the row's EOD close is on (off = may hold
+overnight), at most two entries a day, the daily loss limit and the
 kill switch. This file covers only what is different at TradeZero.
 
 Why TradeZero: IBKR refused most of the names tried in October and November
@@ -35,7 +36,7 @@ name IBKR will not lend can still be shorted, at a known price, within caps.
   the model has no last price for the symbol (the value cap needs one), when
   the account is not `Active`, when the position would pass `TZ_MAX_SHARES`,
   or when a buy would open a long.
-- **Cover** (stop, up-cross, 15:55, Live off, kill switch, loss limit):
+- **Cover** (stop, up-cross, 15:55 when EOD close is on, Live off, kill switch, loss limit):
   `Buy`, `openClose: Close`, `Market`. A cover is never refused for lack of a
   price: leaving a short open is the bigger risk at one share.
 - `TZ_ORDER_TYPE=limit` sends `Limit` at the model's last price through the
