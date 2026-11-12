@@ -2716,29 +2716,43 @@ class LiveRuleEngineTests(unittest.TestCase):
         self.assertFalse((t["exit_reason"] or "").startswith("stop"))
 
     # ---- end of day
-    def test_live_symbol_is_flat_at_1555_without_its_eod_switch(self):
+    def test_live_symbol_follows_its_own_eod_switch(self):
+        """Dean, 2026-11-12: Live no longer forces the 15:55 flat; the row's EOD
+        close button decides, live or not."""
         eng = Engine(self.store, ScriptedProvider([]), 5)
         eng.add_symbols("DAY", "short_only", 1.0, datetime.combine(self.D, time(9), tzinfo=ET))
         s = self.store.settings()
         self.assertIsNone(eng.day_only(self.sym(), "short", s))
         eng.set_live(1, ["EMA5_10"], datetime.combine(self.D, time(9), tzinfo=ET))
         self.assertEqual(self.sym()["eod_close"], 0)
+        self.assertIsNone(eng.day_only(self.sym(), "short", s))  # Live alone: may hold overnight
+        self.store.x("UPDATE symbols SET eod_close=1 WHERE id=1")
         self.assertIn("close by end of day", eng.day_only(self.sym(), "short", s))
 
-    def test_live_no_entry_from_1555_or_from_the_last_bar_at_the_next_open(self):
+    def test_live_entry_cutoffs_apply_only_with_eod_close_on(self):
         from engine import Fill
         eng = self.live_engine()
         s = self.store.settings()
         at = lambda d, hh, mm: datetime.combine(d, time(hh, mm), tzinfo=ET)
+        nxt = self.D + timedelta(days=1)
+        self.store.x("UPDATE symbols SET eod_close=1 WHERE id=1")  # EOD on: as before
         eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(self.D, 15, 55), self.D, "c"),
                    self.UNIT, s, "x", fixed_stop=10.5)
-        nxt = self.D + timedelta(days=1)
         eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(nxt, 9, 30), nxt, "open"),
                    self.UNIT, s, "x", fixed_stop=10.5)
         self.assertFalse(self.store.q("SELECT 1 FROM tranches"))
         eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(self.D, 15, 50), self.D, "c"),
                    self.UNIT, s, "x", fixed_stop=10.5)
         self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)  # 15:50 is fine
+        self.store.x("DELETE FROM tranches")
+        self.store.x("UPDATE symbols SET eod_close=0 WHERE id=1")  # EOD off: no cutoffs
+        eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(self.D, 15, 55), self.D, "c"),
+                   self.UNIT, s, "x", fixed_stop=10.5)
+        self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)
+        self.store.x("DELETE FROM tranches")
+        eng._enter(self.sym(), "EMA5_10", "short", Fill(10.0, at(nxt, 9, 30), nxt, "open"),
+                   self.UNIT, s, "x", fixed_stop=10.5)
+        self.assertEqual(len(self.store.q("SELECT 1 FROM tranches")), 1)
 
 
 class RevisingProvider:
