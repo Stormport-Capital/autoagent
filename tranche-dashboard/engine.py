@@ -69,7 +69,7 @@ SLEEVE_LABELS = {
     "VWAP": "VWAP fail (Russo)",
 }
 RISK_MIN, RISK_MAX = 0.5, 3.0
-# the only tranche the IBKR account may follow (short only, flat by 15:55, fixed stop)
+# the only tranche the live account may follow (short only, fixed stop; EOD close per row)
 LIVE_SLEEVES = ("EMA5_10",)
 # live 5/10 short: the state entry is judged on the bar ending 9:45; the opening
 # range is the regular-hours 5-min bars ending by then; at most this many entries a day
@@ -277,8 +277,8 @@ class Engine:
         """Why a position on this side must be flat by 15:55 (None = may hold overnight)."""
         if sym.get("eod_close"):
             return "close by end of day"
-        if sym.get("live"):
-            return "close by end of day (live symbol)"
+        # A Live symbol is no longer forced flat (Dean, 2026-11-12): its own EOD close
+        # button decides, like any other row. Off = it may hold overnight, live too.
         # Only a rate entered for this symbol can force it flat: the book default is
         # a cost estimate, not an observed fee, so it never changes how a trade is held.
         lim = float(s.get("overnight_borrow_max_pct") or 0)
@@ -289,10 +289,10 @@ class Engine:
         return None
 
     def set_live(self, symbol_id: int, sleeves, now: datetime) -> list[str]:
-        """Which of this symbol's tranches the IBKR account follows (empty =
-        none). Only LIVE_SLEEVES may be chosen. A live symbol is flat by 15:55
-        (every tranche, whatever its own EOD switch) and its 5/10 short has a
-        5-minute high-of-day stop; see day_only and _live_stop."""
+        """Which of this symbol's tranches the live account follows (empty =
+        none). Only LIVE_SLEEVES may be chosen. A live symbol's 5/10 short has a
+        5-minute high-of-day stop (_live_stop); whether it is flat by 15:55 is
+        the row's own EOD close switch, as for any symbol (day_only)."""
         sym = self._symbol(symbol_id)
         asked = set(sleeves or [])
         if asked - set(SLEEVE_LABELS):
@@ -1076,10 +1076,10 @@ class Engine:
             self.store.log(f.when, "skip", f"{why}: symbol paused, no entry", name, sleeve)
             return
         late = self.day_only(sym, side, s)
-        if sym.get("live") and f.when.astimezone(ET).time() == RTH_OPEN:
-            self.store.log(f.when, "skip", f"{why}: live symbol - the signal came from the "
-                           f"15:55-16:00 bar, after the 15:55 cutoff; not entered at the next open",
-                           name, sleeve)
+        if sym.get("live") and late and f.when.astimezone(ET).time() == RTH_OPEN:
+            self.store.log(f.when, "skip", f"{why}: live symbol closing by end of day - the signal "
+                           f"came from the 15:55-16:00 bar, after the 15:55 cutoff; not entered at "
+                           f"the next open", name, sleeve)
             return
         if late and f.when >= eod_cutoff(f.session):
             self.store.log(f.when, "skip", f"{why}: {late} - no new entries "

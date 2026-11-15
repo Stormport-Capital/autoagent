@@ -562,7 +562,8 @@ def live_check(live: "LiveSync | None", note: str | None) -> str:
                 f"{size}, daily loss limit "
                 f"${b.daily_loss_limit:,.0f}; {', '.join(live.book_labels)} "
                 f"book{'s' if len(live.book_labels) > 1 else ''}, 5/10 EMA short only, "
-                f"flat by 15:55; {len(live.selections())} live symbol(s)")
+                f"flat by 15:55 where the row's EOD close is on; "
+                f"{len(live.selections())} live symbol(s)")
     except Exception as e:
         return f"{b.venue}: FAILED - {_short(e)}"
 

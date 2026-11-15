@@ -22,7 +22,8 @@ that symbol's **5/10 EMA tranche, short only**:
   or at the 9:45 close if the 5 EMA is below the 10 and nothing was entered
   yet that day (stop fixed at the 9:30-9:45 high); at most 2 entries a day;
 - covered on a 5-minute close above that stop (market order), on the up-cross,
-  or at the 3:55 PM close.
+  or at the 3:55 PM close when the row's EOD close is on (off: it may hold
+  overnight at the live account too).
 
 VWAP-fail and 10/20 can't trade live. Guards for real money:
 

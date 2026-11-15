@@ -24,6 +24,8 @@ changed. Each needs a decision before anyone works on it.
 4. **Live forces 15:55 flat on every tranche of that symbol in the 5-min
    model.** That includes the VWAP and 10/20 tranches, so they also stop
    holding overnight. This changes that symbol's model stats in the 5-min book.
+   *Ended 2026-11-12: Live no longer forces the flat; the row's EOD close
+   button decides, for every tranche, live or not.*
 5. **Model fill vs live fill.** The model fills at the bar close; the live
    order goes out after the check. `orders` rows are not linked to tranches,
    so per-trade slippage can only be matched by time (see the grading guide's
