@@ -78,7 +78,8 @@ STATUS = {"PendingNew": "accepted", "New": "accepted", "PartiallyFilled": "parti
 # locate quotes 1/s, locate history/inventory 2/s)
 SPACING = {"accounts": 0.34, "pnl": 1.0, "positions": 0.34, "orders": 0.5, "order": 0.5,
            "post_order": 0.1, "cancel": 0.1, "routes": 1.0, "etb": 1.0,
-           "loc_quote": 1.0, "loc_accept": 0.1, "loc_history": 0.5, "loc_inventory": 0.5}
+           "loc_quote": 1.0, "loc_accept": 0.1, "loc_history": 0.5, "loc_inventory": 0.5,
+           "history": 1.0}
 RATE_WAITS = (2.0, 4.0)       # after a 429, before each retry
 REGISTER_S = 5.0              # how long a just-sent order may take to show up on GET
 RECENT_S = 30.0               # a 404 within this long of a submit is "not registered yet"
@@ -517,6 +518,35 @@ class TradeZeroBroker:
         body = self._req("loc_inventory", "GET", f"/accounts/{self.cfg.account}/locates/inventory")
         return sum(int(_f(r.get("available")) or 0) for r in _rows(body, "locateInventory")
                    if str(r.get("symbol") or "").upper() == symbol.upper())
+
+    # ------------------------------------------------------------ history (reconciliation)
+    def fills_history(self, start, days: int) -> list[dict]:
+        """TradeZero's own fill-level history from `start` (a date) for `days`
+        calendar days: one row per execution with price, commission and fees.
+        Live accounts only (paper returns none). Paginated, 100 rows a page."""
+        out, offset = [], 0
+        while True:
+            body = self._req("history", "GET", f"/accounts/{self.cfg.account}/orders-with-pagination/"
+                             f"start-date/{start:%Y-%m-%d}?numberOfDays={int(days)}&offset={offset}"
+                             f"&limit=100")
+            rows = _rows(body, "tradingHistory")
+            out += rows
+            total = int(((body or {}).get("pagination") or {}).get("totalRecords") or 0) \
+                if isinstance(body, dict) else 0
+            offset += len(rows)
+            if not rows or offset >= total:
+                return out
+
+    def cash_history(self, start, days: int) -> list[dict]:
+        """The cash ledger (locate fees, overnight borrow, platform charges,
+        transfers) from `start` for `days` calendar days."""
+        body = self._req("history", "GET", f"/accounts/{self.cfg.account}/cash-transactions/"
+                         f"start-date/{start:%Y-%m-%d}?numberOfDays={int(days)}&offset=0&limit=10000")
+        return _rows(body, "cashHistory")
+
+    def today_orders(self) -> list[dict]:
+        """Today's order book as TradeZero has it (every status), raw rows."""
+        return _rows(self._req("orders", "GET", f"/accounts/{self.cfg.account}/orders"), "orders")
 
     def locate_history(self) -> list[dict]:
         body = self._req("loc_history", "GET", f"/accounts/{self.cfg.account}/locates/history")

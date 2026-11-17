@@ -45,6 +45,7 @@ from backup import Backups, backup_folder
 from broker import AlpacaPaper, BrokerError, BrokerSync, LiveSync, seconds_after
 import ibkr
 import tradezero
+import tz_reconcile
 from data import make_provider, redact
 from engine import LIVE_SLEEVES, SLEEVE_LABELS, Engine, ValidationError, eod_cutoff
 from data import CachedProvider
@@ -661,6 +662,9 @@ def check_auth(header: str | None, password: str | None) -> bool:
     return hmac.compare_digest(supplied.encode(), password.encode())
 
 
+RECON_CACHE: dict = {}  # since -> (monotonic time, reconciliation): one TradeZero read a minute
+
+
 def make_handler(books: dict, provider_name: str, demo, backups=None, live=None):
     password = os.environ.get("TRANCHE_PASSWORD") or None
     ordered = list(books.values())
@@ -716,6 +720,8 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                                   "text/html; charset=utf-8")
             if self.path == "/api/review/trades":
                 return self._send(200, review_payload(review_books(), profiles))
+            if self.path.split("?")[0] == "/api/live/reconcile":
+                return self._reconcile(parse_qs(urlparse(self.path).query))
             book, rest = self._route()
             if book and rest == "/state":
                 st = build_state(book, ordered, provider_name, demo, live)
@@ -861,6 +867,29 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                 self._send(200, {"ok": True})
             except (ValidationError, json.JSONDecodeError) as e:
                 self._send(400, {"error": str(e)})
+
+        def _reconcile(self, qs):
+            """TradeZero's own fills, fees and ledger vs this dashboard (tz_reconcile).
+            Read-only; the last answer is kept for a minute so a busy page can't
+            run into TradeZero's rate limits."""
+            if live is None or getattr(live.broker, "name", "") != "TradeZero":
+                return self._send(400, {"error": "reconciliation needs the TradeZero link"})
+            try:
+                since = date.fromisoformat(qs["since"][0]) if qs.get("since", [""])[0] else None
+            except ValueError:
+                return self._send(400, {"error": "since must be YYYY-MM-DD"})
+            key = since.isoformat() if since else ""
+            hit = RECON_CACHE.get(key)
+            if hit and _time.monotonic() - hit[0] < 60:
+                return self._send(200, hit[1])
+            try:
+                body = tz_reconcile.reconcile(live.broker, live.store,
+                                              {k: b.engine.store for k, b in books.items()}, since)
+            except (BrokerError, ValueError, requests.RequestException) as e:
+                return self._send(400, {"error": redact(e)[:300]})
+            body = json.loads(json.dumps(body, default=str))
+            RECON_CACHE[key] = (_time.monotonic(), body)
+            return self._send(200, body)
 
         def _live_post(self, rest: str):
             try:
