@@ -470,6 +470,9 @@ function renderLiveAlert(L) {
 
 function renderBroker(B, o) {
   const id = x => $(`#${o.p}${x}`);
+  // don't redraw the card under someone choosing a reconcile date (it would close the picker)
+  const ae = document.activeElement;
+  if (o.shared && ae && ae.closest && ae.closest("#lvRecon") && ae.tagName === "INPUT") return;
   if (!B.configured) {
     id("State").textContent = "not linked";
     id("Body").innerHTML = `<div class="hint">${esc(B.reason)}. See ${o.shared ? "IBKR.md or TRADEZERO.md" : "SETUP.md"}.</div>`;
@@ -507,8 +510,19 @@ function renderBroker(B, o) {
     if (ords.length) h += `<details style="margin-top:8px"><summary>Recent ${esc(LVN())} orders</summary><div class="tablewrap"><table><thead><tr><th class="l">Time</th><th class="l">Symbol</th><th>Side</th><th>Qty</th><th class="l">Status</th><th>Fill</th><th title="Seconds from the bar close (the 9:30 open for the last bar of the day) to the order leaving for ${esc(LVN())}">Bar→sent</th><th title="Seconds from the bar close to the fill at ${esc(LVN())}">Bar→fill</th></tr></thead><tbody>` +
       ords.map(x => `<tr><td class="l">${fmtT(x.ts)}</td><td class="l sym">${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${x.qty}</td><td class="l">${esc(x.status)}${x.message ? `<div class="err-text" style="max-width:220px">${esc(x.message)}</div>` : ""}</td><td>${x.filled_avg_price == null ? "—" : num(x.filled_avg_price)}</td><td>${secs(x.sent_s)}</td><td>${secs(x.fill_s)}</td></tr>`).join("") + `</tbody></table></div></details>`;
     if (evs.length) h += `<details style="margin-top:4px"><summary>${esc(LVN())} log</summary><div class="hint">${evs.map(e => `${fmtT(e.ts)} · ${e.symbol ? esc(e.symbol) + ": " : ""}${esc(e.message)}`).join("<br>")}</div></details>`;
+    if (B.name === "TradeZero") h += `<details id="lvRecon" style="margin-top:4px" ${RECON.open ? "open" : ""}><summary>Results at TradeZero (its own fills, fees and locates)</summary>
+      <div class="row" style="margin:6px 0"><label>from <input type="date" id="lvReconFrom" value="${esc(RECON.since)}"></label> <button type="button" class="small" id="lvReconBtn">Reconcile now</button></div>
+      <div id="lvReconOut">${reconHtml()}</div></details>`;
   }
   id("Body").innerHTML = h;
+  if ($("#lvRecon")) {
+    $("#lvRecon").ontoggle = e => {  // a redraw of an open section fires this too: run on a real open only
+      const was = RECON.open; RECON.open = e.target.open;
+      if (!was && RECON.open && !RECON.data && !RECON.busy) runRecon();
+    };
+    $("#lvReconFrom").onchange = $("#lvReconFrom").oninput = e => { RECON.since = e.target.value; };
+    $("#lvReconBtn").onclick = runRecon;
+  }
   id("Body").querySelectorAll("[data-accept]").forEach(btn => btn.onclick = async () => {
     const d = btn.dataset;
     if (!confirm(`${LVN()} holds ${d.pos} ${d.accept}. Treat that as the bot's own position and follow the model (${d.model}) in ${d.accept} again from the next check?`)) return;
@@ -535,6 +549,34 @@ function renderBroker(B, o) {
   id("Pause").onclick = () => kill("pause", `Pause: nothing more is sent to ${B.venue} (no entries, no exits) until you press Resume. Positions there stay as they are.`);
   id("Flat").onclick = () => kill("flatten", `Flatten & stop: cancel working orders and close every position this dashboard manages at ${B.venue} now, then send nothing until you press Resume. The model keeps trading on its own.`);
   if (id("Resume")) id("Resume").onclick = () => kill("off", `Resume: the next sync brings ${B.venue} back to the Live symbols' current positions (it re-opens what the chosen tranches still hold).`);
+}
+
+// TradeZero reconciliation (tz_reconcile): kept across the card's refreshes
+const RECON = {open: false, since: "", data: null, error: null, busy: false};
+async function runRecon() {
+  RECON.busy = true; RECON.error = null; const out = $("#lvReconOut"); if (out) out.innerHTML = reconHtml();
+  try { RECON.data = await api("/api/live/reconcile" + (RECON.since ? `?since=${encodeURIComponent(RECON.since)}` : "")); }
+  catch (e) { RECON.error = e.message; }
+  RECON.busy = false; const o2 = $("#lvReconOut"); if (o2) o2.innerHTML = reconHtml();
+}
+function reconHtml() {
+  if (RECON.busy) return `<div class="hint">Reading TradeZero's fills, fees and ledger…</div>`;
+  if (RECON.error) return `<div class="msg err">${esc(RECON.error)}</div>`;
+  const r = RECON.data; if (!r) return `<div class="hint">Compares TradeZero's own fills, commissions, locate and borrow charges with this dashboard's orders, trade by trade. Read-only.</div>`;
+  const t = r.totals, m2 = v => v == null ? "—" : signed(v, 2), usd2 = v => usd(v, 2);
+  let h = `<div class="hint" style="margin:0">${esc(r.since)} to ${esc(r.today)} · account ${esc(r.account)}</div>
+    <div class="bk-kpis"><div><span>Net, closed trips</span><b class="${cls(t.net_closed)}">${m2(t.net_closed)}</b></div>
+      <div><span>Net, all in (incl. open)</span><b class="${cls(t.net_all)}">${m2(t.net_all)}</b></div>
+      <div><span>Trips (won / lost)</span>${t.trips} (${t.wins} / ${t.losses})</div>
+      <div><span>Do they match</span>${r.mismatches ? `<b class="neg">${r.mismatches} difference${r.mismatches > 1 ? "s" : ""}</b>` : "<b>all match</b>"}</div></div>
+    <div class="hint" style="margin:2px 0">Gross ${m2(t.gross)} · commissions &amp; fees ${m2(-t.fees)} · locates ${m2(-t.locate)} · overnight borrow ${m2(-t.borrow)}${t.other_charges ? ` · other charges ${m2(-t.other_charges)}` : ""} · open ${m2(t.unrealized)}${r.start_equity != null ? `<br>Equity ${usd2(r.start_equity)} → ${usd2(r.equity)}: change ${m2(r.equity_change)}, explained ${m2(t.net_all)}, unexplained <b class="${Math.abs(r.unexplained) > 0.5 ? "neg" : ""}">${m2(r.unexplained)}</b>` : ""}</div>`;
+  if (r.trips.length) h += `<div class="tablewrap"><table><thead><tr><th class="l">Opened</th><th class="l">Symbol</th><th>Qty</th><th>In</th><th>Out</th><th>Gross</th><th>Fees</th><th>Locate</th><th>Net</th><th title="Per share, live vs the model's fill: positive = live did better">vs model in / out</th></tr></thead><tbody>` +
+    r.trips.map(x => `<tr><td class="l">${esc(x.opened)}</td><td class="l sym">${esc(x.symbol)} <small>${esc(x.side)}</small></td><td>${x.qty}</td><td>${x.entry == null ? "—" : num(x.entry, 4)}</td><td>${x.exit == null ? "open" : num(x.exit, 4)}</td><td class="${cls(x.gross)}">${m2(x.gross)}</td><td>${m2(-x.fees)}</td><td>${m2(-x.locate - x.borrow)}</td><td class="${cls(x.net)}"><b>${m2(x.net)}</b></td><td>${x.model ? `${x.entry_vs_model == null ? "—" : num(x.entry_vs_model, 4)} / ${x.exit_vs_model == null ? "—" : num(x.exit_vs_model, 4)}` : "—"}</td></tr>`).join("") + `</tbody></table></div>`;
+  const bad = r.matches.filter(x => x.status !== "MATCH"), badPos = r.positions.filter(p => !p.match);
+  if (bad.length || badPos.length) h += `<div class="msg err">${bad.map(x => `${esc(x.day)} ${esc(x.symbol)} ${esc(x.side)}: TradeZero ${x.tz_qty} @ ${x.tz_price == null ? "—" : num(x.tz_price, 4)}, dashboard ${x.dash_qty} @ ${x.dash_price == null ? "—" : num(x.dash_price, 4)} · ${esc(x.status)}`).concat(badPos.map(p => `${esc(p.symbol)} position: TradeZero ${p.tradezero}, dashboard's fills ${p.dashboard_fills}`)).join("<br>")}</div>`;
+  if (r.other_charges.length) h += `<div class="hint">Other charges: ${r.other_charges.map(c => `${esc(c.day)} ${esc(c.type)} ${esc(c.note)} ${m2(c.amount)}`).join(" · ")}</div>`;
+  if (r.notes.length) h += `<div class="hint">${r.notes.map(esc).join("<br>")}</div>`;
+  return h;
 }
 
 function statRow(name, st, extra = "") {

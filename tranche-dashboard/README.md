@@ -223,7 +223,9 @@ closed yet. Direct link: `/api/<1h|15m|5m>/export/tradesviz.csv?from=YYYY-MM-DD&
   its orders, log, kill switch and loss latch are kept in `tranche_live.db`
 - `deploy/ib-gateway/compose.yml` — IB Gateway + IBC in Docker for the server
 - `tradezero.py` — TradeZero client (REST API), paper or live, same interface as
-  `ibkr.py`; `tz_check.py` — read-only account / borrow check for one symbol
+  `ibkr.py`; `tz_check.py` — read-only account / borrow check for one symbol;
+  `tz_reconcile.py` — TradeZero's own fills, fees and ledger vs the dashboard
+  (also on the card: Results at TradeZero)
 - `store.py` — SQLite state (`tranche.db`), including settings defaults
 - `app.py` — web server and the hourly scheduler
 - `static/index.html` — the dashboard page

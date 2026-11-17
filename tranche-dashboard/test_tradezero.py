@@ -4,10 +4,11 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 
 import app
 import tradezero
+import tz_reconcile
 from broker import BrokerError, BrokerSync, LiveSync
 from engine import LIVE_SLEEVES, Engine
 from indicators import ET
@@ -46,6 +47,7 @@ class FakeTZ:
                  lag=0, rate429=0, inventory=None, auth_ok=True, day_pnl=-3.25, long_only=(),
                  signed_shorts=False):
         self.long_only, self.signed_shorts = set(long_only), signed_shorts
+        self.fill_rows, self.cash = [], []  # fill-level history rows, cash-ledger rows
         self.account, self.acct_type, self.status, self.equity = account, acct_type, status, equity
         self.pos = dict(pos or {})
         self.lots = lots  # explicit raw position rows, if given
@@ -110,7 +112,7 @@ class FakeTZ:
 
     # ---- the API
     def request(self, method, url, timeout=None, json=None, data=None):
-        path = url.split("/v1/api", 1)[1]
+        path = url.split("/v1/api", 1)[1].split("?", 1)[0]
         self.calls.append((method, path, json))
         if self.rate429 > 0:
             self.rate429 -= 1
@@ -126,6 +128,13 @@ class FakeTZ:
                                    for lot in self._lots()]})
         if method == "GET" and path == f"{a}/positions":
             return R(200, {"positions": self._lots()})
+        if method == "GET" and path.startswith(f"{a}/orders-with-pagination/start-date/"):
+            return R(200, {"tradingHistory": list(self.fill_rows),
+                           "pagination": {"totalRecords": len(self.fill_rows), "currentOffset": 0,
+                                          "currentLimit": 100}})
+        if method == "GET" and path.startswith(f"{a}/cash-transactions/start-date/"):
+            return R(200, {"cashHistory": list(self.cash),
+                           "pagination": {"totalRecords": len(self.cash)}})
         if method == "GET" and path == f"{a}/routes":
             return R(200, {"routes": [{"routeName": n, "orderTypes": ["Market", "Limit"]}
                                       for n in self.routes]})
@@ -833,6 +842,160 @@ class AppTests(unittest.TestCase):
         from data import redact
         os.environ["TZ_API_SECRET_KEY"] = "sk-very-secret"
         self.assertEqual(redact("key sk-very-secret leaked"), "key *** leaked")
+
+
+class ReconcileTests(unittest.TestCase):
+    """tz_reconcile: TradeZero's own fills, fees and ledger vs the dashboard."""
+    D = "2026-11-11"
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.live = Store(f"{self.dir.name}/live.db")
+        self.book = Store(f"{self.dir.name}/15m.db")
+
+    def tearDown(self):
+        self.live.db.close()
+        self.book.db.close()
+        self.dir.cleanup()
+
+    def order(self, ts, sym, side, qty, px, cid=None, broker_id=None, book="15m"):
+        cid = cid or f"td-{sym}-{len(self.live.q('SELECT 1 FROM orders'))}"
+        self.live.x("""INSERT INTO orders (ts, symbol, side, qty, client_order_id, broker_order_id,
+                       status, filled_qty, filled_avg_price, filled_at, book)
+                       VALUES (?,?,?,?,?,?,'filled',?,?,?,?)""",
+                    (ts, sym, side, qty, cid, broker_id or cid, qty, px, ts, book))
+
+    def fill(self, fake, day, sym, side, qty, px, fees=0.0, t="10:00:00"):
+        fake.fill_rows.append({"tradeId": len(fake.fill_rows) + 1, "symbol": sym, "securityType": "Stock",
+                             "side": side, "qty": qty, "price": px, "commission": 0,
+                             "totalFees": fees, "tradeDate": f"{day}T00:00:00", "execTime": t,
+                             "canceled": False})
+
+    def run_it(self, fake, since=date(2026, 11, 11), today=date(2026, 11, 12)):
+        b = mk(fake)
+        return tz_reconcile.reconcile(b, self.live, {"15m": self.book}, since, today)
+
+    def test_a_live_day_matches_and_its_costs_are_counted(self):
+        fake = FakeTZ(acct_type="Paper", pos={"ABC": 10})
+        self.fill(fake, self.D, "STAK", "Sell", 1, 2.44, 0.01, "09:45:43")
+        self.fill(fake, self.D, "STAK", "Buy", 1, 2.10, 0.02, "15:55:12")
+        self.fill(fake, "2026-11-12", "ABC", "Buy", 10, 5.00, 0.0, "11:00:00")  # made in TZ1
+        fake.cash = [
+            {"cashType": "Locate Fees", "note": "Locate 100 STAK @ 0.0375 per share",
+             "deposit": 0, "withdraw": 3.75, "entryDate": f"{self.D}T00:00:00"},
+            {"cashType": "Platform Fees", "note": "Monthly data", "deposit": 0, "withdraw": 0.5,
+             "entryDate": f"{self.D}T00:00:00"},
+            {"cashType": "Deposit", "note": "ACH deposit", "deposit": 100, "withdraw": 0,
+             "entryDate": "2026-11-12T00:00:00"}]
+        self.order("2026-11-11T09:45:42-05:00", "STAK", "sell", 1, 2.44)
+        self.order("2026-11-11T15:55:10-05:00", "STAK", "buy", 1, 2.10)
+        self.order("2026-11-10T09:40:00-05:00", "PMI", "sell", 1, 14.0, broker_id="417")  # IBKR era
+        self.live.x("INSERT INTO broker_equity VALUES (?, ?)", ("2026-11-11T09:30:05-05:00", 49940.0))
+        Engine(self.book, ScriptedProvider([]), 15).add_symbols("STAK", "short_only", 1.0, datetime(2026, 11, 11, 9, tzinfo=ET))
+        sid = self.book.q("SELECT id FROM symbols WHERE symbol='STAK'")[0]["id"]
+        self.book.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+            stop_price, risk_dollars, fee_through, status, exit_time, exit_price, exit_reason)
+            VALUES (?, 'STAK', 'EMA5_10', 'short', 732, '2026-11-11T09:45:00-05:00', 2.583, 2.79, 100,
+            '2026-11-11', 'closed', '2026-11-11T15:55:00-05:00', 2.08, 'close by end of day')""", (sid,))
+        r = self.run_it(fake)
+        t = r["totals"]
+        self.assertEqual((t["trips"], t["wins"], t["losses"]), (1, 0, 1))
+        self.assertEqual((t["gross"], t["fees"], t["locate"], t["other_charges"], t["transfers"]),
+                         (0.34, 0.03, 3.75, 0.5, 100.0))
+        self.assertEqual(t["net_closed"], -3.44)                      # 0.34 - 0.03 - 3.75
+        st = {(m["symbol"], m["side"]): m["status"] for m in r["matches"]}
+        self.assertEqual(st[("STAK", "sell")], "MATCH")
+        self.assertEqual(st[("STAK", "buy")], "MATCH")
+        self.assertIn("ONLY AT TRADEZERO", st[("ABC", "buy")])
+        self.assertNotIn(("PMI", "sell"), st)                          # IBKR's order is not TradeZero's
+        self.assertEqual(r["mismatches"], 1)
+        pos = {p["symbol"]: (p["tradezero"], p["dashboard_fills"], p["match"]) for p in r["positions"]}
+        self.assertEqual(pos, {"ABC": (10, 0, False)})
+        stak = [x for x in r["trips"] if x["symbol"] == "STAK"][0]
+        self.assertEqual((stak["entry"], stak["exit"], stak["net"]), (2.44, 2.10, -3.44))
+        self.assertEqual(stak["model"]["book"], "15m")
+        self.assertEqual(stak["entry_vs_model"], round(2.44 - 2.583, 4))  # live sold lower: worse
+        self.assertEqual(stak["exit_vs_model"], round(2.08 - 2.10, 4))    # live covered higher: worse
+        abc = [x for x in r["trips"] if x["symbol"] == "ABC"][0]
+        self.assertIsNone(abc["closed"])
+        self.assertEqual(r["start_equity"], 49940.0)
+        self.assertEqual(r["equity_change"], round(50001.5 - 49940.0 - 100, 2))  # transfers out
+        text = tz_reconcile.format_report(r)
+        for bit in ("HOW WE'RE DOING", "NET, closed trips:  -$3.44", "locate fees:        -$3.75",
+                    "ONLY AT TRADEZERO", "OTHER LEDGER CHARGES", "Monthly data", "Read-only"):
+            self.assertIn(bit, text)
+
+    def test_a_dashboard_fill_tradezero_does_not_show_and_a_price_gap(self):
+        fake = FakeTZ(acct_type="Paper")
+        self.fill(fake, self.D, "AAA", "Sell", 1, 5.00)
+        self.order("2026-11-11T10:00:00-05:00", "AAA", "sell", 1, 5.20)   # 4% off
+        self.order("2026-11-11T10:05:00-05:00", "BBB", "sell", 1, 3.00)   # not at TradeZero
+        st = {m["symbol"]: m["status"] for m in self.run_it(fake)["matches"]}
+        self.assertEqual(st["AAA"], "PRICE DIFFERS")
+        self.assertIn("ONLY ON THE DASHBOARD", st["BBB"])
+
+    def test_today_falls_back_to_the_order_book_and_locate_history(self):
+        fake = FakeTZ(acct_type="Margin", etb={"HTB": False}, locate_price=0.02)
+        b = mk(fake, TZ_MODE="live", TZ_LOCATE_MAX_PCT="2")
+        today = datetime.now(ET).date()
+        b.submit("ZZZ", 1, "sell", "td-ZZZ-1", ref_price=5.0)            # fills in the fake's book
+        b.short_check("HTB", 1, ref_price=5.0)                             # buys a 100-lot locate
+        r = tz_reconcile.reconcile(b, self.live, {}, today, today)
+        z = [m for m in r["matches"] if m["symbol"] == "ZZZ"][0]
+        self.assertEqual((z["tz_qty"], z["tz_price"]), (1, 4.01))
+        self.assertTrue(any("order book" in n for n in r["notes"]))
+        self.assertTrue(any("locate history" in n for n in r["notes"]))
+        self.assertEqual(r["totals"]["locate"] + r["totals"]["other_charges"], 2.0)  # 100 x 0.02
+
+    def test_the_dashboard_endpoint_serves_it_and_caches_a_minute(self):
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        fake = FakeTZ(acct_type="Paper")
+        self.fill(fake, self.D, "STAK", "Sell", 1, 2.44, 0.01)
+        self.fill(fake, self.D, "STAK", "Buy", 1, 2.10, 0.02)
+        self.order("2026-11-11T09:45:42-05:00", "STAK", "sell", 1, 2.44)
+        self.order("2026-11-11T15:55:10-05:00", "STAK", "buy", 1, 2.10)
+        b = mk(fake)
+        live = LiveSync(self.live, b, {"15m": ("15-min", self.book)}, live_book="15m",
+                        live_books=("15m",), sleeves=LIVE_SLEEVES, fill_wait_s=0,
+                        max_shares=1, daily_loss_limit=100)
+
+        class Eng:
+            store = self.book
+        class Bk:
+            key, label, engine = "15m", "15-min", Eng()
+        app.RECON_CACHE.clear()
+        old = os.environ.pop("TRANCHE_PASSWORD", None)
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler({"15m": Bk()}, "demo", None, None, live))
+        finally:
+            if old is not None:
+                os.environ["TRANCHE_PASSWORD"] = old
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            get = lambda q: _json.loads(urllib.request.urlopen(base + "/api/live/reconcile" + q).read())
+            r = get("?since=2026-11-11")
+            self.assertEqual((r["totals"]["trips"], r["totals"]["gross"], r["mismatches"]), (1, 0.34, 0))
+            n = len([c for c in fake.calls if "orders-with-pagination" in c[1]])
+            get("?since=2026-11-11")
+            self.assertEqual(len([c for c in fake.calls if "orders-with-pagination" in c[1]]), n)  # cached
+            try:
+                urllib.request.urlopen(base + "/api/live/reconcile?since=11/11/2026")
+                self.fail("a bad date must be refused")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 400)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_ibkr_is_refused(self):
+        class NotTZ:
+            name = "IBKR"
+        with self.assertRaisesRegex(ValueError, "not TradeZero"):
+            tz_reconcile.reconcile(NotTZ(), self.live)
 
 
 if __name__ == "__main__":
