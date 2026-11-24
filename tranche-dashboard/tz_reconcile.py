@@ -197,27 +197,49 @@ def _round_trips(fills: list[dict]) -> tuple[list[dict], dict[str, int]]:
         t["gross"] = round(sum(f["qty"] * f["price"] * (1 if f["side"] == "sell" else -1)
                                for f in t["fills"]), 4) if t["closed"] else None
         t["fees"] = round(sum(f["fees"] for f in t["fills"]), 4)
+        t["shares"] = sum(f["qty"] for f in (sells if t["side"] == "short" else buys))
     return trips, dict(pos)
 
 
-def _model_for(trip: dict, dash_orders: list[dict], books: dict) -> dict | None:
-    """The model's 5/10 tranche behind a live trip: the book recorded on the
-    dashboard's opening order, the same symbol, entered within 20 minutes."""
-    opening = [o for o in dash_orders if o["symbol"] == trip["symbol"]
-               and _day(o["ts"]) == trip["opened"]
-               and o["side"] == ("sell" if trip["side"] == "short" else "buy")]
-    for o in opening:
-        when = datetime.fromisoformat(o["ts"])
-        for key in (o.get("book") or "").split(","):
-            st = books.get(key)
-            if st is None:
-                continue
-            for r in st.q("SELECT entry_time, entry_price, exit_price, exit_reason, status, stop_price "
-                          "FROM tranches WHERE symbol=? AND sleeve='EMA5_10' AND side=? "
-                          "ORDER BY entry_time", (trip["symbol"], trip["side"])):
-                if abs((datetime.fromisoformat(r["entry_time"]) - when).total_seconds()) <= 1200:
-                    return {"book": key, **dict(r)}
-    return None
+def _dash_openers(dash_orders: list[dict]) -> dict[str, list[dict]]:
+    """Per symbol, in order, the dashboard's orders that opened a position from
+    flat: the k-th is the order behind TradeZero's k-th trip in that symbol
+    (the fills match, so the two sequences line up; no clock needed)."""
+    pos, out = defaultdict(int), defaultdict(list)
+    for o in dash_orders:
+        q = int(round(_f(o["filled_qty"])))
+        if pos[o["symbol"]] == 0:
+            out[o["symbol"]].append(o)
+        pos[o["symbol"]] += q if o["side"] == "buy" else -q
+    return out
+
+
+def _model_for(trip: dict, opener: dict | None, books: dict, used: set) -> dict | None:
+    """The model's 5/10 tranche behind a live trip: in the book(s) recorded on
+    the dashboard order that opened it, same symbol and side, the tranche
+    entered closest to that order (within 20 minutes) and not already matched
+    to another trip. Before 2026-11-24 it took the day's first tranche, so a
+    second trade in a symbol on a day was compared with the first."""
+    if (opener is None or _day(opener["ts"]) != trip["opened"]
+            or opener["side"] != ("sell" if trip["side"] == "short" else "buy")):
+        return None
+    when = datetime.fromisoformat(opener["ts"])
+    best = None
+    for key in (opener.get("book") or "").split(","):
+        st = books.get(key)
+        if st is None:
+            continue
+        for r in st.q("SELECT id, entry_time, entry_price, exit_price, exit_reason, status, stop_price "
+                      "FROM tranches WHERE symbol=? AND sleeve='EMA5_10' AND side=? "
+                      "ORDER BY entry_time", (trip["symbol"], trip["side"])):
+            gap = abs((datetime.fromisoformat(r["entry_time"]) - when).total_seconds())
+            if gap <= 1200 and (key, r["id"]) not in used and (best is None or gap < best[0]):
+                best = (gap, key, r)
+    if best is None:
+        return None
+    _, key, r = best
+    used.add((key, r["id"]))
+    return {"book": key, **{k: v for k, v in dict(r).items() if k != "id"}}
 
 
 def reconcile(broker, live_store, books: dict | None = None, since: date | None = None,
@@ -266,7 +288,7 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
 
     # ---- round trips with their charges
     trips, tz_pos = _round_trips(fills)
-    used = set()
+    used, models_used, openers, nth = set(), set(), _dash_openers(dash), defaultdict(int)
     for t in trips:
         last = t["closed"] or today
         mine = [i for i, c in enumerate(charges) if i not in used and c["symbol"] == t["symbol"]
@@ -276,7 +298,10 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
         t["borrow"] = round(-sum(charges[i]["amount"] for i in mine if charges[i]["kind"] == "borrow"), 4)
         t["net"] = (round(t["gross"] - t["fees"] - t["locate"] - t["borrow"], 4)
                     if t["gross"] is not None else None)
-        m = _model_for(t, dash, books or {})
+        k = nth[t["symbol"]]
+        nth[t["symbol"]] += 1
+        mine_open = openers.get(t["symbol"], [])
+        m = _model_for(t, mine_open[k] if k < len(mine_open) else None, books or {}, models_used)
         t["model"] = m
         if m:
             sign = 1 if t["side"] == "short" else -1  # short: a higher entry is better
@@ -301,7 +326,14 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
         "other_charges": round(-sum(c["amount"] for c in other), 2),
         "transfers": round(sum(c["amount"] for c in transfers), 2),
         "unrealized": unreal,
+        "gross_wins": sum(1 for t in closed if (t["gross"] or 0) > 0),
     }
+    # live vs the model's own prices on the same trades, in dollars (shares x per-share gap)
+    vs = [t for t in closed if t.get("model") and t.get("entry_vs_model") is not None
+          and t.get("exit_vs_model") is not None]
+    tot["vs_model_trips"] = len(vs)
+    tot["vs_model_entry"] = round(sum(t["shares"] * t["entry_vs_model"] for t in vs), 2)
+    tot["vs_model_exit"] = round(sum(t["shares"] * t["exit_vs_model"] for t in vs), 2)
     tot["net_closed"] = round(tot["gross"] - sum(t["fees"] + t["locate"] + t["borrow"]
                                                  for t in closed), 2)
     tot["net_all"] = round(tot["gross"] - tot["fees"] - tot["locate"] - tot["borrow"]
@@ -347,7 +379,8 @@ def format_report(r: dict) -> str:
     t = r["totals"]
     out = [f"TradeZero {r['account']} vs the dashboard, {r['since']} to {r['today']}", ""]
     out.append("HOW WE'RE DOING")
-    out.append(f"  closed round trips: {t['trips']} ({t['wins']} won, {t['losses']} lost)")
+    out.append(f"  closed round trips: {t['trips']} ({t['wins']} won, {t['losses']} lost after all "
+               f"costs; {t['gross_wins']} made money before costs)")
     out.append(f"  gross trading P&L:  {_usd(t['gross'])}")
     out.append(f"  commissions + fees: {_usd(-t['fees'])}")
     out.append(f"  locate fees:        {_usd(-t['locate'])}")
@@ -357,6 +390,11 @@ def format_report(r: dict) -> str:
     out.append(f"  NET, closed trips:  {_usd(t['net_closed'])}")
     out.append(f"  open positions:     {_usd(t['unrealized'])} unrealized")
     out.append(f"  NET, all in:        {_usd(t['net_all'])}")
+    if t["vs_model_trips"]:
+        out.append(f"  live vs the model's prices on the same {t['vs_model_trips']} trips: "
+                   f"{_usd(t['vs_model_entry'] + t['vs_model_exit'])} (entries "
+                   f"{_usd(t['vs_model_entry'])}, exits {_usd(t['vs_model_exit'])}; "
+                   f"negative = live filled worse)")
     if r["start_equity"] is not None:
         out.append(f"  equity {_usd(r['start_equity'])} -> {_usd(r['equity'])}"
                    + (f" (transfers {_usd(t['transfers'])})" if t["transfers"] else "")
@@ -379,14 +417,14 @@ def format_report(r: dict) -> str:
     out.append("ROUND TRIPS (TradeZero's fills)")
     for x in r["trips"]:
         state = f"closed {x['closed']}" if x["closed"] else "OPEN"
-        line = (f"  {x['opened']} {x['symbol']:<6} {x['side']:<5} {x['qty']} sh  in {x['entry'] or 0:.4f}"
-                f"  out {x['exit'] or 0:.4f}  gross {_usd(x['gross'])}  fees {_usd(-x['fees'])}"
+        px = lambda v: "-" if v is None else f"{v:.4f}"
+        line = (f"  {x['opened']} {x['symbol']:<6} {x['side']:<5} {x['qty']} sh  in {px(x['entry'])}"
+                f"  out {px(x['exit'])}  gross {_usd(x['gross'])}  fees {_usd(-x['fees'])}"
                 f"  locate {_usd(-x['locate'])}  borrow {_usd(-x['borrow'])}  net {_usd(x['net'])}  ({state})")
         out.append(line)
         m = x.get("model")
         if m:
-            out.append(f"      model ({m['book']}): in {m['entry_price']:.4f}, out "
-                       f"{m['exit_price'] if m['exit_price'] is not None else '-'}"
+            out.append(f"      model ({m['book']}): in {px(m['entry_price'])}, out {px(m['exit_price'])}"
                        f" ({m['exit_reason'] or m['status']}); live vs model per share: entry "
                        f"{x.get('entry_vs_model') if x.get('entry_vs_model') is not None else '-'}, exit "
                        f"{x.get('exit_vs_model') if x.get('exit_vs_model') is not None else '-'} "
