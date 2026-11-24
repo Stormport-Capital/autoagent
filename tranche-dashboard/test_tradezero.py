@@ -991,6 +991,18 @@ class ReconcileTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_the_script_runs_the_documented_way(self):
+        """`python -I tz_reconcile.py` from the server failed on 2026-11-24 with
+        "No module named 'indicators'": -I leaves the script's folder off sys.path.
+        Run it exactly that way, from another folder."""
+        import subprocess
+        import sys as _sys
+        here = os.path.dirname(os.path.abspath(tradezero.__file__))
+        r = subprocess.run([_sys.executable, "-I", os.path.join(here, "tz_reconcile.py"), "--help"],
+                           cwd=tempfile.gettempdir(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--since", r.stdout)
+
     def test_ibkr_is_refused(self):
         class NotTZ:
             name = "IBKR"
