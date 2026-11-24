@@ -37,8 +37,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from indicators import ET  # noqa: E402
 
 PRICE_TOL = 0.005        # 0.5%: a fill price this far from TradeZero's is a mismatch
-LOCATE_NOTE = re.compile(r"locate\s+(?:credit\s+)?(\d+)\s+([A-Z][A-Z0-9.\-]*)\s+@\s*\$?([\d.]+)", re.I)
-BORROW_NOTE = re.compile(r"\bONB\s+(\d+)\s+([A-Z][A-Z0-9.\-]*)", re.I)
+# ledger notes seen live: "Locate 100 BB @ 0.0045 per share", "Single-Use 100 POAS @ 0.0098 per
+# share", "ONB 1.00000000 ADXN ($-0.11129000) for 11/19"
+LOCATE_NOTE = re.compile(r"(?:locate|single[- ]use|pre[- ]?borrow)\s+(?:credit\s+)?([\d.]+)\s+"
+                         r"([A-Z][A-Z0-9.\-]*)\s+@\s*\$?([\d.]+)", re.I)
+BORROW_NOTE = re.compile(r"\bONB\s+([\d.]+)\s+([A-Z][A-Z0-9.\-]*)", re.I)
+
+
+def _side(row: dict, gross_key: str | None = None) -> str:
+    """'buy' or 'sell'. The sign of the gross proceeds decides when there is one
+    (negative = cash out = a buy or a cover): TradeZero's live fill history
+    labels covers in a way a "Buy"/"Sell" reading took for sells (2026-11-24:
+    every cover counted as a sell). Otherwise the label: buy, cover, BC, BTC."""
+    if gross_key and row.get(gross_key) not in (None, ""):
+        g = _f(row.get(gross_key))
+        if g:
+            return "buy" if g < 0 else "sell"
+    lab = str(row.get("side") or "").strip().lower()
+    return "buy" if lab.startswith("b") or "cover" in lab else "sell"
+
+
+def _fees(row: dict) -> float:
+    """Every charge on a fill: gross minus net when TradeZero gives both
+    (that includes the regulatory and venue fees its totalFees can leave out),
+    otherwise commission + totalFees."""
+    if row.get("grossProceeds") not in (None, "") and row.get("netProceeds") not in (None, ""):
+        return round(abs(_f(row["grossProceeds"]) - _f(row["netProceeds"])), 4)
+    return round(abs(_f(row.get("commission"))) + abs(_f(row.get("totalFees"))), 4)
 TRANSFER = re.compile(r"deposit|withdraw|transfer|wire|ach|journal", re.I)
 
 
@@ -87,10 +112,14 @@ def _tz_fills(broker, since: date, today: date) -> tuple[list[dict], list[str]]:
             if not r.get("canceled") and str(r.get("securityType") or "Stock") == "Stock"]
     fills = [{"day": _day(r.get("tradeDate")), "time": str(r.get("execTime") or ""),
               "symbol": str(r.get("symbol") or "").upper(),
-              "side": "buy" if str(r.get("side")).lower().startswith("b") else "sell",
+              "side": _side(r, "grossProceeds"),
               "qty": int(round(abs(_f(r.get("qty"))))), "price": _f(r.get("price")),
-              "fees": round(abs(_f(r.get("commission"))) + abs(_f(r.get("totalFees"))), 4),
+              "fees": _fees(r),
               "source": "TradeZero fill history"} for r in rows]
+    labels = sorted({str(r.get("side")) for r in rows})
+    if labels:
+        notes.append(f"TradeZero's fill history labels sides as: {', '.join(labels)} "
+                     f"(read by the sign of the proceeds)")
     fills = [x for x in fills if x["day"] and since <= x["day"] <= today and x["qty"]]
     if not any(x["day"] == today for x in fills):
         todays = [o for o in broker.today_orders() if _f(o.get("executed")) > 0
@@ -98,7 +127,7 @@ def _tz_fills(broker, since: date, today: date) -> tuple[list[dict], list[str]]:
         for o in todays:
             fills.append({"day": today, "time": str(o.get("lastUpdated") or "")[11:19],
                           "symbol": str(o.get("symbol") or "").upper(),
-                          "side": "buy" if str(o.get("side")).lower().startswith("b") else "sell",
+                          "side": _side(o),
                           "qty": int(round(_f(o.get("executed")))), "price": _f(o.get("priceAvg")),
                           "fees": 0.0, "source": "today's order book"})
         if todays:

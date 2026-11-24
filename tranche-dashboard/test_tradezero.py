@@ -925,6 +925,42 @@ class ReconcileTests(unittest.TestCase):
                     "ONLY AT TRADEZERO", "OTHER LEDGER CHARGES", "Monthly data", "Read-only"):
             self.assertIn(bit, text)
 
+    def test_covers_are_buys_whatever_tradezero_calls_them(self):
+        """2026-11-24, live: the fill history's labels for covers were read as sells,
+        so no trip ever closed and nothing matched. The sign of the proceeds decides;
+        fees are gross minus net; single-use and ONB ledger notes are tied to symbols."""
+        fake = FakeTZ(acct_type="Paper")
+        for side, px, gross, net, t in (("SS", 2.44, 2.44, 2.42, "09:48:32"),
+                                        ("BC", 1.89, -1.89, -1.90, "15:55:11")):
+            fake.fill_rows.append({"symbol": "STAK", "securityType": "Stock", "side": side, "qty": 1,
+                                   "price": px, "grossProceeds": gross, "netProceeds": net,
+                                   "commission": 0, "totalFees": 0.0, "tradeDate": f"{self.D}T00:00:00",
+                                   "execTime": t, "canceled": False})
+        for side, px, gross, net, t in (("Short", 2.0, 2.0, 1.98, "10:00:00"),
+                                        ("Cover", 2.1, -2.1, -2.11, "10:30:00")):
+            fake.fill_rows.append({"symbol": "POAS", "securityType": "Stock", "side": side, "qty": 1,
+                                   "price": px, "grossProceeds": gross, "netProceeds": net,
+                                   "tradeDate": f"{self.D}T00:00:00", "execTime": t, "canceled": False})
+        fake.cash = [
+            {"cashType": "Locate Fees", "note": "Single-Use 100 POAS @ 0.0098 per share",
+             "deposit": 0, "withdraw": 0.98, "entryDate": f"{self.D}T00:00:00"},
+            {"cashType": "Locate & Borrow Charge", "note": "ONB 1.00000000 STAK ($-0.11129000) for 11/11",
+             "deposit": 0, "withdraw": 0.36, "entryDate": f"{self.D}T00:00:00"}]
+        self.order("2026-11-11T09:48:31-05:00", "STAK", "sell", 1, 2.44)
+        self.order("2026-11-11T15:55:10-05:00", "STAK", "buy", 1, 1.89)
+        self.order("2026-11-11T09:59:59-05:00", "POAS", "sell", 1, 2.0)
+        self.order("2026-11-11T10:29:59-05:00", "POAS", "buy", 1, 2.1)
+        r = self.run_it(fake)
+        self.assertEqual(r["mismatches"], 0, r["matches"])
+        trips = {x["symbol"]: x for x in r["trips"]}
+        self.assertEqual((trips["STAK"]["gross"], trips["STAK"]["fees"], trips["STAK"]["borrow"]),
+                         (0.55, 0.03, 0.36))
+        self.assertEqual((trips["POAS"]["gross"], trips["POAS"]["fees"], trips["POAS"]["locate"]),
+                         (-0.1, 0.03, 0.98))
+        t = r["totals"]
+        self.assertEqual((t["trips"], t["other_charges"]), (2, 0.0))
+        self.assertTrue(any("BC, Cover, SS, Short" in n for n in r["notes"]), r["notes"])
+
     def test_a_dashboard_fill_tradezero_does_not_show_and_a_price_gap(self):
         fake = FakeTZ(acct_type="Paper")
         self.fill(fake, self.D, "AAA", "Sell", 1, 5.00)
