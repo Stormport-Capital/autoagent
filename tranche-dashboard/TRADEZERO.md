@@ -171,13 +171,16 @@ sudo -u tranche /opt/tranche/venv/bin/python -I tz_reconcile.py                #
 sudo -u tranche /opt/tranche/venv/bin/python -I tz_reconcile.py --since 2026-11-11
 ```
 
-- **How we're doing:** closed round trips, won and lost, gross P&L, commissions
+- **How we're doing:** closed round trips, won and lost after all costs and
+  how many made money before costs, gross P&L, commissions
   and fees, locate fees, overnight borrow, any other ledger charges, the net
   for closed trips and all in (open positions at TradeZero's unrealized P&L),
   and the equity change those explain (the start is the dashboard's first
   equity reading on the start day; transfers are left out). A non-zero
   "unexplained" means a charge or credit TradeZero posted that the report
-  doesn't recognise.
+  doesn't recognise. Then live vs the model's own prices on the same trips,
+  in dollars (entries and exits apart): what the live fills cost or gained
+  against the model's fills.
 - **Do they match:** per day, symbol and side, TradeZero's filled shares and
   average price against the dashboard's own fills. *Only at TradeZero* is a
   trade made outside the bot (TZ1, the app); *only on the dashboard* is a fill
@@ -185,7 +188,10 @@ sudo -u tranche /opt/tranche/venv/bin/python -I tz_reconcile.py --since 2026-11-
   TradeZero's against the sum of the dashboard's fills.
 - **Round trips:** each from flat to flat, with its own fees, the locates and
   borrow charged on that symbol while it was open, the net, and per share how
-  the live fills compare with the model's (positive = live did better).
+  the live fills compare with the model's (positive = live did better). The
+  model trade is the one in the book on the dashboard order that opened the
+  trip, entered closest to that order; a second trade in a symbol on a day is
+  compared with the model's second trade, not its first.
 
 Sources: TradeZero's fill history (price, commission and fees per execution),
 its cash ledger (locate fees, overnight borrow, other charges), its locate

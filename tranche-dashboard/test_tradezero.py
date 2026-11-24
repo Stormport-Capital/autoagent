@@ -961,6 +961,47 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual((t["trips"], t["other_charges"]), (2, 0.0))
         self.assertTrue(any("BC, Cover, SS, Short" in n for n in r["notes"]), r["notes"])
 
+    def test_a_second_trade_on_the_day_is_compared_with_its_own_model_trade(self):
+        """2026-11-24, live: every trip in a symbol on a day was compared with the
+        model's first trade that day (TANH: live in 35.70 'vs' model in 39.99)."""
+        fake = FakeTZ(acct_type="Paper")
+        for side, px, t in (("Sell", 38.24, "10:01:10"), ("Buy", 37.50, "10:46:05"),
+                            ("Sell", 35.70, "11:31:20"), ("Buy", 38.79, "12:16:02")):
+            self.fill(fake, self.D, "TANH", side, 1, px, 0.01, t)
+        self.order("2026-11-11T10:01:09-05:00", "TANH", "sell", 1, 38.24)
+        self.order("2026-11-11T10:46:04-05:00", "TANH", "buy", 1, 37.50)
+        self.order("2026-11-11T11:31:19-05:00", "TANH", "sell", 1, 35.70)
+        self.order("2026-11-11T12:16:01-05:00", "TANH", "buy", 1, 38.79)
+        Engine(self.book, ScriptedProvider([]), 15).add_symbols("TANH", "short_only", 1.0, datetime(2026, 11, 11, 9, tzinfo=ET))
+        sid = self.book.q("SELECT id FROM symbols WHERE symbol='TANH'")[0]["id"]
+        for entry_t, entry_px, exit_t, exit_px in (("10:00", 39.99, "10:45", 38.81),
+                                                   ("11:30", 35.90, "12:15", 38.70)):
+            self.book.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+                stop_price, risk_dollars, fee_through, status, exit_time, exit_price, exit_reason)
+                VALUES (?, 'TANH', 'EMA5_10', 'short', 30, ?, ?, 41, 100, '2026-11-11', 'closed', ?, ?,
+                '5/10 EMA crossed up')""", (sid, f"{self.D}T{entry_t}:00-05:00", entry_px,
+                                            f"{self.D}T{exit_t}:00-05:00", exit_px))
+        r = self.run_it(fake)
+        first, second = [x for x in r["trips"] if x["symbol"] == "TANH"]
+        self.assertEqual((first["model"]["entry_price"], second["model"]["entry_price"]), (39.99, 35.90))
+        self.assertEqual(second["entry_vs_model"], round(35.70 - 35.90, 4))
+        self.assertEqual(second["exit_vs_model"], round(38.70 - 38.79, 4))
+        t = r["totals"]
+        self.assertEqual((t["gross_wins"], t["vs_model_trips"]), (1, 2))
+        self.assertEqual((t["vs_model_entry"], t["vs_model_exit"]),
+                         (round(38.24 - 39.99 + 35.70 - 35.90, 2), round(38.81 - 37.50 + 38.70 - 38.79, 2)))
+        text = tz_reconcile.format_report(r)
+        self.assertIn("1 made money before costs", text)
+        self.assertIn("live vs the model's prices on the same 2 trips", text)
+        self.assertIn("out 38.8100", text)                       # 4 decimals, not 38.809999...
+
+    def test_an_open_trip_prints_no_exit_price(self):
+        fake = FakeTZ(acct_type="Paper", pos={"GP": -1})
+        self.fill(fake, self.D, "GP", "Sell", 1, 2.69)
+        self.order("2026-11-11T10:00:00-05:00", "GP", "sell", 1, 2.69)
+        text = tz_reconcile.format_report(self.run_it(fake))
+        self.assertIn("in 2.6900  out -  gross -", text)
+
     def test_a_dashboard_fill_tradezero_does_not_show_and_a_price_gap(self):
         fake = FakeTZ(acct_type="Paper")
         self.fill(fake, self.D, "AAA", "Sell", 1, 5.00)
