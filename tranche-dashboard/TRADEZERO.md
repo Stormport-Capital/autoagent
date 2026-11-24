@@ -186,6 +186,12 @@ sudo -u tranche /opt/tranche/venv/bin/python -I tz_reconcile.py --since 2026-11-
   trade made outside the bot (TZ1, the app); *only on the dashboard* is a fill
   TradeZero doesn't show; a price more than 0.5% apart is flagged. Positions:
   TradeZero's against the sum of the dashboard's fills.
+- **By book:** each book's share of the closed trips (a trip two books shared
+  is split by shares): won and lost, up before costs, gross, costs, net, and on
+  trips whose model trade has closed, TradeZero's gross against what the
+  model's own prices made on the same shares. The tab you are on is first.
+  Each tab's *Broker orders* lists that book's TradeZero orders, with seconds
+  from the bar close to sent and to filled.
 - **Round trips:** each from flat to flat, with its own fees, the locates and
   borrow charged on that symbol while it was open, the net, and per share how
   the live fills compare with the model's (positive = live did better). The

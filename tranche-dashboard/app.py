@@ -2,9 +2,8 @@
 
 Four independent books run side by side with identical rules: "1h" on hourly
 bars, "15m" on 15-minute bars, "5m" on 5-minute bars and "1d" on daily bars
-(model and paper only; it can't trade live). Each has its own
-database, settings, capital, performance and (optionally) its own Alpaca paper
-account.
+(model only; it can't trade live). Each has its own database, settings,
+capital and performance.
 
     python app.py                      # live prices from Yahoo, http://127.0.0.1:8050
     python app.py --provider polygon   # Polygon data (POLYGON_API_KEY), recommended
@@ -12,8 +11,7 @@ account.
     python app.py --demo               # synthetic prices on a fast simulated clock
 
 The model is simulated. Orders go only to a linked broker account, only when
-switched on in the dashboard: an Alpaca PAPER account per book (broker.py /
-SETUP.md), and one live-venue account, paper or live, shared by all books,
+switched on in the dashboard: one live-venue account, paper or live, shared by all books,
 trading only the symbols and tranches marked Live, with a share cap, a daily
 loss limit and a kill switch: Interactive Brokers (ibkr.py / IBKR.md) or
 TradeZero (tradezero.py / TRADEZERO.md), one at a time (LIVE_BROKER).
@@ -632,6 +630,7 @@ def broker_state(book: Book) -> dict:
     return {"configured": True, "endpoint": "paper-api.alpaca.markets", **sched.sync.status()}
 
 
+PAPER_OFF = "Alpaca paper is switched off: TradeZero's own results are the record"
 LIVE_NOTE = "set IBKR_ACCOUNT (IBKR.md) or TZ_ACCOUNT (TRADEZERO.md) in .env"
 
 
@@ -1074,7 +1073,10 @@ def main() -> None:
     clock = SimClock(args.demo_days, delay) if args.demo else RealClock()
     provider = CachedProvider(make_provider(
         args.provider, demo_origin=clock.now().date() - timedelta(days=60)))
-    papers = link_papers(args.demo)
+    # Alpaca paper is off (Dean, 2026-11-24): TradeZero is the venue and its own
+    # results are the performance record. link_papers() stays for its tests and
+    # a deliberate return; nothing links a paper account at startup.
+    papers = {k: (None, PAPER_OFF) for k, *_ in BOOKS}
     ib, live_note = link_live(args.demo)
     live = None
     if ib is not None:
@@ -1101,9 +1103,7 @@ def main() -> None:
 
     if not args.demo:
         print("Checking connections...")
-        for line in connection_check(
-                provider, [(b.label, papers[k][0], papers[k][1]) for k, b in books.items()],
-                clock.now()):
+        for line in connection_check(provider, [], clock.now()):
             print("  " + line)
         print("  " + live_check(live, live_note))
     demo = None
@@ -1126,10 +1126,8 @@ def main() -> None:
             print(f"  backup: FAILED - {e}")
         backups.start()
     server.RequestHandlerClass = make_handler(books, provider.name, demo, backups, live)
-    linked = ", ".join(f"{b.label} {'linked' if b.sched.sync else 'not linked'}"
-                       for b in books.values())
     print(f"Tranche dashboard on {url}  (provider={provider.name}"
-          f"{', DEMO clock' if args.demo else ''}; alpaca paper: {linked}; "
+          f"{', DEMO clock' if args.demo else ''}; alpaca paper: off; "
           f"live: {live.broker.venue if live else 'not linked'})")
     if args.open:
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()

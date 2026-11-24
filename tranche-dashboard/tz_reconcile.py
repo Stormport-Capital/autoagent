@@ -201,45 +201,109 @@ def _round_trips(fills: list[dict]) -> tuple[list[dict], dict[str, int]]:
     return trips, dict(pos)
 
 
-def _dash_openers(dash_orders: list[dict]) -> dict[str, list[dict]]:
-    """Per symbol, in order, the dashboard's orders that opened a position from
-    flat: the k-th is the order behind TradeZero's k-th trip in that symbol
-    (the fills match, so the two sequences line up; no clock needed)."""
+def _dash_trips(dash_orders: list[dict]) -> dict[str, list[list[dict]]]:
+    """Per symbol, in order, the dashboard's orders grouped flat to flat: the
+    k-th group is the orders behind TradeZero's k-th trip in that symbol (the
+    fills match, so the two sequences line up; no clock needed)."""
     pos, out = defaultdict(int), defaultdict(list)
     for o in dash_orders:
-        q = int(round(_f(o["filled_qty"])))
         if pos[o["symbol"]] == 0:
-            out[o["symbol"]].append(o)
+            out[o["symbol"]].append([])
+        out[o["symbol"]][-1].append(o)
+        q = int(round(_f(o["filled_qty"])))
         pos[o["symbol"]] += q if o["side"] == "buy" else -q
     return out
 
 
-def _model_for(trip: dict, opener: dict | None, books: dict, used: set) -> dict | None:
-    """The model's 5/10 tranche behind a live trip: in the book(s) recorded on
-    the dashboard order that opened it, same symbol and side, the tranche
-    entered closest to that order (within 20 minutes) and not already matched
-    to another trip. Before 2026-11-24 it took the day's first tranche, so a
-    second trade in a symbol on a day was compared with the first."""
-    if (opener is None or _day(opener["ts"]) != trip["opened"]
-            or opener["side"] != ("sell" if trip["side"] == "short" else "buy")):
+def _book_keys(order: dict) -> list[str]:
+    return [k for k in (order.get("book") or "").split(",") if k]
+
+
+def _model_for(trip: dict, order: dict, key: str, books: dict, used: set) -> dict | None:
+    """The model's 5/10 tranche behind a live trip in one book: same symbol and
+    side, entered closest to the dashboard order that opened that book's part
+    of the trip (within 20 minutes), not already matched to another trip.
+    Before 2026-11-24 it took the day's first tranche, so a second trade in a
+    symbol on a day was compared with the first."""
+    st = books.get(key)
+    if st is None:
         return None
-    when = datetime.fromisoformat(opener["ts"])
+    when = datetime.fromisoformat(order["ts"])
     best = None
-    for key in (opener.get("book") or "").split(","):
-        st = books.get(key)
-        if st is None:
-            continue
-        for r in st.q("SELECT id, entry_time, entry_price, exit_price, exit_reason, status, stop_price "
-                      "FROM tranches WHERE symbol=? AND sleeve='EMA5_10' AND side=? "
-                      "ORDER BY entry_time", (trip["symbol"], trip["side"])):
-            gap = abs((datetime.fromisoformat(r["entry_time"]) - when).total_seconds())
-            if gap <= 1200 and (key, r["id"]) not in used and (best is None or gap < best[0]):
-                best = (gap, key, r)
+    for r in st.q("SELECT id, entry_time, entry_price, exit_price, exit_reason, status, stop_price "
+                  "FROM tranches WHERE symbol=? AND sleeve='EMA5_10' AND side=? "
+                  "ORDER BY entry_time", (trip["symbol"], trip["side"])):
+        gap = abs((datetime.fromisoformat(r["entry_time"]) - when).total_seconds())
+        if gap <= 1200 and (key, r["id"]) not in used and (best is None or gap < best[0]):
+            best = (gap, r)
     if best is None:
         return None
-    _, key, r = best
-    used.add((key, r["id"]))
-    return {"book": key, **{k: v for k, v in dict(r).items() if k != "id"}}
+    used.add((key, best[1]["id"]))
+    return {"book": key, **{k: v for k, v in dict(best[1]).items() if k != "id"}}
+
+
+def _attribute(trip: dict, orders: list[dict] | None, books: dict, used: set) -> None:
+    """Which books a live trip belongs to and the model trade behind each:
+    trip["book_shares"] {book: shares it opened} (an order serving two books
+    is split evenly between them) and trip["models"] {book: model tranche}."""
+    trip["book_shares"], trip["models"] = {}, {}
+    opening = "sell" if trip["side"] == "short" else "buy"
+    if (not orders or _day(orders[0]["ts"]) != trip["opened"] or orders[0]["side"] != opening):
+        return
+    for o in orders:
+        keys = _book_keys(o)
+        if o["side"] != opening or not keys:
+            continue
+        q = _f(o["filled_qty"]) / len(keys)
+        for key in keys:
+            if key not in trip["models"]:
+                trip["models"][key] = _model_for(trip, o, key, books, used)
+            trip["book_shares"][key] = round(trip["book_shares"].get(key, 0) + q, 4)
+
+
+def _split_by_book(t: dict) -> None:
+    """trip["by_book"]: each book's share of a trip (its shares over the trip's
+    opening shares) of TradeZero's gross, costs and net, and what the model's
+    own prices made on those shares (None until the model trade has closed)."""
+    total = sum(t["book_shares"].values())
+    sign = 1 if t["side"] == "short" else -1
+    t["by_book"] = {}
+    for key, sh in t["book_shares"].items():
+        frac = sh / total if total else 0.0
+        m = t["models"].get(key)
+        mg = (round(sign * (m["entry_price"] - m["exit_price"]) * sh, 4)
+              if t["closed"] and m and m.get("exit_price") is not None else None)
+        t["by_book"][key] = {
+            "shares": sh, "frac": round(frac, 4), "model": m,
+            "gross": round(t["gross"] * frac, 4) if t["gross"] is not None else None,
+            "fees": round(t["fees"] * frac, 4),
+            "locate_borrow": round((t["locate"] + t["borrow"]) * frac, 4),
+            "net": round(t["net"] * frac, 4) if t["net"] is not None else None,
+            "model_gross": mg}
+
+
+def _book_totals(closed: list[dict]) -> dict:
+    """Per book, its share of the closed trips: TradeZero's results, and on the
+    trips with a closed model trade, TradeZero's gross against the model's."""
+    out = {}
+    for t in closed:
+        for key, b in t.get("by_book", {}).items():
+            o = out.setdefault(key, {"trips": 0, "wins": 0, "gross_wins": 0, "gross": 0.0,
+                                     "fees": 0.0, "locate_borrow": 0.0, "net": 0.0,
+                                     "compared": 0, "live_gross_compared": 0.0, "model_gross": 0.0})
+            o["trips"] += 1
+            o["wins"] += b["net"] > 0
+            o["gross_wins"] += b["gross"] > 0
+            for k in ("gross", "fees", "locate_borrow", "net"):
+                o[k] += b[k]
+            if b["model_gross"] is not None:
+                o["compared"] += 1
+                o["live_gross_compared"] += b["gross"]
+                o["model_gross"] += b["model_gross"]
+    for o in out.values():
+        for k in ("gross", "fees", "locate_borrow", "net", "live_gross_compared", "model_gross"):
+            o[k] = round(o[k], 2)
+    return out
 
 
 def reconcile(broker, live_store, books: dict | None = None, since: date | None = None,
@@ -288,7 +352,7 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
 
     # ---- round trips with their charges
     trips, tz_pos = _round_trips(fills)
-    used, models_used, openers, nth = set(), set(), _dash_openers(dash), defaultdict(int)
+    used, models_used, dash_trips, nth = set(), set(), _dash_trips(dash), defaultdict(int)
     for t in trips:
         last = t["closed"] or today
         mine = [i for i, c in enumerate(charges) if i not in used and c["symbol"] == t["symbol"]
@@ -300,14 +364,16 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
                     if t["gross"] is not None else None)
         k = nth[t["symbol"]]
         nth[t["symbol"]] += 1
-        mine_open = openers.get(t["symbol"], [])
-        m = _model_for(t, mine_open[k] if k < len(mine_open) else None, books or {}, models_used)
+        groups = dash_trips.get(t["symbol"], [])
+        _attribute(t, groups[k] if k < len(groups) else None, books or {}, models_used)
+        m = next((x for x in t["models"].values() if x), None)  # the first book's, for the CLI
         t["model"] = m
         if m:
             sign = 1 if t["side"] == "short" else -1  # short: a higher entry is better
             t["entry_vs_model"] = round(sign * (t["entry"] - m["entry_price"]), 4) if t["entry"] else None
             t["exit_vs_model"] = (round(sign * (m["exit_price"] - t["exit"]), 4)
                                   if t["exit"] and m.get("exit_price") else None)
+        _split_by_book(t)
     other = [c for i, c in enumerate(charges) if i not in used and c["kind"] != "transfer"]
     transfers = [c for c in charges if c["kind"] == "transfer"]
 
@@ -338,6 +404,7 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
                                                  for t in closed), 2)
     tot["net_all"] = round(tot["gross"] - tot["fees"] - tot["locate"] - tot["borrow"]
                            - tot["other_charges"] + unreal, 2)
+    by_book = _book_totals(closed)
     start_eq = None
     rows = live_store.q("SELECT ts, equity FROM broker_equity ORDER BY ts")
     for r in rows:
@@ -361,7 +428,7 @@ def reconcile(broker, live_store, books: dict | None = None, since: date | None 
         "since": since.isoformat(), "today": today.isoformat(), "account": broker.cfg.account,
         "equity": equity, "start_equity": start_eq, "equity_change": change,
         "unexplained": round(change - tot["net_all"], 2) if change is not None else None,
-        "totals": tot, "matches": matches,
+        "totals": tot, "by_book": by_book, "matches": matches,
         "mismatches": sum(1 for m in matches if m["status"] != "MATCH"),
         "trips": [{k: (v.isoformat() if isinstance(v, date) else v) for k, v in t.items() if k != "fills"}
                   for t in trips],

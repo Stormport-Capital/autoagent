@@ -995,6 +995,50 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("live vs the model's prices on the same 2 trips", text)
         self.assertIn("out 38.8100", text)                       # 4 decimals, not 38.809999...
 
+    def test_each_book_gets_its_share_of_a_trip_and_its_own_model_trade(self):
+        """GP short in two books: the 5-min book opens 1 share, the 15-min book
+        adds 1 later, both cover together. Each book gets half the trip and is
+        compared with its own model trade; a 5-min-only trip goes to 5-min alone."""
+        fake = FakeTZ(acct_type="Paper")
+        for side, qty, px, t in (("Sell", 1, 2.70, "10:01:00"), ("Sell", 1, 2.60, "10:16:00"),
+                                 ("Buy", 2, 2.50, "11:01:00"),
+                                 ("Sell", 1, 3.00, "13:01:00"), ("Buy", 1, 3.10, "13:31:00")):
+            self.fill(fake, self.D, "GP", side, qty, px, 0.01, t)
+        self.order("2026-11-11T10:00:59-05:00", "GP", "sell", 1, 2.70, book="5m")
+        self.order("2026-11-11T10:15:59-05:00", "GP", "sell", 1, 2.60, book="15m")
+        self.order("2026-11-11T11:00:59-05:00", "GP", "buy", 2, 2.50, book="5m,15m")
+        self.order("2026-11-11T13:00:59-05:00", "GP", "sell", 1, 3.00, book="5m")
+        self.order("2026-11-11T13:30:59-05:00", "GP", "buy", 1, 3.10, book="5m")
+        five = Store(f"{self.dir.name}/5m.db")
+        try:
+            for st, rows in ((five, (("10:00", 2.72, "11:00", 2.52), ("13:00", 3.02, "13:30", 3.08))),
+                             (self.book, (("10:15", 2.61, "11:00", 2.49),))):
+                Engine(st, ScriptedProvider([]), 5).add_symbols("GP", "short_only", 1.0, datetime(2026, 11, 11, 9, tzinfo=ET))
+                sid = st.q("SELECT id FROM symbols WHERE symbol='GP'")[0]["id"]
+                for et, ep, xt, xp in rows:
+                    st.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+                        stop_price, risk_dollars, fee_through, status, exit_time, exit_price, exit_reason)
+                        VALUES (?, 'GP', 'EMA5_10', 'short', 500, ?, ?, 3.5, 100, '2026-11-11', 'closed', ?, ?,
+                        '5/10 EMA crossed up')""", (sid, f"{self.D}T{et}:00-05:00", ep, f"{self.D}T{xt}:00-05:00", xp))
+            r = tz_reconcile.reconcile(mk(fake), self.live, {"5m": five, "15m": self.book},
+                                       date(2026, 11, 11), date(2026, 11, 12))
+        finally:
+            five.db.close()
+        first, second = [x for x in r["trips"] if x["symbol"] == "GP"]
+        self.assertEqual(first["book_shares"], {"5m": 1.0, "15m": 1.0})
+        self.assertEqual((first["by_book"]["5m"]["model"]["entry_price"],
+                          first["by_book"]["15m"]["model"]["entry_price"]), (2.72, 2.61))
+        self.assertEqual(first["by_book"]["5m"]["gross"], round((2.70 + 2.60 - 5.00) / 2, 4))
+        self.assertEqual(first["by_book"]["15m"]["model_gross"], round(2.61 - 2.49, 4))
+        self.assertEqual(second["book_shares"], {"5m": 1.0})
+        self.assertEqual(second["by_book"]["5m"]["model"]["entry_price"], 3.02)
+        b5, b15 = r["by_book"]["5m"], r["by_book"]["15m"]
+        self.assertEqual((b5["trips"], b15["trips"]), (2, 1))
+        self.assertEqual(b5["gross"], round(0.15 - 0.10, 2))           # half of +0.30, then -0.10
+        self.assertEqual(b5["model_gross"], round((2.72 - 2.52) + (3.02 - 3.08), 2))
+        self.assertEqual((b5["gross_wins"], b15["gross_wins"]), (1, 1))
+        self.assertAlmostEqual(b5["net"] + b15["net"], r["totals"]["net_closed"], delta=0.011)  # split, not doubled
+
     def test_an_open_trip_prints_no_exit_price(self):
         fake = FakeTZ(acct_type="Paper", pos={"GP": -1})
         self.fill(fake, self.D, "GP", "Sell", 1, 2.69)
