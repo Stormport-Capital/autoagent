@@ -26,10 +26,15 @@ And reports:
 from __future__ import annotations
 
 import re
+import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
-from indicators import ET
+# `python -I tz_reconcile.py` (the documented way to run it) leaves the script's
+# own folder off sys.path, so its neighbours must be put there before importing
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from indicators import ET  # noqa: E402
 
 PRICE_TOL = 0.005        # 0.5%: a fill price this far from TradeZero's is a mismatch
 LOCATE_NOTE = re.compile(r"locate\s+(?:credit\s+)?(\d+)\s+([A-Z][A-Z0-9.\-]*)\s+@\s*\$?([\d.]+)", re.I)
@@ -372,8 +377,6 @@ def format_report(r: dict) -> str:
 
 def main(argv=None) -> None:
     import argparse
-    import sys
-    from pathlib import Path
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--since", help="first day, YYYY-MM-DD (default: the first day the dashboard "
                                     "traded at TradeZero)")
