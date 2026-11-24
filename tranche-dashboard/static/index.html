@@ -66,6 +66,7 @@ th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: rig
 th { color: var(--muted); font-weight: 500; font-size: 12px; }
 th:first-child, td:first-child, td.l, th.l { text-align: left; }
 tbody tr:hover { background: var(--chip); }
+tbody tr.hl td { background: var(--chip); }
 .pos { color: var(--good); } .neg { color: var(--bad); }
 .pill { display: inline-block; border-radius: 10px; padding: 1px 7px; font-size: 11.5px;
   background: var(--chip); color: var(--ink-2); margin-right: 3px; }
@@ -206,11 +207,6 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
         <h2><span id="lvTitle">Live account</span> <small id="lvState"></small></h2>
         <div id="lvBody"></div>
       </section>
-
-      <section class="card">
-        <h2><span id="bkTitle">Alpaca paper account</span> <small id="bkState"></small></h2>
-        <div id="bkBody"></div>
-      </section>
     </div>
 
     <div style="display:grid; gap:16px; min-width:0">
@@ -299,7 +295,7 @@ function renderBooks(S) {
   $("#bookTabs").innerHTML = S.books.map(b => {
     const r = b.equity / b.start - 1;
     return `<button data-book="${b.key}" class="${b.key === BOOK ? "on" : ""}">${esc(b.label)} book
-      <small>${usd(b.equity)} · ${pct(r, 2)}${b.sync_on ? " · paper on" : ""}</small></button>`;
+      <small>${usd(b.equity)} · ${pct(r, 2)}</small></button>`;
   }).join("");
   document.title = `Tranche Dashboard - ${S.book.label}`;
 }
@@ -308,7 +304,7 @@ function render() {
   const S = STATE, m = S.summary, o = m.overall;
   renderBooks(S);
   $("#meta").innerHTML = [
-    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : [S.settings.broker_sync_enabled ? "Alpaca PAPER orders" : "", S.live.configured && S.live.enabled ? (S.live.live ? `<span class="pill short">LIVE ${esc(LVN())} orders (real money)</span>` : `${esc(LVN())} paper orders`) : ""].filter(Boolean).join(" + ") || "Model only · no orders sent"}</span>`,
+    `<span>${S.demo ? '<span class="pill warn">DEMO — synthetic prices, simulated clock</span>' : [S.live.configured && S.live.enabled ? (S.live.live ? `<span class="pill short">LIVE ${esc(LVN())} orders (real money)</span>` : `${esc(LVN())} paper orders`) : ""].filter(Boolean).join(" + ") || "Model only · no orders sent"}</span>`,
     `<span>Data: ${esc(S.provider)}</span>`,
     `<span>${S.demo ? "Sim time" : "Now"}: ${fmtT(S.now)} · market ${S.market_open ? "open" : "closed"}</span>`,
     `<span>Last check: ${fmtT(S.last_tick)}</span>`,
@@ -334,10 +330,9 @@ function render() {
 
   renderSettings(S.settings);
   renderWatch(S);
-  renderBroker(S.broker, {p: "bk", on: S.settings.broker_sync_enabled, toggle: bk("/api/settings"), key: "broker_sync_enabled", sync: bk("/api/broker/sync")});
   renderLiveAlert(S.live || {});
   renderBroker(S.live, {p: "lv", on: S.live.enabled, toggle: "/api/live/settings", key: "enabled", sync: "/api/live/sync", kill: "/api/live/kill", shared: true});
-  renderChart(m.curve, m.starting_capital, S.broker.curve || []);
+  renderChart(m.curve, m.starting_capital);
   renderPerf(m);
   renderTab();
 }
@@ -396,12 +391,11 @@ function renderWatch(S) {
   $("#watch").innerHTML = h + "</tbody>";
 }
 
-function renderChart(curve, start, paper) {
+function renderChart(curve, start) {
   const svg = $("#chart svg"), tip = $("#chart .tip");
   const W = svg.clientWidth || 600, H = 220, P = {l: 64, r: 12, t: 10, b: 24};
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const series = [{name: "Model", color: "var(--series)", pts: curve}];
-  if (paper.length) series.push({name: "Alpaca paper", color: "var(--series-2)", pts: paper});
   $("#legend").innerHTML = series.length > 1
     ? series.map(se => `<span><i style="background:${se.color}"></i>${se.name}</span>`).join("") : "";
   const all = series.flatMap(se => se.pts);
@@ -569,9 +563,16 @@ function reconHtml() {
       <div><span>Net, all in (incl. open)</span><b class="${cls(t.net_all)}">${m2(t.net_all)}</b></div>
       <div><span>Trips (won / lost)</span>${t.trips} (${t.wins} / ${t.losses})${t.gross_wins != null ? ` <small>· ${t.gross_wins} up before costs</small>` : ""}</div>
       <div><span>Do they match</span>${r.mismatches ? `<b class="neg">${r.mismatches} difference${r.mismatches > 1 ? "s" : ""}</b>` : "<b>all match</b>"}</div></div>
-    <div class="hint" style="margin:2px 0">Gross ${m2(t.gross)} · commissions &amp; fees ${m2(-t.fees)} · locates ${m2(-t.locate)} · overnight borrow ${m2(-t.borrow)}${t.other_charges ? ` · other charges ${m2(-t.other_charges)}` : ""} · open ${m2(t.unrealized)}${r.start_equity != null ? `<br>Equity ${usd2(r.start_equity)} → ${usd2(r.equity)}: change ${m2(r.equity_change)}, explained ${m2(t.net_all)}, unexplained <b class="${Math.abs(r.unexplained) > 0.5 ? "neg" : ""}">${m2(r.unexplained)}</b>` : ""}${t.vs_model_trips ? `<br>Live vs the model's prices on the same ${t.vs_model_trips} trips: <b class="${cls(t.vs_model_entry + t.vs_model_exit)}">${m2(t.vs_model_entry + t.vs_model_exit)}</b> (entries ${m2(t.vs_model_entry)}, exits ${m2(t.vs_model_exit)}; negative = live filled worse)` : ""}</div>`;
-  if (r.trips.length) h += `<div class="tablewrap"><table><thead><tr><th class="l">Opened</th><th class="l">Symbol</th><th>Qty</th><th>In</th><th>Out</th><th>Gross</th><th>Fees</th><th>Locate</th><th>Net</th><th title="Per share, live vs the model's fill: positive = live did better">vs model in / out</th></tr></thead><tbody>` +
-    r.trips.map(x => `<tr><td class="l">${esc(x.opened)}</td><td class="l sym">${esc(x.symbol)} <small>${esc(x.side)}</small></td><td>${x.qty}</td><td>${x.entry == null ? "—" : num(x.entry, 4)}</td><td>${x.exit == null ? "open" : num(x.exit, 4)}</td><td class="${cls(x.gross)}">${m2(x.gross)}</td><td>${m2(-x.fees)}</td><td>${m2(-x.locate - x.borrow)}</td><td class="${cls(x.net)}"><b>${m2(x.net)}</b></td><td>${x.model ? `${x.entry_vs_model == null ? "—" : num(x.entry_vs_model, 4)} / ${x.exit_vs_model == null ? "—" : num(x.exit_vs_model, 4)}` : "—"}</td></tr>`).join("") + `</tbody></table></div>`;
+    <div class="hint" style="margin:2px 0">Gross ${m2(t.gross)} · commissions &amp; fees ${m2(-t.fees)} · locates ${m2(-t.locate)} · overnight borrow ${m2(-t.borrow)}${t.other_charges ? ` · other charges ${m2(-t.other_charges)}` : ""} · open ${m2(t.unrealized)}${r.start_equity != null ? `<br>Equity ${usd2(r.start_equity)} → ${usd2(r.equity)}: change ${m2(r.equity_change)}, explained ${m2(t.net_all)}, unexplained <b class="${Math.abs(r.unexplained) > 0.5 ? "neg" : ""}">${m2(r.unexplained)}</b>` : ""}${t.vs_model_trips ? `<br>Live vs the model's prices on the same ${t.vs_model_trips} trips: <b class="${cls(t.vs_model_entry + t.vs_model_exit)}" style="white-space:nowrap">${m2(t.vs_model_entry + t.vs_model_exit)}</b> (entries ${m2(t.vs_model_entry)}, exits ${m2(t.vs_model_exit)}; negative = live filled worse)` : ""}</div>`;
+  const bl = k => ((STATE.books || []).find(b => b.key === k) || {label: k}).label;
+  const keys = Object.keys(r.by_book || {}).sort((a, b) => (a === BOOK ? -1 : b === BOOK ? 1 : 0));
+  const nw = (v, c = "") => `<b class="${c}" style="white-space:nowrap">${m2(v)}</b>`;
+  if (keys.length) h += `<div style="margin-top:6px">` + keys.map(k => { const b = r.by_book[k]; return `<div class="hint" style="margin:0 0 6px;padding:6px 8px;border-radius:6px;${k === BOOK ? "background:var(--chip)" : ""}">
+      <b>${esc(bl(k))}</b>${k === BOOK ? " (this tab)" : ""}: net ${nw(b.net, cls(b.net))} on ${b.trips} trip${b.trips === 1 ? "" : "s"} (${b.wins} won after costs, ${b.gross_wins} up before costs)<br>
+      gross ${nw(b.gross, cls(b.gross))} · costs ${nw(-(b.fees + b.locate_borrow))}${b.compared ? `<br>same ${b.compared} trip${b.compared === 1 ? "" : "s"}: TradeZero ${nw(b.live_gross_compared, cls(b.live_gross_compared))} vs the model's prices ${nw(b.model_gross, cls(b.model_gross))}, before costs` : ""}</div>`; }).join("") +
+    `<div class="hint" style="margin:0 0 4px">A trip two books shared is split between them by shares.</div></div>`;
+  if (r.trips.length) h += `<div class="tablewrap"><table><thead><tr><th class="l">Opened</th><th class="l">Book</th><th class="l">Symbol</th><th>Qty</th><th>In</th><th>Out</th><th>Gross</th><th>Fees</th><th>Locate</th><th>Net</th><th title="Per share, live vs the model's fill: positive = live did better">vs model in / out</th></tr></thead><tbody>` +
+    r.trips.map(x => `<tr><td class="l">${esc(x.opened)}</td><td class="l">${Object.keys(x.book_shares || {}).map(k => esc(bl(k))).join(", ") || "—"}</td><td class="l sym">${esc(x.symbol)} <small>${esc(x.side)}</small></td><td>${x.qty}</td><td>${x.entry == null ? "—" : num(x.entry, 4)}</td><td>${x.exit == null ? "open" : num(x.exit, 4)}</td><td class="${cls(x.gross)}">${m2(x.gross)}</td><td>${m2(-x.fees)}</td><td>${m2(-x.locate - x.borrow)}</td><td class="${cls(x.net)}"><b>${m2(x.net)}</b></td><td>${x.model ? `${x.entry_vs_model == null ? "—" : num(x.entry_vs_model, 4)} / ${x.exit_vs_model == null ? "—" : num(x.exit_vs_model, 4)}` : "—"}</td></tr>`).join("") + `</tbody></table></div>`;
   const bad = r.matches.filter(x => x.status !== "MATCH"), badPos = r.positions.filter(p => !p.match);
   if (bad.length || badPos.length) h += `<div class="msg err">${bad.map(x => `${esc(x.day)} ${esc(x.symbol)} ${esc(x.side)}: TradeZero ${x.tz_qty} @ ${x.tz_price == null ? "—" : num(x.tz_price, 4)}, dashboard ${x.dash_qty} @ ${x.dash_price == null ? "—" : num(x.dash_price, 4)} · ${esc(x.status)}`).concat(badPos.map(p => `${esc(p.symbol)} position: TradeZero ${p.tradezero}, dashboard's fills ${p.dashboard_fills}`)).join("<br>")}</div>`;
   if (r.other_charges.length) h += `<div class="hint">Other charges: ${r.other_charges.map(c => `${esc(c.day)} ${esc(c.type)} ${esc(c.note)} ${m2(c.amount)}`).join(" · ")}</div>`;
@@ -664,20 +665,27 @@ function filterSummary(all, shown) {
 
 const sh = (k, label, cl = "") => `<th class="sort ${cl}" data-sort="${k}" title="Sort">${label}${TSORT.k === k ? (TSORT.dir > 0 ? " ▲" : " ▼") : ""}</th>`;
 
+// the Broker orders tab: this book's orders at the live venue (an order serving
+// several books lists them all, e.g. "5m,15m")
+function bookOrders() {
+  const L = STATE.live || {};
+  return (L.orders || []).filter(o => (o.book || "").split(",").includes(BOOK));
+}
+
 function renderTab() {
   $("#exportBar").hidden = TAB !== "closed";
   const m = STATE.summary, L = STATE.sleeves;
   document.querySelectorAll(".tabs button[data-tab]").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB));
   const all = TAB === "open" ? m.open : TAB === "closed" ? m.closed
     : TAB === "symbols" ? Object.entries(m.by_symbol).map(([k, st]) => ({...st, symbol: k}))
-    : TAB === "orders" ? ((STATE.broker && STATE.broker.orders) || []).map(o => ({...o, side: o.side}))
+    : TAB === "orders" ? bookOrders()
     : STATE.events;
   renderFilterBar(all);
   const rows = applyFilters(all);
   filterSummary(all, rows);
   if (TAB === "closed") exportLink();
   const none = {open: "No open positions.", closed: "No closed trades yet.", symbols: "No closed trades yet.",
-    orders: "No broker orders yet.", log: "No events yet."}[TAB];
+    orders: `No ${STATE.live && STATE.live.configured ? esc(LVN()) + " " : "broker "}orders from this book yet.`, log: "No events yet."}[TAB];
   if (!all.length) return $("#tabBody").innerHTML = `<div class="empty">${none}</div>`;
   if (!rows.length) return $("#tabBody").innerHTML = `<div class="empty">Nothing matches these filters.</div>`;
   let h = "";
@@ -698,10 +706,10 @@ function renderTab() {
     h = `<table><thead><tr>${sh("symbol", "Symbol", "l")}${sh("trades", "Trades")}${sh("win_rate", "Win %")}${sh("pnl", "Net P&amp;L")}<th>Avg win</th><th>Avg loss</th>${sh("profit_factor", "PF")}${sh("avg_r", "Avg R")}<th>Borrow</th></tr></thead><tbody>`
       + rows.map(st => statRow(`<span class="sym">${esc(st.symbol)}</span>`, st)).join("");
   } else if (TAB === "orders") {
-    h = `<table><thead><tr>${sh("ts", "Sent", "l")}${sh("symbol", "Symbol", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}${sh("status", "Status", "l")}<th>Filled</th><th>Avg price</th><th class="l">Why</th></tr></thead><tbody>`;
+    h = `<table><thead><tr>${sh("ts", "Sent", "l")}${sh("symbol", "Symbol", "l")}${sh("side", "Side", "l")}${sh("qty", "Qty")}${sh("status", "Status", "l")}<th>Filled</th><th>Avg price</th><th title="Seconds from the bar close to the order leaving">Bar→sent</th><th title="Seconds from the bar close to the fill">Bar→fill</th><th class="l">Why</th></tr></thead><tbody>`;
     for (const o of rows) h += `<tr><td class="l">${fmtT(o.ts)}</td><td class="sym">${esc(o.symbol)}</td><td class="l">${o.side}</td><td>${o.qty}</td>
       <td class="l"><span class="pill ${o.status === "filled" ? "long" : o.status === "rejected" ? "short" : "warn"}">${esc(o.status)}</span></td>
-      <td>${o.filled_qty ?? "—"}</td><td>${num(o.filled_avg_price)}</td><td class="l" style="white-space:normal">${esc(o.message || o.reason)}</td></tr>`;
+      <td>${o.filled_qty ?? "—"}</td><td>${num(o.filled_avg_price)}</td><td>${o.sent_s == null ? "—" : `${o.sent_s.toFixed(1)} s`}</td><td>${o.fill_s == null ? "—" : `${o.fill_s.toFixed(1)} s`}</td><td class="l" style="white-space:normal">${esc(o.message || o.reason)}</td></tr>`;
   } else {
     h = `<table class="log"><thead><tr><th class="l">Time</th><th class="l">Symbol</th><th class="l">Tranche</th><th class="l">Event</th><th class="l">Detail</th></tr></thead><tbody>`;
     for (const e of rows) h += `<tr><td class="ts">${fmtT(e.ts)}</td><td class="sym">${esc(e.symbol || "")}</td><td>${e.sleeve ? L[e.sleeve] : ""}</td>

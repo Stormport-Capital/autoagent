@@ -7,11 +7,14 @@ and per symbol.
 
 It runs **four books with identical rules**, an **Hourly** book, a **15-min**
 book, a **5-min** book and a **Daily** book (see below), side by side in one dashboard. Each has its own portfolio, settings and
-performance, and optionally its own Alpaca paper account. Each book keeps its
-own records: simulated fills, per-tranche attribution and borrow fees. It can also be **linked to an Alpaca paper account**. With that on,
-after each hourly check the paper account is brought to the model's net
-position with market orders. Alpaca is paper only: the paper endpoint is hard-coded.
-**Step-by-step keys and setup: [SETUP.md](SETUP.md).**
+performance. Each book keeps its own records: simulated fills, per-tranche
+attribution and borrow fees. **Alpaca paper is switched off (2026-11-24):** no
+book links a paper account any more, and the dashboard has no Alpaca card. The
+real record is the live venue's own: the TradeZero card's *Results at
+TradeZero* section shows each book's trips, costs and net at TradeZero against
+the model's prices on the same trades, and each tab's *Broker orders* lists that
+book's TradeZero orders. **Data keys and setup: [SETUP.md](SETUP.md)** (its
+Alpaca paper steps no longer apply).
 
 **Interactive Brokers (paper or LIVE), one book, 5/10 short only:** set
 `IBKR_ACCOUNT` and one IBKR account trades through IB Gateway. It follows the

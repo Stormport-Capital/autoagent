@@ -1,5 +1,9 @@
 # Setup: Polygon data + Alpaca paper account
 
+> **Alpaca paper is switched off (2026-11-24).** The dashboard no longer links a
+> paper account or shows its card; the Alpaca paper steps below are kept for
+> reference only. Live trading is set up in TRADEZERO.md.
+
 About 20 minutes, one time. You need three keys:
 
 | Name (exact spelling) | Where it comes from | What it's for |
