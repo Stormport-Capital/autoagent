@@ -609,6 +609,40 @@ def build_state(book: Book, books: list, provider_name: str, demo, live=None) ->
     }
 
 
+def long_short_everywhere(books: dict, now: datetime) -> dict:
+    """Every watched symbol, long & short, in every book (Daily included).
+    Symbols already in a book switch mode from their next cross; a symbol
+    missing from a book is added there with the grade, risk and borrow of the
+    first book that has it, active, not Live, and trades only bars that close
+    after now. Close-by-end-of-day is copied to the intraday books only (the
+    Daily book holds for days). Returns {"switched": {book: [...]},
+    "added": {book: [...]}}."""
+    src: dict[str, dict] = {}
+    for b in books.values():
+        for r in b.engine.store.q("SELECT * FROM symbols WHERE status!='removed' ORDER BY id"):
+            src.setdefault(r["symbol"], dict(r))
+    switched: dict[str, list] = {}
+    added: dict[str, list] = {}
+    for key, b in books.items():
+        eng = b.engine
+        have = {r["symbol"]: dict(r) for r in eng.store.q(
+            "SELECT * FROM symbols WHERE status!='removed'")}
+        for sym, r in sorted(have.items()):
+            if r["mode"] != "long_short":
+                eng.set_mode(r["id"], "long_short", now)
+                switched.setdefault(key, []).append(sym)
+        for sym, r in sorted(src.items()):
+            if sym in have:
+                continue
+            eng.add_symbols(sym, "long_short", r["risk_pct"], now, r["grade"],
+                            bool(r["eod_close"]) and not eng.daily)
+            if r["borrow_pct"] is not None:
+                eng.store.x("UPDATE symbols SET borrow_pct=? WHERE symbol=? AND status!='removed'",
+                            (r["borrow_pct"], sym))
+            added.setdefault(key, []).append(sym)
+    return {"switched": switched, "added": added}
+
+
 def last_check(store: Store) -> dict | None:
     """The book's latest bar check, as seconds after the bar closed."""
     r = next(iter(store.q("SELECT * FROM checks WHERE kind != 'other' ORDER BY id DESC LIMIT 1")),
@@ -791,6 +825,14 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                     return self._send(400, {"error": str(e)})
             if self.path.startswith("/api/live/"):
                 return self._live_post(self.path[len("/api/live"):])
+            if self.path == "/api/all/long_short":
+                try:
+                    done = long_short_everywhere(books, ordered[0].sched.clock.now())
+                except ValidationError as e:
+                    return self._send(400, {"error": str(e)})
+                for b in ordered:
+                    threading.Thread(target=b.sched.run_tick, daemon=True).start()
+                return self._send(200, done)
             book, rest = self._route()
             if book is None:
                 return self._send(404, {"error": "not found"})
@@ -837,6 +879,9 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                 elif m := re.fullmatch(r"/symbols/(\d+)/eod", rest):
                     engine.set_eod_close(int(m.group(1)), bool(body.get("on")), now)
                     threading.Thread(target=sched.run_tick, daemon=True).start()
+                    return self._send(200, {"ok": True})
+                elif m := re.fullmatch(r"/symbols/(\d+)/mode", rest):
+                    engine.set_mode(int(m.group(1)), body.get("mode"), now)
                     return self._send(200, {"ok": True})
                 elif m := re.fullmatch(r"/symbols/(\d+)/grade", rest):
                     engine.set_grade(int(m.group(1)), body.get("grade"), now)

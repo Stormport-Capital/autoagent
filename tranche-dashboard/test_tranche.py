@@ -20,6 +20,8 @@ from indicators import (ET, Bar, atr, bar_bucket, cross_adverse_moves, crossed_b
                         resample_hourly, session_bar_ends, session_hour_ends,
                         session_vwap)
 from store import Store
+from indicators import SESSION_MINUTES
+from types import SimpleNamespace as NS
 
 FIVE = timedelta(minutes=5)
 
@@ -537,6 +539,19 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.store.q("SELECT risk_pct FROM symbols WHERE id=1")[0]["risk_pct"], 1.5)
         with self.assertRaises(ValidationError):
             eng.add_symbols("BAD", "short_only", 1, now, grade="Z")
+
+    def test_mode_switches_from_the_next_cross(self):
+        eng = self.engine([])
+        now = datetime(2026, 11, 25, 13, tzinfo=ET)
+        eng.add_symbols("MOD", "short_only", 1.5, now, grade="B")
+        eng.set_mode(1, "long_short", now)
+        self.assertEqual(self.store.q("SELECT mode FROM symbols WHERE id=1")[0]["mode"], "long_short")
+        self.assertIn("short only -> long short", self.store.q(
+            "SELECT message FROM events WHERE kind='mode'")[0]["message"])
+        eng.set_mode(1, "long_short", now)                       # no change, no second event
+        self.assertEqual(len(self.store.q("SELECT 1 FROM events WHERE kind='mode'")), 1)
+        with self.assertRaises(ValidationError):
+            eng.set_mode(1, "long_only", now)
 
     def test_check_delay_keeps_seconds(self):
         """The dashboard sends the delay as minutes with a fraction (10 s = 1/6 min).
@@ -2769,6 +2784,52 @@ class RevisingProvider:
 
     def session_open(self, symbol, day, now):
         return None
+
+
+class LongShortEverywhereTests(unittest.TestCase):
+    """Dean, 2026-11-25: every symbol long & short on every book, Daily included."""
+    NOW = datetime(2026, 11, 25, 13, 5, tzinfo=ET)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.books = {}
+        for key, minutes in (("1h", 60), ("15m", 15), ("5m", 5), ("1d", SESSION_MINUTES)):
+            st = Store(f"{self.dir.name}/{key}.db")
+            self.books[key] = NS(engine=Engine(st, ScriptedProvider([]), minutes))
+
+    def tearDown(self):
+        for b in self.books.values():
+            b.engine.store.db.close()
+        self.dir.cleanup()
+
+    def test_every_symbol_long_and_short_on_every_book(self):
+        e5, e15 = self.books["5m"].engine, self.books["15m"].engine
+        e5.add_symbols("BNAI", "short_only", 1.5, self.NOW, grade="B", eod_close=True)
+        e5.store.x("UPDATE symbols SET borrow_pct=120, live='EMA5_10', status='paused' WHERE symbol='BNAI'")
+        e5.add_symbols("GP", "long_short", 1.0, self.NOW, grade="C")
+        e15.add_symbols("OTLY", "short_only", 2.0, self.NOW, grade="A")
+        e15.add_symbols("OLD", "short_only", 2.0, self.NOW)
+        e15.store.x("UPDATE symbols SET status='removed' WHERE symbol='OLD'")
+        later = self.NOW + timedelta(minutes=1)
+        r = app.long_short_everywhere(self.books, later)
+        self.assertEqual(r["switched"], {"5m": ["BNAI"], "15m": ["OTLY"]})
+        self.assertEqual(r["added"], {"1h": ["BNAI", "GP", "OTLY"], "15m": ["BNAI", "GP"],
+                                      "5m": ["OTLY"], "1d": ["BNAI", "GP", "OTLY"]})
+        for key, b in self.books.items():
+            rows = {x["symbol"]: dict(x) for x in b.engine.store.q(
+                "SELECT * FROM symbols WHERE status!='removed'")}
+            self.assertEqual(sorted(rows), ["BNAI", "GP", "OTLY"], key)
+            self.assertTrue(all(x["mode"] == "long_short" for x in rows.values()), key)
+        d = {x["symbol"]: dict(x) for x in self.books["1d"].engine.store.q("SELECT * FROM symbols")}
+        h = {x["symbol"]: dict(x) for x in self.books["1h"].engine.store.q("SELECT * FROM symbols")}
+        self.assertEqual((h["BNAI"]["grade"], h["BNAI"]["risk_pct"], h["BNAI"]["borrow_pct"]), ("B", 1.5, 120))
+        self.assertEqual((h["BNAI"]["eod_close"], d["BNAI"]["eod_close"]), (1, 0))   # Daily holds for days
+        self.assertEqual((h["BNAI"]["live"], h["BNAI"]["status"]), (None, "active"))  # never Live by copy
+        self.assertEqual(h["BNAI"]["added_at"], later.isoformat())   # trades only bars from now on
+        self.assertEqual(self.books["5m"].engine.store.q(
+            "SELECT status, live FROM symbols WHERE symbol='BNAI'")[0]["status"], "paused")  # left as is
+        again = app.long_short_everywhere(self.books, later)
+        self.assertEqual(again, {"switched": {}, "added": {}})
 
 
 class RevisedBarTests(unittest.TestCase):
