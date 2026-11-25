@@ -311,6 +311,23 @@ class Engine:
             sym["symbol"])
         return sleeves
 
+    def set_mode(self, symbol_id: int, mode: str, now: datetime) -> None:
+        """Short only <-> long & short for the 5/10 and 10/20 tranches, from the
+        next cross: an open position stays until its opposite cross, which in
+        long & short also reverses it. The VWAP tranche is short only either
+        way, and a live account still only ever shorts (a long means flat there)."""
+        if mode not in ("short_only", "long_short"):
+            raise ValidationError("mode must be short_only or long_short")
+        sym = self._symbol(symbol_id)
+        if sym["status"] == "removed":
+            raise ValidationError(f"{sym['symbol']} was removed")
+        if sym["mode"] == mode:
+            return
+        self.store.x("UPDATE symbols SET mode=? WHERE id=?", (mode, symbol_id))
+        self.store.log(now, "mode", f"{sym['symbol']}: {sym['mode'].replace('_', ' ')} -> "
+                       f"{mode.replace('_', ' ')} (from the next cross; open positions stay "
+                       f"until their opposite cross)", sym["symbol"])
+
     def set_eod_close(self, symbol_id: int, on: bool, now: datetime) -> None:
         """Day-trade mode: the symbol still trades all session, but takes no new
         entries from 15:55 ET and is flat at the 15:55 5-minute close."""
