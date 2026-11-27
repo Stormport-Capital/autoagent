@@ -7,12 +7,12 @@ One Interactive Brokers account, paper or live, trades the books listed in
 | Rule | Where it is enforced |
 |---|---|
 | Only the listed books' symbols can be Live; the Live button exists only on those tabs, and the server refuses it elsewhere | `app.py` live route, `LiveSync.selections` |
-| **A symbol may be Live in several books.** Each book's 5/10 tranche is its own position, short only and capped at the share cap per book; the account holds the sum (5-min and 15-min both short at a 1-share cap = 2 shares; the 5-min stop covers one). Order rows record the books (`5m,15m`) | `LiveSync._net`, `LiveSync._cap`; the adapter refuses more than the cap × the number of listed books |
+| **A symbol may be Live in several books.** Each book's Live tranche is its own position, short only at IBKR (TradeZero also takes the 10/20 long, TRADEZERO.md) and capped at the share cap per tranche and book; the account holds the sum (5-min and 15-min both short at a 1-share cap = 2 shares; the 5-min stop covers one). Order rows record the books (`5m,15m`) | `LiveSync._net`, `LiveSync._cap`; the adapter refuses more than the cap × the number of listed books |
 | Only the **5/10 EMA tranche** can be Live. VWAP-fail and 10/20 are refused | `Engine.set_live` (`LIVE_SLEEVES`), `LiveSync.selections` |
 | **Short only.** The account never goes above 0 shares; a long signal in the model means flat | `LiveSync.desired`; the adapter refuses any buy that would open a long |
 | **1 share** (`IBKR_MAX_SHARES`, the only size setting) | `BrokerSync.desired` and the adapter |
 | **The row's EOD close button decides the 15:55 flat** (since 2026-11-12; before, a Live symbol was always flat by 15:55). EOD on: flat at the 15:55 close, no new entry from 15:55, no entry at the next open from the 15:55-16:00 bar. EOD off: it may hold overnight, at the live account too | `Engine.day_only`, `Engine._enter` |
-| **Entries:** a down-cross at any bar close of the symbol's book, or the 9:45 state entry if nothing was entered yet that day (5-min and 15-min books; an hourly book has no 9:45 bar, so it enters on crosses only); at most 2 a day | `Engine._live_510` |
+| **Entries:** a down-cross at any bar close of the symbol's book, or the 9:45 state entry if nothing was entered yet that day (5-min and 15-min books; an hourly book has no 9:45 bar, so it enters on crosses only); no daily limit (the 2-a-day cap was removed 2026-11-27) | `Engine._live_510` |
 | **Hard stop, fixed at entry:** cover on a 5-minute close above it, as a **market** order. On 15-min and hourly books it is checked at every 5-minute close, not only at the book's own bar close | `Engine._live_stop`, `Engine.live_stop_sweep`, `LiveSync._order_type` |
 | **$100 daily loss limit** | `BrokerSync._check_loss` |
 

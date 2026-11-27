@@ -4,13 +4,30 @@ One TradeZero account, paper or live, trades the books listed in `TZ_BOOKS`
 (the **5-minute book** by default, or any of `5m`, `15m`, `1h`) over
 TradeZero's REST Trading API. It is a second live venue next to Interactive
 Brokers (`IBKR.md`); **one of the two is linked at a time** (`LIVE_BROKER`).
-Everything in `IBKR.md` about *what* trades live applies unchanged: the Live
-button on the listed books' tabs (a symbol may be Live in several books; the
-account holds the sum of their positions), the 5/10 EMA tranche only, short
-only, the share cap per book, the fixed entry stop checked at every 5-minute
-close, flat by 15:55 when the row's EOD close is on (off = may hold
-overnight), at most two entries a day, the daily loss limit and the
-kill switch. This file covers only what is different at TradeZero.
+What trades live (Dean, 2026-11-27): the Live button on the listed books' tabs
+picks a symbol's tranches, and a symbol may be Live in several books. The
+choices are:
+
+- **5/10 EMA cross, short**: a down-cross (stop: the day's high at entry) or
+  the 9:45 state entry (stop: the opening-range high). There is no daily
+  entry limit (it was two a day until 2026-11-27).
+- **10/20 EMA cross, long and short**: a down-cross shorts (stop: the day's
+  high at entry); an up-cross covers and, where the row's **Long** button is
+  on, goes long (stop: the day's low at entry). Both stops act on a 5-minute
+  close through them, like the 5/10's.
+- **VWAP fail, short**: the model's VWAP tranche, with its own high-of-day
+  stop, 10-day-average target and time stop. The account acts at the book's
+  check after the model's exit, so on the 15-min and hourly books the stop can
+  trail the model's by up to a bar.
+
+Each Live tranche in each book is its own position at the share cap
+(`TZ_MAX_SHARES`, or exactly `TZ_SHARES`), and the account holds the sum. A
+10/20 long and a 5/10 short in the same symbol net to flat: one account can't
+be long and short the same stock. A short that turns long goes in two orders
+(close, then open). Longs need no locate. The 5/10 and VWAP never go long
+live, whatever the model does. EOD close per row, the daily loss limit and
+the kill switch apply as in `IBKR.md`; the IBKR link itself stays short only.
+This file covers only what is different at TradeZero.
 
 Why TradeZero: IBKR refused most of the names tried in October and November
 2026 for borrow ("locate needed", "not shortable", closing-only, a small-cap
@@ -31,14 +48,16 @@ name IBKR will not lend can still be shorted, at a known price, within caps.
 
 ### Orders, exactly
 
-- **Entry** (the model's 5/10 down-cross or the 9:45 state entry): `Sell`,
-  `openClose: Open`, `Market`, `Day`, 1 share. Refused before it is sent when
-  the model has no last price for the symbol (the value cap needs one), when
-  the account is not `Active`, when the position would pass `TZ_MAX_SHARES`,
-  or when a buy would open a long.
-- **Cover** (stop, up-cross, 15:55 when EOD close is on, Live off, kill switch, loss limit):
-  `Buy`, `openClose: Close`, `Market`. A cover is never refused for lack of a
-  price: leaving a short open is the bigger risk at one share.
+- **Short entry** (a Live tranche's short): `Sell`, `openClose: Open`,
+  `Market`, `Day`, 1 share. **Long entry** (a Live 10/20 long): `Buy`,
+  `openClose: Open`, no locate. Either is refused before it is sent when the
+  model has no last price for the symbol (the value cap needs one), when the
+  account is not `Active`, or when the position would pass the cap
+  (`TZ_MAX_SHARES` for each Live tranche and book).
+- **Exit** (stop, opposite cross, 15:55 when EOD close is on, Live off, kill switch, loss limit):
+  `Buy` (a short) or `Sell` (a long), `openClose: Close`, `Market`. An exit is
+  never refused for lack of a price: leaving a position open is the bigger
+  risk at one share.
 - `TZ_ORDER_TYPE=limit` sends `Limit` at the model's last price through the
   market by `TZ_LIMIT_COLLAR_PCT` (3% default). BrokerSync cancels one still
   unfilled after `TZ_REPRICE_S` and re-prices it on the next follow-up sync.
@@ -126,7 +145,7 @@ journalctl -u tranche -n 40 --no-pager
 The startup lines should show:
 
 ```
-TradeZero paper: OK - TZP12345678 net liquidation $…; cap 1 share(s) per symbol, daily loss limit $100; 5-min, 15-min, Hourly books, 5/10 EMA short only, flat by 15:55; 0 live symbol(s)
+TradeZero paper: OK - TZP12345678 net liquidation $…; cap 1 share(s) per tranche and book, daily loss limit $100; 5-min, 15-min, Hourly books, tranches: 5/10 short, 10/20 long and short, VWAP short; flat by 15:55 where the row's EOD close is on; 0 live symbol(s)
 ```
 
 The broker card on every tab is now **TradeZero paper account**; the Live

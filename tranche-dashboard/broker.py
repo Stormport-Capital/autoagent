@@ -156,6 +156,12 @@ REJECT_PAUSE = timedelta(minutes=4)
 
 KILL_MODES = ("pause", "flatten")
 WATCH_EVERY_S = 60
+# a symbol Live in one book holds at most one position per live tranche there (5/10,
+# 10/20, VWAP): the brokers' own share ceiling is max_shares x books x this
+LIVE_TRANCHES_PER_BOOK = 3
+# tranches whose LONG the live account also takes (where the venue allows longs and
+# the row's Long is on); every other tranche's long means flat there
+LIVE_LONG_SLEEVES = ("EMA10_20",)
 QUOTES_EVERY_S = 30.0  # IBKR link: re-check which quote subscriptions to keep open
 
 
@@ -635,14 +641,17 @@ class BrokerSync:
 class LiveSync(BrokerSync):
     """The live account (IBKR or TradeZero), fed by the books listed in
     IBKR_BOOKS / TZ_BOOKS (default the 5-min book only). In those books a
-    watchlist symbol can be marked Live for the 5/10 EMA tranche only
-    (`sleeves`; symbols.live). A symbol may be Live in several books at once:
-    each book's tranche is its own position, short only and capped at
-    max_shares per book, and the account holds their sum (5-min short and
-    15-min short = 2 shares at a 1-share cap; the 5-min stop covers one). A
-    long signal means flat for that book. A cover after a model stop goes out
-    as a market order. Orders, events, the kill switch and the loss-limit
-    latch live in this sync's own store."""
+    watchlist symbol can be marked Live for any of `sleeves` (symbols.live):
+    the 5/10 short, the 10/20 long and short, the VWAP-fail short. Each Live
+    tranche in each book is its own position, the sign of the model's (capped
+    at max_shares, or exactly the venue's fixed size), and the account holds
+    their sum: 5-min 5/10 short + 15-min 5/10 short = 2 shares short at a
+    1-share cap; a 10/20 long and a 5/10 short in the same symbol net to flat,
+    since one account can't be long and short the same stock. A long counts
+    only for LIVE_LONG_SLEEVES and only on a venue that allows longs
+    (TradeZero; IBKR stays short only); any other long means flat. An exit
+    after a model stop goes out as a market order. Orders, events, the kill
+    switch and the loss-limit latch live in this sync's own store."""
 
     def __init__(self, store, broker, books: dict, live_book: str = "5m",
                  sleeves: tuple = ("EMA5_10",), live_books: tuple | None = None, **kw):
@@ -703,47 +712,58 @@ class LiveSync(BrokerSync):
                         {"id": r["id"], "book": key, "label": label, "sleeves": sleeves, "store": st})
         return out
 
+    def _tranche_nets(self) -> dict[str, dict[tuple, int]]:
+        """ticker -> {(book, tranche): the model's open shares there}, longs
+        positive, for every Live tranche."""
+        out: dict[str, dict[tuple, int]] = {}
+        for sym, sels in self.selections().items():
+            for sel in sels:
+                for sleeve in sel["sleeves"]:
+                    q = 0
+                    for t in sel["store"].q("SELECT side, qty FROM tranches WHERE status='open' "
+                                            "AND symbol_id=? AND sleeve=?", (sel["id"], sleeve)):
+                        q += t["qty"] if t["side"] == "long" else -t["qty"]
+                    out.setdefault(sym, {})[(sel["book"], sleeve)] = q
+        return out
+
     def _book_nets(self) -> dict[str, dict[str, int]]:
         """ticker -> {book: the model's net shares of its Live tranches there}."""
         out: dict[str, dict[str, int]] = {}
-        for sym, sels in self.selections().items():
-            for sel in sels:
-                marks = ",".join("?" * len(sel["sleeves"]))
-                q = 0
-                for t in sel["store"].q(f"SELECT side, qty FROM tranches WHERE status='open' "
-                                        f"AND symbol_id=? AND sleeve IN ({marks})",
-                                        (sel["id"], *sel["sleeves"])):
-                    q += t["qty"] if t["side"] == "long" else -t["qty"]
-                out.setdefault(sym, {})[sel["book"]] = q
+        for sym, by in self._tranche_nets().items():
+            for (book, _sleeve), q in by.items():
+                out.setdefault(sym, {})[book] = out.get(sym, {}).get(book, 0) + q
         return out
 
     def _net(self) -> dict[str, int]:
-        """Each book's position, short only and capped at max_shares (or the
-        fixed size), then summed: the account holds every Live book's trade."""
+        """Each Live tranche's position in each book: the sign of the model's,
+        capped at max_shares (or exactly the venue's fixed size); a long only
+        where it may trade long here (else flat); then summed."""
         fixed = getattr(self.broker, "fixed_shares", None)
+        longs = bool(getattr(self.broker, "allows_longs", False))
         want: dict[str, int] = {}
-        for sym, by_book in self._book_nets().items():
+        for sym, by in self._tranche_nets().items():
             total = 0
-            for q in by_book.values():
-                q = min(q, 0)  # a long signal means flat for that book
+            for (_book, sleeve), q in by.items():
+                if q > 0 and not (longs and sleeve in LIVE_LONG_SLEEVES):
+                    q = 0  # a long signal means flat for that tranche
                 if fixed:
-                    q = -fixed if q < 0 else 0
+                    q = fixed if q > 0 else -fixed if q < 0 else 0
                 if self.max_shares:
-                    q = max(q, -self.max_shares)
+                    q = max(-self.max_shares, min(q, self.max_shares))
                 total += q
             want[sym] = total
         return want
 
     def desired(self) -> dict[str, int]:
-        """Short only, capped per book: _net has already applied both."""
+        """Capped per book and tranche: _net has already applied it."""
         return self._net()
 
     def _cap(self, sym: str) -> int | None:
-        """max_shares for each book the symbol is Live in (at least one: a
-        symbol being closed still has the single-book cap)."""
+        """max_shares for each Live tranche of the symbol across books (at
+        least one: a symbol being closed still has the single cap)."""
         if not self.max_shares:
             return None
-        return self.max_shares * max(1, len(self.selections().get(sym, [])))
+        return self.max_shares * max(1, sum(len(s["sleeves"]) for s in self.selections().get(sym, [])))
 
     def managed(self) -> set[str]:
         """Live symbols, plus anything this link ever traded: a symbol switched
@@ -783,11 +803,11 @@ class LiveSync(BrokerSync):
         return None
 
     def _order_type(self, sym: str, target: int, cur: int) -> str | None:
-        """Market for the cover of a short the model just stopped out: its most
-        recent closed live tranche exited on the stop after this link's last
-        fill. A cover that only reduces the short (one of several books
-        stopped out) counts too."""
-        if not (cur < 0 and target > cur):
+        """Market for the exit the model's stop just caused: its most recent
+        closed live tranche exited on the stop after this link's last fill. An
+        order that only reduces the position (one of several tranches stopped
+        out) counts too; a long being sold the same as a short being covered."""
+        if not ((cur < 0 and target > cur) or (cur > 0 and target < cur)):
             return None
         marks = ",".join("?" * len(self.sleeves))
         stores = self._sel_stores(sym)
