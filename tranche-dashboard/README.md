@@ -13,7 +13,7 @@ book links a paper account any more, and the dashboard has no Alpaca card. The
 real record is the live venue's own: the TradeZero card's *Results at
 TradeZero* section shows each book's trips, costs and net at TradeZero against
 the model's prices on the same trades, and each tab's *Broker orders* lists that
-book's TradeZero orders. **Data keys and setup: [SETUP.md](SETUP.md)** (its
+book's TradeZero orders. **Droplet commands to copy and paste: [COMMANDS.md](COMMANDS.md).** **Data keys and setup: [SETUP.md](SETUP.md)** (its
 Alpaca paper steps no longer apply).
 
 **Interactive Brokers (paper or LIVE), one book, 5/10 short only:** set

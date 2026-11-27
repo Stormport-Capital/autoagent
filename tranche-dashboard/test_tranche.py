@@ -2786,8 +2786,9 @@ class RevisingProvider:
         return None
 
 
-class LongShortEverywhereTests(unittest.TestCase):
-    """Dean, 2026-11-25: every symbol long & short on every book, Daily included."""
+class EveryBookTests(unittest.TestCase):
+    """Dean, 2026-11-25: every symbol on every book, Daily included. 2026-11-27:
+    long is a per-symbol choice, so filling the books never changes direction."""
     NOW = datetime(2026, 11, 25, 13, 5, tzinfo=ET)
 
     def setUp(self):
@@ -2802,7 +2803,7 @@ class LongShortEverywhereTests(unittest.TestCase):
             b.engine.store.db.close()
         self.dir.cleanup()
 
-    def test_every_symbol_long_and_short_on_every_book(self):
+    def test_every_symbol_on_every_book_keeps_its_direction(self):
         e5, e15 = self.books["5m"].engine, self.books["15m"].engine
         e5.add_symbols("BNAI", "short_only", 1.5, self.NOW, grade="B", eod_close=True)
         e5.store.x("UPDATE symbols SET borrow_pct=120, live='EMA5_10', status='paused' WHERE symbol='BNAI'")
@@ -2811,25 +2812,23 @@ class LongShortEverywhereTests(unittest.TestCase):
         e15.add_symbols("OLD", "short_only", 2.0, self.NOW)
         e15.store.x("UPDATE symbols SET status='removed' WHERE symbol='OLD'")
         later = self.NOW + timedelta(minutes=1)
-        r = app.long_short_everywhere(self.books, later)
-        self.assertEqual(r["switched"], {"5m": ["BNAI"], "15m": ["OTLY"]})
+        r = app.every_symbol_every_book(self.books, later)
         self.assertEqual(r["added"], {"1h": ["BNAI", "GP", "OTLY"], "15m": ["BNAI", "GP"],
                                       "5m": ["OTLY"], "1d": ["BNAI", "GP", "OTLY"]})
         for key, b in self.books.items():
-            rows = {x["symbol"]: dict(x) for x in b.engine.store.q(
+            rows = {x["symbol"]: x["mode"] for x in b.engine.store.q(
                 "SELECT * FROM symbols WHERE status!='removed'")}
-            self.assertEqual(sorted(rows), ["BNAI", "GP", "OTLY"], key)
-            self.assertTrue(all(x["mode"] == "long_short" for x in rows.values()), key)
+            self.assertEqual(rows, {"BNAI": "short_only", "GP": "long_short", "OTLY": "short_only"}, key)
         d = {x["symbol"]: dict(x) for x in self.books["1d"].engine.store.q("SELECT * FROM symbols")}
         h = {x["symbol"]: dict(x) for x in self.books["1h"].engine.store.q("SELECT * FROM symbols")}
         self.assertEqual((h["BNAI"]["grade"], h["BNAI"]["risk_pct"], h["BNAI"]["borrow_pct"]), ("B", 1.5, 120))
         self.assertEqual((h["BNAI"]["eod_close"], d["BNAI"]["eod_close"]), (1, 0))   # Daily holds for days
         self.assertEqual((h["BNAI"]["live"], h["BNAI"]["status"]), (None, "active"))  # never Live by copy
         self.assertEqual(h["BNAI"]["added_at"], later.isoformat())   # trades only bars from now on
-        self.assertEqual(self.books["5m"].engine.store.q(
-            "SELECT status, live FROM symbols WHERE symbol='BNAI'")[0]["status"], "paused")  # left as is
-        again = app.long_short_everywhere(self.books, later)
-        self.assertEqual(again, {"switched": {}, "added": {}})
+        self.assertEqual(e5.store.q("SELECT status FROM symbols WHERE symbol='BNAI'")[0]["status"],
+                         "paused")                                     # what was there is left as is
+        self.assertFalse(e5.store.q("SELECT 1 FROM events WHERE kind='mode'"))  # no direction change
+        self.assertEqual(app.every_symbol_every_book(self.books, later), {"added": {}})
 
 
 class RevisedBarTests(unittest.TestCase):
