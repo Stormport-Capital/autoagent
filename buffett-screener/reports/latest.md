@@ -1,4 +1,4 @@
-# Buffett quality-compounder scan — 2026-11-26
+# Buffett quality-compounder scan — 2026-11-27
 
 > **These are RESEARCH CANDIDATES, not buys.** Every threshold below is a
 > secondary-codifier PROXY (Mary Buffett/Clark, Braverman) for Buffett's own
