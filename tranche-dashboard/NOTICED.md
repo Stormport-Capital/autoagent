@@ -156,3 +156,12 @@ Added with the TradeZero link (2026-11-09):
 27. **`checks.ibkr_start` / `ibkr_done` and the `ibkr_s` timing fields** keep
     their names whichever venue is linked; the dashboard labels them with the
     venue's name. Renaming the columns would need a migration.
+28. **Fixed 2026-11-27: model EMA crosses the feed revealed late were lost.**
+    Only the Live 5/10 judged crosses against a recorded side; every other
+    EMA tranche read the bars alone, so when the feed changed a bar after it
+    was checked (BNAI 5-min 10/20, Nov 24 12:30 bar) the cross was never
+    acted on and the short ran to -$4,060. Every book now records each pair's
+    side as judged (`symbols.close_sides`) and acts on the first bar that
+    reads the other way ("missed when it happened ... acted on at this
+    close"). On the first check after this deploy, an open EMA tranche whose
+    cross was already missed closes (and, with Long on, reverses) at that bar.

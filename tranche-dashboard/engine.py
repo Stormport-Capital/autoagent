@@ -41,7 +41,10 @@ past sessions and builds today's from 5-minute bars. With daily_at_close on
 (the default) its signals act at 15:55 on the day's bar as it stands then
 (9:30-15:55), filled at that 5-minute close; a cross is judged against the EMA
 side recorded at the previous 15:55 check (symbols.close_sides), because the
-official close can differ from the 15:55 price. Off, they act at the next 9:30
+official close can differ from the 15:55 price. Every other book also judges
+each EMA pair against the side recorded at the previous bar's check (the same
+record), because the feed can change a bar after it was checked: a cross that
+only shows in the later version is acted on at the next check, not lost. Off, they act at the next 9:30
 open on the finished bar, like the last bar of the other books. The VWAP
 tranche can't fire on one bar a session.
 """
@@ -759,15 +762,21 @@ class Engine:
             ctx = (f"on the {bar_txt}; EMA5 {e5[j]:.4g}->{e5[i]:.4g}, EMA10 {e10[j]:.4g}->"
                    f"{e10[i]:.4g}, EMA20 {e20[j]:.4g}->{e20[i]:.4g}; filled {fill.how}")
             tick = price_tick(b.close)
-            ctx1 = ctx2 = ctx
+            # every book judges each EMA pair against the side recorded when the
+            # previous bar was judged, so a cross the feed's later version of a bar
+            # hides (BNAI 10/20, 2026-11-24) is still acted on, one check late; both
+            # records are kept current even while a Live 5/10 uses its own
+            (c1, late1), (c2, late2) = (
+                self._judged_cross(sym, "EMA5_10", e5, e10, i, tick, open_tr.get("EMA5_10")),
+                self._judged_cross(sym, "EMA10_20", e10, e20, i, tick, open_tr.get("EMA10_20")))
             if self.daily and s["daily_at_close"]:
-                (c1, late1), (c2, late2) = (self._judged_cross(sym, "EMA5_10", e5, e10, i, tick),
-                                            self._judged_cross(sym, "EMA10_20", e10, e20, i, tick))
                 note = ("; judged against the side recorded at the previous 15:55 check (the "
                         "official close since then reads differently)")
                 ctx1, ctx2 = ctx + (note if late1 else ""), ctx + (note if late2 else "")
             else:
-                c1, c2 = ema_cross(e5, e10, i, tick), ema_cross(e10, e20, i, tick)
+                note = ("- missed when it happened (the feed changed bars after they were "
+                        "checked), acted on at this close; ")
+                ctx1, ctx2 = (note if late1 else "") + ctx, (note if late2 else "") + ctx
             u2 = self._ema_unit(bars, e10, e20, i, a, s) if c2 else None
             if "EMA5_10" in (sym.get("live") or ""):
                 self._live_510(sym, open_tr.get("EMA5_10"), fill, bars, five, i, e5, e10, s, ctx,
@@ -896,19 +905,31 @@ class Engine:
         return c, bool(c) and not on_bars
 
     def _judged_cross(self, sym: dict, key: str, a: list, b: list, i: int,
-                      tick: float) -> tuple[int, bool]:
-        """Daily book at 15:55: the cross of line a vs line b on bar i, judged
-        against the side recorded when the previous bar was judged at 15:55
-        (symbols.close_sides), as _live_cross does for the live 5/10. The bars
-        alone would judge yesterday by its official close, which can sit on the
-        other side of the 15:55 price that was acted on: a short taken on a
-        15:55 down-cross that the close undid would then never see an up-cross.
-        Returns (cross, judged against the record rather than the bars)."""
+                      tick: float, open_t: dict | None = None) -> tuple[int, bool]:
+        """The cross of line a vs line b on bar i (-1 down, +1 up, 0 none),
+        judged against the side recorded when the previous bar was judged
+        (symbols.close_sides, per tranche), as _live_cross does for the live
+        5/10, rather than against today's recomputed history. Two reasons:
+          * intraday books: the feed can change a bar after it was checked. On
+            2026-11-24 the 5-min book shorted BNAI's 10/20 at 9:40; the feed's
+            bars now show the up-cross on the 12:30 bar, but when that bar was
+            checked it read no cross, and the next bar, already above, was no
+            cross either: the short stayed open while BNAI ran +45%. Against the
+            record, the first bar that reads on the other side is the cross;
+          * the daily book at 15:55: yesterday's official close can sit on the
+            other side of the 15:55 price that was acted on.
+        Equal at the tick records nothing, as in ema_cross. With no record yet,
+        an open tranche's side stands in for it (so a cross missed before the
+        record existed is caught at the next check); with neither, the bars
+        alone decide. Returns (cross, judged against the record rather than
+        what the bars show for this bar)."""
         now, on_bars = ema_side(a, b, i, tick), ema_cross(a, b, i, tick)
         sides = json.loads(sym.get("close_sides") or "{}")
         prev = sides.get(key)
+        if prev is None and open_t is not None:
+            prev = -1 if open_t["side"] == "short" else 1
         c = on_bars if prev is None else (now if now and now != prev else 0)
-        if now and now != prev:
+        if now and now != sides.get(key):
             sides[key] = now
             sym["close_sides"] = json.dumps(sides)
             self.store.x("UPDATE symbols SET close_sides=? WHERE id=?",
