@@ -609,38 +609,32 @@ def build_state(book: Book, books: list, provider_name: str, demo, live=None) ->
     }
 
 
-def long_short_everywhere(books: dict, now: datetime) -> dict:
-    """Every watched symbol, long & short, in every book (Daily included).
-    Symbols already in a book switch mode from their next cross; a symbol
-    missing from a book is added there with the grade, risk and borrow of the
-    first book that has it, active, not Live, and trades only bars that close
-    after now. Close-by-end-of-day is copied to the intraday books only (the
-    Daily book holds for days). Returns {"switched": {book: [...]},
-    "added": {book: [...]}}."""
+def every_symbol_every_book(books: dict, now: datetime) -> dict:
+    """Every watched symbol on every book (Daily included). A symbol missing
+    from a book is added there with the direction (short only or long &
+    short), grade, risk and borrow of the first book that has it; active, not
+    Live, trading only bars that close after now; close-by-end-of-day copied
+    to the intraday books only (the Daily book holds for days). Direction is
+    never changed here: long is a per-symbol choice (the row's Long button).
+    Returns {"added": {book: [...]}}."""
     src: dict[str, dict] = {}
     for b in books.values():
         for r in b.engine.store.q("SELECT * FROM symbols WHERE status!='removed' ORDER BY id"):
             src.setdefault(r["symbol"], dict(r))
-    switched: dict[str, list] = {}
     added: dict[str, list] = {}
     for key, b in books.items():
         eng = b.engine
-        have = {r["symbol"]: dict(r) for r in eng.store.q(
-            "SELECT * FROM symbols WHERE status!='removed'")}
-        for sym, r in sorted(have.items()):
-            if r["mode"] != "long_short":
-                eng.set_mode(r["id"], "long_short", now)
-                switched.setdefault(key, []).append(sym)
+        have = {r["symbol"] for r in eng.store.q("SELECT symbol FROM symbols WHERE status!='removed'")}
         for sym, r in sorted(src.items()):
             if sym in have:
                 continue
-            eng.add_symbols(sym, "long_short", r["risk_pct"], now, r["grade"],
+            eng.add_symbols(sym, r["mode"], r["risk_pct"], now, r["grade"],
                             bool(r["eod_close"]) and not eng.daily)
             if r["borrow_pct"] is not None:
                 eng.store.x("UPDATE symbols SET borrow_pct=? WHERE symbol=? AND status!='removed'",
                             (r["borrow_pct"], sym))
             added.setdefault(key, []).append(sym)
-    return {"switched": switched, "added": added}
+    return {"added": added}
 
 
 def last_check(store: Store) -> dict | None:
@@ -825,9 +819,9 @@ def make_handler(books: dict, provider_name: str, demo, backups=None, live=None)
                     return self._send(400, {"error": str(e)})
             if self.path.startswith("/api/live/"):
                 return self._live_post(self.path[len("/api/live"):])
-            if self.path == "/api/all/long_short":
+            if self.path == "/api/all/books":
                 try:
-                    done = long_short_everywhere(books, ordered[0].sched.clock.now())
+                    done = every_symbol_every_book(books, ordered[0].sched.clock.now())
                 except ValidationError as e:
                     return self._send(400, {"error": str(e)})
                 for b in ordered:
