@@ -644,6 +644,35 @@ class EngineTests(unittest.TestCase):
         self.assertEqual({t["sleeve"] for t in longs}, {"EMA5_10", "EMA10_20"})
         self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE sleeve='VWAP' AND side='long'"))
 
+    def test_a_short_whose_up_cross_was_missed_covers_at_the_next_check(self):
+        """BNAI, 2026-11-24/25, 5-min book: the 10/20 short opened at 9:40; the
+        feed's later bars show the up-cross on the 12:30 bar, but it was never
+        acted on and the short ran to -$4,060. With no record yet, the open
+        short stands in for the side last judged, so the first check that reads
+        10 above 20 covers it (and short only: no long)."""
+        ds = weekdays(date(2026, 8, 3), 10)
+        bars, p = [], 50.0
+        for d in ds:  # a steady uptrend: 10 above 20 throughout, no fresh cross at the end
+            closes = [p + 0.1 * (k + 1) for k in range(7)]
+            bars += day_from_closes(d, closes)
+            p = closes[-1]
+        eng = self.engine(bars)
+        eng.add_symbols("BNAI", "short_only", 1.0, datetime.combine(ds[-2], time(9), tzinfo=ET))
+        self.store.x("""INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+            stop_price, risk_dollars, fee_through, status) VALUES (1, 'BNAI', 'EMA10_20', 'short', 100, ?, 50.0,
+            0, 100, ?, 'open')""", (datetime.combine(ds[-2], time(9, 40), tzinfo=ET).isoformat(), ds[-2].isoformat()))
+        last = datetime.combine(ds[-1], time(16), tzinfo=ET)
+        e = [b.close for b in bars]
+        e10, e20 = ema(e, 10), ema(e, 20)
+        self.assertEqual(ema_cross(e10, e20, len(bars) - 1, 0.01), 0)   # the bars alone: no cross
+        eng.tick(last + timedelta(minutes=5))
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA10_20'")
+        self.assertEqual([x["status"] for x in t], ["closed"])           # covered, not left open
+        self.assertIn("missed when it happened", t[0]["exit_reason"])
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE side='long'"))
+        self.assertEqual(json.loads(self.store.q("SELECT close_sides FROM symbols")[0]["close_sides"])
+                         ["EMA10_20"], 1)
+
     def test_borrow_fee_over_weekend(self):
         # short opened Friday, still open Monday -> 3 calendar nights charged
         fri = date(2026, 9, 18)
@@ -2918,6 +2947,26 @@ class RevisedBarTests(unittest.TestCase):
         self.assertFalse(self.store.q("SELECT 1 FROM events WHERE kind='error'"))
 
 
+    def test_a_model_tranche_also_takes_the_cross_the_feed_showed_late(self):
+        """The same revised bar on a symbol that is not Live: before 2026-11-27
+        only the Live 5/10 judged against a record, so the model's own 5/10
+        never entered at all."""
+        as_checked, as_revised = self.bars(14.60), self.bars(14.43)
+        eng = Engine(self.store, RevisingProvider(as_checked, as_revised, self.at(12, 4)), minutes=5)
+        added = self.at(11, 54, 51, 467982)
+        eng.add_symbols("PMI", "short_only", 1.5, added, grade="B")
+        eng.tick(added)
+        eng.tick(self.at(11, 57, 0, 300000))
+        eng.tick(self.at(12, 2, 0, 300000))
+        self.assertFalse(self.store.q("SELECT 1 FROM tranches WHERE sleeve='EMA5_10'"))
+        eng.tick(self.at(12, 7, 0, 300000))
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA5_10'")
+        self.assertEqual(len(t), 1)
+        self.assertEqual((t[0]["side"], _dt(t[0]["entry_time"])), ("short", self.at(12, 5)))
+        msg = self.store.q("SELECT message FROM events WHERE kind='entry' AND sleeve='EMA5_10'")[0]["message"]
+        self.assertIn("missed when it happened", msg)
+
+
 class FastPipelineTests(unittest.TestCase):
     """Phase 1 of PLAN_TIMEFRAMES.md: Live symbols first, the IBKR sync before
     the paper sync, streaming quotes, and a timing record of every check and
@@ -3791,7 +3840,9 @@ class DailyBookTests(unittest.TestCase):
         self.assertEqual(len(t), 1)
         self.assertEqual(_dt(t[0]["entry_time"]), self.at(self.next, 9, 30))
         self.assertAlmostEqual(t[0]["entry_price"], 55.0)
-        self.assertIsNone(self.store.q("SELECT close_sides FROM symbols")[0]["close_sides"])
+        # since 2026-11-27 every book records the side each pair was judged on
+        self.assertEqual(json.loads(self.store.q("SELECT close_sides FROM symbols")[0]["close_sides"])
+                         ["EMA5_10"], -1)
 
     def test_name_added_before_the_open_acts_on_yesterdays_bar_at_the_open(self):
         """As on the other books: the bar before the name was added acts at the

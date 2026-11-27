@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     borrow_pct REAL,                        -- this symbol's annual borrow fee %; NULL = book default
     live TEXT,                              -- tranches mirrored to the IBKR account, e.g. 'EMA5_10,VWAP'
     live_side INTEGER,                      -- live 5/10: EMA5 side of EMA10 as last judged (+1/-1)
-    close_sides TEXT                        -- daily book at 15:55: JSON {tranche: EMA side as last judged}
+    close_sides TEXT                        -- JSON {tranche: EMA side as last judged} (daily: at 15:55)
 );
 CREATE TABLE IF NOT EXISTS tranches (
     id INTEGER PRIMARY KEY,
