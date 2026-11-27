@@ -365,27 +365,30 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(posted(b.fake)[0]["side"], "Buy")
         self.assertNotIn("AAA", b.fake.pos)
 
-    def test_short_only_cap_and_crossing_zero_are_refused_before_any_post(self):
+    def test_cap_and_crossing_zero_are_refused_before_any_post_and_longs_open(self):
         b = mk(pos={"AAA": -1, "LNG": 1})
         with self.assertRaisesRegex(BrokerError, "cap is 1"):
             b.submit("AAA", 1, "sell", "c1", ref_price=5)
-        with self.assertRaisesRegex(BrokerError, "short only"):
-            b.submit("NEW", 1, "buy", "c2", ref_price=5)
         with self.assertRaisesRegex(BrokerError, "cross through zero"):
             b.submit("LNG", 2, "sell", "c3", ref_price=5)
+        with self.assertRaisesRegex(BrokerError, "no reference price"):
+            b.submit("NEW", 1, "buy", "c2")                 # opening a long needs a price too
         self.assertEqual(posted(b.fake), [])
         b.submit("LNG", 1, "sell", "c4")  # closing the long is allowed, with no price
         self.assertEqual(posted(b.fake)[0]["openClose"], "Close")
+        b.submit("NEW", 1, "buy", "c5", ref_price=5)        # a live 10/20 long (2026-11-27)
+        self.assertEqual((posted(b.fake)[1]["side"], posted(b.fake)[1]["openClose"]), ("Buy", "Open"))
+        self.assertTrue(b.allows_longs)
 
     def test_cap_per_book_from_brokersync_bounded_by_the_listed_books(self):
-        b = mk(TZ_BOOKS="5m,15m", pos={"AAA": -1})
-        b.submit("AAA", 1, "sell", "c1", ref_price=5.0, cap=2)  # two books: -2 is allowed
-        self.assertEqual(b.fake.pos, {"AAA": -2})
-        with self.assertRaisesRegex(BrokerError, "cap is 2 \\(1 per book"):
-            b.submit("AAA", 1, "sell", "c2", ref_price=5.0, cap=9)  # never above cap x books
+        b = mk(TZ_BOOKS="5m,15m", pos={"AAA": -5})
+        b.submit("AAA", 1, "sell", "c1", ref_price=5.0, cap=6)  # two books x 3 tranches: -6 allowed
+        self.assertEqual(b.fake.pos, {"AAA": -6})
+        with self.assertRaisesRegex(BrokerError, "cap is 6 \\(1 per tranche and book"):
+            b.submit("AAA", 1, "sell", "c2", ref_price=5.0, cap=9)  # never above cap x books x 3
         b = mk(pos={"AAA": -1})
         with self.assertRaisesRegex(BrokerError, "cap is 1"):
-            b.submit("AAA", 1, "sell", "c3", ref_price=5.0, cap=3)  # one listed book
+            b.submit("AAA", 1, "sell", "c3", ref_price=5.0, cap=1)  # BrokerSync's own cap holds
 
     def test_order_value_cap_uses_the_reference_price(self):
         b = mk()
@@ -648,6 +651,57 @@ class SyncTests(unittest.TestCase):
         live.sync(self.NOW)
         self.assertEqual(self.b.fake.pos, {})
         self.assertEqual(posted(self.b.fake)[1]["openClose"], "Close")
+
+    def tranche(self, sid, sym, sleeve, side, qty=100):
+        self.stores["5m"].x(
+            """INSERT INTO tranches (symbol_id, symbol, sleeve, side, qty, entry_time, entry_price,
+               stop_price, risk_dollars, fee_through, trigger) VALUES (?,?,?,?,?,?,10,11,100,
+               '2026-11-09','cross')""", (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
+
+    def test_each_live_tranche_is_a_share_and_a_10_20_long_goes_long(self):
+        """Dean, 2026-11-27: 5/10 short, 10/20 long and short, VWAP short, one share
+        each per book, netted in the one account."""
+        sid = self.add_live("AAA", last_price=5.0)
+        self.eng.set_live(sid, ["EMA5_10", "EMA10_20", "VWAP"], self.NOW)
+        self.tranche(sid, "AAA", "EMA10_20", "short")
+        self.tranche(sid, "AAA", "VWAP", "short")
+        live = self.link(TZ_MAX_ORDER_USD="2500")
+        self.assertEqual(live.desired(), {"AAA": -2})
+        self.assertEqual(live._cap("AAA"), 3)                 # one share for each Live tranche
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {"AAA": -2})
+        # the 10/20 reverses long, the VWAP short still open: net flat
+        self.stores["5m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.2, "
+                            "exit_reason='10/20 EMA crossed up' WHERE sleeve='EMA10_20'", (self.NOW.isoformat(),))
+        self.tranche(sid, "AAA", "EMA10_20", "long")
+        self.assertEqual(live.desired(), {"AAA": 0})
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {})
+        # the VWAP short covers: the account goes long one share, in two legs from short
+        self.stores["5m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.2, "
+                            "exit_reason='target' WHERE sleeve='VWAP'", (self.NOW.isoformat(),))
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {"AAA": 1})
+        last = posted(self.b.fake)[-1]
+        self.assertEqual((last["side"], last["openClose"]), ("Buy", "Open"))
+        # a 5/10 long in the model is flat here: only the 10/20 goes long live
+        self.tranche(sid, "AAA", "EMA5_10", "long")
+        self.assertEqual(live.desired(), {"AAA": 1})
+
+    def test_a_short_to_long_flip_closes_first_then_opens(self):
+        sid = self.add_live("BBB", last_price=5.0)
+        self.eng.set_live(sid, ["EMA10_20"], self.NOW)
+        self.tranche(sid, "BBB", "EMA10_20", "short")
+        live = self.link(TZ_MAX_ORDER_USD="2500")
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {"BBB": -1})
+        self.stores["5m"].x("UPDATE tranches SET status='closed', exit_time=?, exit_price=10.2, "
+                            "exit_reason='10/20 EMA crossed up'", (self.NOW.isoformat(),))
+        self.tranche(sid, "BBB", "EMA10_20", "long")
+        live.sync(self.NOW)
+        self.assertEqual(self.b.fake.pos, {"BBB": 1})
+        legs = [(o["side"], o["openClose"], o["orderQuantity"]) for o in posted(self.b.fake)[1:]]
+        self.assertEqual(legs, [("Buy", "Close", 1), ("Buy", "Open", 1)])
 
     def test_fixed_size_trades_the_locate_lot_whatever_the_model_holds(self):
         """TZ_SHARES=100: the model short 37 or 150, TradeZero short exactly 100,

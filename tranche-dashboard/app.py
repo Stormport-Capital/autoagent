@@ -555,12 +555,13 @@ def live_check(live: "LiveSync | None", note: str | None) -> str:
     b = live.broker
     try:
         a = b.account()
-        size = (f"{b.fixed_shares} shares per symbol (fixed)" if getattr(b, "fixed_shares", None)
-                else f"cap {b.max_shares} share(s) per symbol")
+        size = (f"{b.fixed_shares} shares per tranche (fixed)" if getattr(b, "fixed_shares", None)
+                else f"cap {b.max_shares} share(s) per tranche and book")
         return (f"{b.venue}: OK - {a['account_id']} net liquidation ${float(a['equity']):,.2f}; "
                 f"{size}, daily loss limit "
                 f"${b.daily_loss_limit:,.0f}; {', '.join(live.book_labels)} "
-                f"book{'s' if len(live.book_labels) > 1 else ''}, 5/10 EMA short only, "
+                f"book{'s' if len(live.book_labels) > 1 else ''}, tranches: 5/10 short, 10/20 "
+                f"{'long and short' if getattr(b, 'allows_longs', False) else 'short'}, VWAP short; "
                 f"flat by 15:55 where the row's EOD close is on; "
                 f"{len(live.selections())} live symbol(s)")
     except Exception as e:

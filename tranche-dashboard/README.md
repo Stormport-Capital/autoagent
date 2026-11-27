@@ -16,14 +16,14 @@ the model's prices on the same trades, and each tab's *Broker orders* lists that
 book's TradeZero orders. **Droplet commands to copy and paste: [COMMANDS.md](COMMANDS.md).** **Data keys and setup: [SETUP.md](SETUP.md)** (its
 Alpaca paper steps no longer apply).
 
-**Interactive Brokers (paper or LIVE), one book, 5/10 short only:** set
+**Live trading** (TradeZero now: 5/10 short, 10/20 long and short, VWAP-fail short per symbol, see TRADEZERO.md). **Interactive Brokers (paper or LIVE), one book, 5/10 short only:** set
 `IBKR_ACCOUNT` and one IBKR account trades through IB Gateway. It follows the
 **5-min book** (`IBKR_BOOK`) only. On that tab, a row's **Live** button sends
 that symbol's **5/10 EMA tranche, short only**:
 - 1 share; a long signal means flat;
 - enters on a down-cross on any bar (stop fixed at the day's high at entry),
   or at the 9:45 close if the 5 EMA is below the 10 and nothing was entered
-  yet that day (stop fixed at the 9:30-9:45 high); at most 2 entries a day;
+  yet that day (stop fixed at the 9:30-9:45 high); no daily entry limit;
 - covered on a 5-minute close above that stop (market order), on the up-cross,
   or at the 3:55 PM close when the row's EOD close is on (off: it may hold
   overnight at the live account too).

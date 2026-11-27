@@ -165,3 +165,12 @@ Added with the TradeZero link (2026-11-09):
     reads the other way ("missed when it happened ... acted on at this
     close"). On the first check after this deploy, an open EMA tranche whose
     cross was already missed closes (and, with Long on, reverses) at that bar.
+29. **2026-11-27: the live account follows more than the 5/10 short.** The
+    Live button picks any of the 5/10 short, the 10/20 long and short, and the
+    VWAP-fail short, one share each per book, netted in the one account (a
+    10/20 long and a 5/10 short in a symbol are flat at the broker). The live
+    10/20 has a stop fixed at entry (day's high for a short, day's low for a
+    long, 5-minute close through it). The 5/10's two-entries-a-day cap is
+    gone. The VWAP tranche has no 5-minute stop sweep: on the 15-min and
+    hourly books its live exit waits for the book's check. IBKR stays short
+    only. tz_reconcile's live-vs-model line now matches any Live tranche.

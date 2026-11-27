@@ -1,7 +1,8 @@
 """TradeZero link (paper or LIVE) for the books in TZ_BOOKS (default the
 5-minute book only; for example TZ_BOOKS=5m,15m,1h), over TradeZero's REST
-Trading API (https://webapi.tradezero.com/v1/api). Same scope as the IBKR
-link: short only, the 5/10 EMA tranche only, flat by 15:55, one share.
+Trading API (https://webapi.tradezero.com/v1/api). It follows the Live tranches
+of each symbol (broker.LiveSync): the 5/10 short, the 10/20 long and short, the
+VWAP-fail short; one share per tranche and book; EOD close per row.
 
 TradeZeroBroker speaks the same small interface as ibkr.IBKRBroker (account,
 positions, open_orders, get_order, submit, cancel, short_check, day_pnl), so
@@ -14,15 +15,18 @@ Safety, enforced here independently of BrokerSync:
     type. The first call of every request checks this; a mismatch sends
     nothing. The account must also be "Active".
   * No order may take a symbol's position beyond TZ_MAX_SHARES (default 1)
-    for each book it is Live in (BrokerSync passes the count; this adapter
-    never allows more than TZ_MAX_SHARES x the number of books in TZ_BOOKS).
+    for each Live tranche in each book (BrokerSync passes the count; this
+    adapter never allows more than TZ_MAX_SHARES x the number of books in
+    TZ_BOOKS x 3 tranches).
     Orders that only reduce a position are always allowed.
     TZ_SHARES=100 makes the position a fixed 100 shares whenever the model's
-    tranche is short (and sets the cap to 100 unless TZ_MAX_SHARES says more):
+    tranche is short or long (and sets the cap to 100 unless TZ_MAX_SHARES says more):
     a locate covers 100 shares at minimum, so a 100-share short uses what the
     locate fee bought. The order-value cap (TZ_MAX_ORDER_USD) still applies to
     the whole order.
-  * Short only: a buy that would leave any position above zero is refused.
+  * Longs (2026-11-27): a buy may open a long; only a Live 10/20 long asks
+    for one (LiveSync). A long needs no locate. An order that would cross
+    through zero is still refused: BrokerSync closes first, then opens.
   * No order worth more than TZ_MAX_ORDER_USD (default 1,000). TradeZero's
     API has no quotes, so the model's last price is the reference (passed in
     by BrokerSync). An OPENING order with no price is refused; a CLOSING
@@ -63,7 +67,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from broker import BrokerError
+from broker import LIVE_TRANCHES_PER_BOOK, BrokerError
 from ibkr import BOOK_KEYS, _num, limit_price
 from indicators import ET
 
@@ -194,6 +198,7 @@ class TradeZeroBroker:
         self.endpoint = f"TradeZero API ({HOST}), account {cfg.account} ({cfg.mode})"
         self.max_shares, self.daily_loss_limit = cfg.max_shares, cfg.daily_loss_limit
         self.fixed_shares = cfg.shares  # BrokerSync.desired: exactly this many, or none
+        self.allows_longs = True  # LiveSync: a Live 10/20 long goes long here (2026-11-27)
         self.reprice_s = cfg.reprice_s if cfg.order_type == "limit" else 0
         self.http = session or requests.Session()
         self.http.headers.update({"TZ-API-KEY-ID": cfg.key_id, "TZ-API-SECRET-KEY": cfg.secret,
@@ -416,12 +421,13 @@ class TradeZeroBroker:
                ref_price: float | None = None, order_type: str | None = None,
                cap: int | None = None) -> dict:
         """`cap`: BrokerSync's share cap for this symbol (max_shares for each
-        book it is Live in); never above max_shares x the number of books."""
+        Live tranche in each book); never above max_shares x books x 3."""
         cfg = self.cfg
         qty = int(qty)
         if qty < 1 or side not in ("buy", "sell"):
             raise BrokerError(f"TradeZero: bad order {side} {qty}")
-        limit = min(int(cap or cfg.max_shares), cfg.max_shares * max(1, len(cfg.books)))
+        limit = min(int(cap or cfg.max_shares),
+                    cfg.max_shares * max(1, len(cfg.books)) * LIVE_TRANCHES_PER_BOOK)
         if not client_order_id or len(client_order_id) > 36:
             raise BrokerError("TradeZero: clientOrderId must be 1-36 characters")
         row = self._account_row()
@@ -434,11 +440,8 @@ class TradeZeroBroker:
         new = cur + (qty if side == "buy" else -qty)
         if abs(new) > limit and abs(new) > abs(cur):
             raise BrokerError(f"TradeZero: refused, {symbol} would go from {cur:+d} to {new:+d} "
-                              f"shares; the cap is {limit} ({cfg.max_shares} per book, "
+                              f"shares; the cap is {limit} ({cfg.max_shares} per tranche and book, "
                               f"TZ_MAX_SHARES)")
-        if new > 0:
-            raise BrokerError(f"TradeZero: refused, a buy would take {symbol} from {cur:+d} to "
-                              f"{new:+d}; this link is short only")
         closing = (cur < 0 and side == "buy") or (cur > 0 and side == "sell")
         if closing and abs(qty) > abs(cur):
             raise BrokerError(f"TradeZero: refused, {side} {qty} {symbol} would cross through "

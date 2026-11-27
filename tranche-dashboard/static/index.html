@@ -368,7 +368,7 @@ function renderWatch(S) {
     const stack = n.ema5 == null ? "warming up" :
       `<span title="${n.ema5 < n.ema10 ? "5 below 10" : "5 above 10"}; ${n.ema10 < n.ema20 ? "10 below 20" : "10 above 20"}">${num(n.ema5)} / ${num(n.ema10)} / ${num(n.ema20)}</span>`;
     const below = n.vwap != null && s.last_price != null && s.last_price < n.vwap;
-    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="${esc(LVN())} follows this symbol's 5/10 EMA short: ${(STATE.live.control || {}).max_shares || 1} share(s), short only; enters on a down-cross (stop: day's high at entry), or at the 9:45 close if the 5 EMA is below the 10 and nothing was entered yet (stop: opening-range high); at most 2 entries a day; the row's EOD close button decides the 3:55 PM flat">${STATE.live.live ? "LIVE" : esc(LVN())} 5/10 short${s.eod_close ? " · flat 3:55" : " · may hold overnight"}</span>` : ""}
+    h += `<tr><td><span class="sym">${esc(s.symbol)}</span>${s.status === "paused" ? ' <span class="pill warn">paused</span>' : ""}${s.eod_close ? ' <span class="pill" title="Close by end of day: flat at the 3:55 PM close, no new entries after 3:55">EOD</span>' : ""}${s.live ? ` <span class="pill short" title="${esc(LVN())} follows this symbol's ${liveText(s)}: ${(STATE.live.control || {}).max_shares || 1} share(s) per tranche. 5/10 short: a down-cross (stop: day's high at entry) or the 9:45 close with the 5 EMA below the 10 and nothing entered yet (stop: opening-range high). 10/20: a down-cross shorts (stop: day's high), an up-cross goes long where Long is on (stop: day's low). VWAP fail: short, with the model's high-of-day stop and targets. EMA stops act on a 5-minute close through them. The row's EOD close button decides the 3:55 PM flat">${STATE.live.live ? "LIVE" : esc(LVN())} ${liveText(s)}${s.eod_close ? " · flat 3:55" : " · may hold overnight"}</span>` : ""}
         ${s.error ? `<div class="err-text">${esc(s.error)}</div>` : ""}</td>
       <td class="l">${s.mode === "long_short" ? "Long &amp; short" : "Short only"} ·
         <select class="gradesel" data-id="${s.id}" title="Grade sets risk for new entries">
@@ -386,7 +386,7 @@ function renderWatch(S) {
         <button class="small" data-act="status" data-id="${s.id}" data-v="${s.status === "paused" ? "active" : "paused"}">${s.status === "paused" ? "Resume" : "Pause"}</button>
         <button class="small" data-act="eod" data-id="${s.id}" data-on="${s.eod_close ? 0 : 1}" title="${s.eod_close ? "Stop closing at end of day (positions may be held overnight again)" : "Trade all day, then be flat at the 3:55 PM close every session"}">${s.eod_close ? "EOD close: on" : "EOD close: off"}</button>
         <button class="small" data-act="mode" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.mode === "long_short" ? "short_only" : "long_short"}" title="${s.mode === "long_short" ? "Long is on: the 5/10 and 10/20 tranches go long on an up-cross. Click to make this symbol short only" : "Long is off (short only). Click to let the 5/10 and 10/20 tranches go long on an up-cross (it covers the short and reverses)"}, from the next cross. This book only; VWAP stays short only; the live account only ever shorts">${s.mode === "long_short" ? "Long: on" : "Long: off"}</button>
-        ${STATE.live.configured && (STATE.live.books || [STATE.live.book]).includes(BOOK) ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" title="Trade this symbol's 5/10 EMA short at ${esc(LVN())} (${(STATE.live.control || {}).max_shares || 1} share(s); the EOD close button decides the 3:55 PM flat)">${s.live ? "Live: on" : "Live: off"}</button>` : ""}
+        ${STATE.live.configured && (STATE.live.books || [STATE.live.book]).includes(BOOK) ? `<button class="small" data-act="live" data-id="${s.id}" data-sym="${esc(s.symbol)}" data-v="${s.live || ""}" title="Choose which of this symbol's tranches trade at ${esc(LVN())}: 5/10 short, 10/20 long and short, VWAP fail short (${(STATE.live.control || {}).max_shares || 1} share(s) each; the EOD close button decides the 3:55 PM flat)">${s.live ? "Live: on" : "Live: off"}</button>` : ""}
         <button class="small" data-act="flatten" data-id="${s.id}">Flatten</button>
         <button class="small" data-act="rename" data-id="${s.id}" data-sym="${esc(s.symbol)}" title="Ticker changed? Move this symbol and its open positions to the new ticker">Rename</button>
         <button class="small" data-act="status" data-id="${s.id}" data-v="removed">Remove</button></td></tr>`;
@@ -446,6 +446,12 @@ function renderChart(curve, start) {
 }
 
 const SL_SHORT = {EMA5_10: "5/10", EMA10_20: "10/20", VWAP: "VWAP"};
+// what a Live row trades: "5/10 short + 10/20 long/short + VWAP short"
+function liveText(s) {
+  const ls = s.mode === "long_short";
+  const one = {EMA5_10: "5/10 short", EMA10_20: ls ? "10/20 long/short" : "10/20 short", VWAP: "VWAP short"};
+  return (s.live || "").split(",").filter(Boolean).map(x => one[x] || x).join(" + ");
+}
 
 // one broker card: this book's Alpaca paper account (p="bk") or the shared live account (p="lv")
 function renderLiveAlert(L) {
@@ -481,9 +487,9 @@ function renderBroker(B, o) {
     (C.kill ? `<span class="pill warn">kill switch: ${esc(C.kill)}</span>` : on ? '<span class="pill long">orders on</span>' : '<span class="pill">orders off</span>');
   const mism = (B.reconciliation || []).filter(r => !r.match);
   let h = `<label class="switch"><input type="checkbox" id="${o.p}Toggle" ${on ? "checked" : ""}> Send ${o.shared ? "the Live symbols' trades" : "the model's trades"} to ${V}</label>
-    <div class="hint">${esc(B.endpoint)}. ${o.shared ? `${esc((B.book_labels || [B.book_label]).join(", "))} book${(B.book_labels || []).length > 1 ? "s" : ""}: mark symbols with the <b>Live</b> button on that tab's watchlist (a symbol may be Live in several books). 5/10 EMA short only; a row's <b>EOD close</b> button decides whether it is flat by 3:55 PM or may hold overnight. Orders go out after each check of the symbol's book; stops are checked on every 5-minute close.` : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
+    <div class="hint">${esc(B.endpoint)}. ${o.shared ? `${esc((B.book_labels || [B.book_label]).join(", "))} book${(B.book_labels || []).length > 1 ? "s" : ""}: mark symbols with the <b>Live</b> button on that tab's watchlist and pick their tranches: 5/10 short, 10/20 long and short (long where the row's Long is on), VWAP fail short. A symbol may be Live in several books. A row's <b>EOD close</b> button decides whether it is flat by 3:55 PM or may hold overnight. Orders go out after each check of the symbol's book; the EMA tranches' stops are checked on every 5-minute close.` : `Orders go out right after each ${esc(STATE.book.label)} check.`}</div>`;
   if (C.max_shares || C.daily_loss_limit)
-    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol${o.shared ? " and book" : ""} (${o.shared ? "short only: the 5/10 short's direction, not its size; a symbol Live in two books may hold two" : "the model's direction, not its size"})` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
+    h += `<div class="hint">Limits: ${C.max_shares ? `at most ${C.max_shares} share${C.max_shares > 1 ? "s" : ""} per symbol${o.shared ? ", tranche and book" : ""} (${o.shared ? "each Live tranche's direction, not its size; the account holds the sum, so a 10/20 long and a 5/10 short in one symbol net to flat" : "the model's direction, not its size"})` : "no share cap"}${C.daily_loss_limit ? ` · daily loss limit ${usd(C.daily_loss_limit)}` : ""}.</div>`;
   if (a) h += `<div class="bk-kpis">
       <div><span>${o.shared ? "Net liquidation" : "Equity"}</span>${usd(a.equity)}</div><div><span>Today${C.daily_loss_limit ? ` (limit −${usd(C.daily_loss_limit)})` : ""}</span><b class="${cls(a.day_pl)}">${a.day_pl == null ? "—" : signed(a.day_pl)}</b></div>
       <div><span>Buying power</span>${a.buying_power == null ? "—" : usd(a.buying_power)}</div><div><span>Cash</span>${a.cash == null ? "—" : usd(a.cash)}</div></div>`;
@@ -808,8 +814,8 @@ $("#watch").onclick = async e => {
     dlg.querySelectorAll(".lvName").forEach(e => { e.textContent = LVN(); });
     const m = STATE.book.minutes, bars = m >= 60 ? "hourly" : `${m}-minute`;
     $("#liveEntry").textContent = m >= 60
-      ? `Entry: a down-cross at an hourly bar close (stop: the day's high at entry); there is no 9:45 entry on hourly bars; at most 2 a day.`
-      : `Entry: a down-cross at any ${bars} bar close (stop: the day's high at entry), or the 9:45 bar close if the 5 EMA is below the 10 and nothing was entered yet that day (stop: the 9:30-9:45 high); at most 2 a day.`;
+      ? `Entry: a down-cross at an hourly bar close (stop: the day's high at entry); there is no 9:45 entry on hourly bars; no daily limit.`
+      : `Entry: a down-cross at any ${bars} bar close (stop: the day's high at entry), or the 9:45 bar close if the 5 EMA is below the 10 and nothing was entered yet that day (stop: the 9:30-9:45 high); no daily limit.`;
     $("#liveCap").textContent = (STATE.live.control || {}).max_shares || "no";
     dlg.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = cur.includes(c.value));
     dlg.onclose = async () => {
@@ -823,7 +829,7 @@ $("#watch").onclick = async e => {
   }
   if (b.dataset.act === "mode") {
     const ls = b.dataset.v === "long_short";
-    if (!confirm(ls ? `${b.dataset.sym} (${STATE.book.label} book): long & short for the 5/10 and 10/20 tranches. From the next cross, an up-cross covers a short and goes long, a down-cross sells a long and goes short. Open positions stay until their opposite cross. The live account still only shorts.`
+    if (!confirm(ls ? `${b.dataset.sym} (${STATE.book.label} book): long & short for the 5/10 and 10/20 tranches. From the next cross, an up-cross covers a short and goes long, a down-cross sells a long and goes short. Open positions stay until their opposite cross. Where the 10/20 is Live, the live account goes long with it; other tranches stay short only there.`
                     : `${b.dataset.sym} (${STATE.book.label} book): short only. An open long stays until the next down-cross, which sells it and goes short.`)) return;
     try { await api(bk(`/api/symbols/${b.dataset.id}/mode`), {mode: b.dataset.v}); } catch (err) { alert(err.message); }
     return refresh();
@@ -854,8 +860,13 @@ setInterval(refresh, 5000);
 <dialog id="liveDlg">
   <form method="dialog">
     <h3 style="margin:0 0 6px"><span class="lvName">IBKR</span> live: <span id="liveSym"></span></h3>
-    <div class="hint" style="margin:0 0 8px"><span class="lvName">IBKR</span> follows this symbol's 5/10 EMA tranche, short only (a long signal means flat), <span id="liveCap"></span> share(s). <span id="liveEntry"></span> Exit: a 5-minute close above the stop (checked at every 5-minute close; market order), the up-cross, or the 3:55 PM close when the row's EOD close is on. With EOD close off the position may hold overnight, at the live account too. A symbol may be Live in several books: each book's trade is its own position and the account holds the sum. Turning Live on applies these rules to the model's 5/10 tranche for this symbol. VWAP-fail and 10/20 can't trade live.</div>
+    <div class="hint" style="margin:0 0 8px"><span class="lvName">IBKR</span> follows the tranches ticked here, <span id="liveCap"></span> share(s) each. Each tranche in each book is its own position and the account holds the sum, so a 10/20 long and a 5/10 short in this symbol net to flat. The row's EOD close decides the 3:55 PM flat; with it off positions may hold overnight, at the live account too. Turning a tranche on applies its live rules to the model's tranche for this symbol.</div>
     <label class="switch"><input type="checkbox" value="EMA5_10"> 5/10 EMA cross (short)</label>
+    <div class="hint" style="margin:0 0 6px 24px"><span id="liveEntry"></span> Exit: a 5-minute close above the stop (market order), the up-cross, or the 3:55 PM close when EOD close is on.</div>
+    <label class="switch"><input type="checkbox" value="EMA10_20"> 10/20 EMA cross (long &amp; short)</label>
+    <div class="hint" style="margin:0 0 6px 24px">A down-cross shorts (stop: the day's high at entry); an up-cross covers and, where the row's Long is on, goes long (stop: the day's low at entry). Exit: a 5-minute close through the stop (market order) or the opposite cross. Longs need TradeZero; IBKR stays short only.</div>
+    <label class="switch"><input type="checkbox" value="VWAP"> VWAP fail (short)</label>
+    <div class="hint" style="margin:0 0 6px 24px">The model's VWAP-fail short: its high-of-day stop, 10-day-average target and time stop. The live account acts at the book's check after the model's exit, so on the 15-min and hourly books its stop can trail the model's by up to a bar.</div>
     <div class="row" style="margin-top:12px"><button value="save" class="primary">Save</button> <button value="off">Live off</button> <button value="cancel">Cancel</button></div>
   </form>
 </dialog>

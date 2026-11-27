@@ -13,7 +13,7 @@ What it compares:
   * TradeZero's cash ledger: locate fees, overnight borrow, other charges;
     today's locates from its locate history when the ledger hasn't posted them;
   * TradeZero's open positions and their unrealized P&L;
-  * the model's 5/10 tranche behind each live trade, for live-vs-model prices.
+  * the model's tranche (5/10, 10/20 or VWAP) behind each live trade, for live-vs-model prices.
 
 And reports:
   * MATCH / mismatch per day, symbol and side (a fill only at TradeZero is a
@@ -220,9 +220,10 @@ def _book_keys(order: dict) -> list[str]:
 
 
 def _model_for(trip: dict, order: dict, key: str, books: dict, used: set) -> dict | None:
-    """The model's 5/10 tranche behind a live trip in one book: same symbol and
-    side, entered closest to the dashboard order that opened that book's part
-    of the trip (within 20 minutes), not already matched to another trip.
+    """The model's tranche behind a live trip in one book: any Live tranche
+    (5/10, 10/20, VWAP), same symbol and side, entered closest to the dashboard
+    order that opened that book's part of the trip (within 20 minutes), not
+    already matched to another trip.
     Before 2026-11-24 it took the day's first tranche, so a second trade in a
     symbol on a day was compared with the first."""
     st = books.get(key)
@@ -230,9 +231,9 @@ def _model_for(trip: dict, order: dict, key: str, books: dict, used: set) -> dic
         return None
     when = datetime.fromisoformat(order["ts"])
     best = None
-    for r in st.q("SELECT id, entry_time, entry_price, exit_price, exit_reason, status, stop_price "
-                  "FROM tranches WHERE symbol=? AND sleeve='EMA5_10' AND side=? "
-                  "ORDER BY entry_time", (trip["symbol"], trip["side"])):
+    for r in st.q("SELECT id, sleeve, entry_time, entry_price, exit_price, exit_reason, status, "
+                  "stop_price FROM tranches WHERE symbol=? AND sleeve IN ('EMA5_10', 'EMA10_20', "
+                  "'VWAP') AND side=? ORDER BY entry_time", (trip["symbol"], trip["side"])):
         gap = abs((datetime.fromisoformat(r["entry_time"]) - when).total_seconds())
         if gap <= 1200 and (key, r["id"]) not in used and (best is None or gap < best[0]):
             best = (gap, r)
@@ -491,7 +492,9 @@ def format_report(r: dict) -> str:
         out.append(line)
         m = x.get("model")
         if m:
-            out.append(f"      model ({m['book']}): in {px(m['entry_price'])}, out {px(m['exit_price'])}"
+            tr = {"EMA5_10": "5/10", "EMA10_20": "10/20", "VWAP": "VWAP"}.get(m.get("sleeve"), "")
+            out.append(f"      model ({m['book']}{' ' + tr if tr else ''}): in {px(m['entry_price'])}, "
+                       f"out {px(m['exit_price'])}"
                        f" ({m['exit_reason'] or m['status']}); live vs model per share: entry "
                        f"{x.get('entry_vs_model') if x.get('entry_vs_model') is not None else '-'}, exit "
                        f"{x.get('exit_vs_model') if x.get('exit_vs_model') is not None else '-'} "

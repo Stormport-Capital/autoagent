@@ -43,7 +43,7 @@ import time as _time
 from dataclasses import dataclass
 from datetime import datetime
 
-from broker import BrokerError
+from broker import LIVE_TRANCHES_PER_BOOK, BrokerError
 from indicators import ET
 
 DEFAULT_PORTS = {"paper": 4002, "live": 4001}  # IB Gateway; TWS uses 7497 / 7496
@@ -415,12 +415,13 @@ class IBKRBroker:
         qty = int(qty)
         if qty < 1 or side not in ("buy", "sell"):
             raise BrokerError(f"IBKR: bad order {side} {qty}")
-        limit = min(int(cap or cfg.max_shares), cfg.max_shares * max(1, len(cfg.books)))
+        limit = min(int(cap or cfg.max_shares),
+                    cfg.max_shares * max(1, len(cfg.books)) * LIVE_TRANCHES_PER_BOOK)
         cur = self._position(symbol)
         new = cur + (qty if side == "buy" else -qty)
         if abs(new) > limit and abs(new) > abs(cur):
             raise BrokerError(f"IBKR: refused, {symbol} would go from {cur:+d} to {new:+d} "
-                              f"shares; the cap is {limit} ({cfg.max_shares} per book, "
+                              f"shares; the cap is {limit} ({cfg.max_shares} per tranche and book, "
                               f"IBKR_MAX_SHARES)")
         if new > 0:
             raise BrokerError(f"IBKR: refused, a buy would take {symbol} from {cur:+d} to "

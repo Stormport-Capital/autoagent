@@ -2361,19 +2361,19 @@ class LiveSelectionTests(unittest.TestCase):
                     (sid, sym, sleeve, side, qty, self.NOW.isoformat()))
 
     def test_scope_constants(self):
-        self.assertEqual(LIVE_SLEEVES, ("EMA5_10",))
+        self.assertEqual(LIVE_SLEEVES, ("EMA5_10", "EMA10_20", "VWAP"))  # Dean, 2026-11-27
         self.assertEqual((self.live.live_book, self.live.book_label), ("5m", "5-min"))
 
-    def test_only_the_5_10_tranche_of_the_live_book_counts(self):
+    def test_only_the_live_tranches_of_the_live_book_count(self):
         sid = self.add("5m", "AAA")
         self.tranche("5m", "AAA", "VWAP", "short", 50)
         self.engines["5m"].set_live(sid, ["EMA5_10"], self.NOW)
         self.live.sync(self.NOW)
-        self.assertEqual(self.ib.placed, [])  # VWAP short open, 5/10 flat: nothing live
+        self.assertEqual(self.ib.placed, [])  # VWAP short open but not Live, 5/10 flat: nothing
         self.tranche("5m", "AAA", "EMA5_10", "short", 100)
         self.live.sync(self.NOW)
         self.assertEqual(self.ib.pos, {"AAA": -1})
-        # marked live in another book, or for another tranche, straight in the db: ignored
+        # marked live in a book this link doesn't trade: ignored; a Live VWAP tranche counts
         hid = self.add("1h", "HHH")
         self.tranche("1h", "HHH", "EMA5_10", "short", 10)
         self.stores["1h"].x("UPDATE symbols SET live='EMA5_10' WHERE id=?", (hid,))
@@ -2381,8 +2381,8 @@ class LiveSelectionTests(unittest.TestCase):
         self.tranche("5m", "VVV", "VWAP", "short", 10)
         self.stores["5m"].x("UPDATE symbols SET live='VWAP' WHERE id=?", (vid,))
         self.live.sync(self.NOW)
-        self.assertEqual(self.ib.pos, {"AAA": -1})
-        self.assertEqual(set(self.live.selections()), {"AAA"})
+        self.assertEqual(self.ib.pos, {"AAA": -1, "VVV": -1})
+        self.assertEqual(set(self.live.selections()), {"AAA", "VVV"})
 
     def test_short_only_a_long_signal_means_flat(self):
         sid = self.add("5m", "AAA")
@@ -2431,12 +2431,14 @@ class LiveSelectionTests(unittest.TestCase):
         self.live.sync(self.NOW)
         self.assertEqual(self.ib.pos, {})
 
-    def test_set_live_refuses_vwap_and_10_20(self):
+    def test_set_live_takes_the_three_tranches_and_refuses_others(self):
         a = self.add("5m", "AAA")
-        for bad in (["VWAP"], ["EMA10_20"], ["EMA5_10", "VWAP"], ["MACD"]):
-            with self.assertRaises(ValidationError):
-                self.engines["5m"].set_live(a, bad, self.NOW)
+        with self.assertRaises(ValidationError):
+            self.engines["5m"].set_live(a, ["MACD"], self.NOW)
         self.assertIsNone(self.stores["5m"].q("SELECT live FROM symbols")[0]["live"])
+        self.assertEqual(self.engines["5m"].set_live(a, ["VWAP", "EMA5_10", "EMA10_20"], self.NOW),
+                         ["EMA5_10", "EMA10_20", "VWAP"])
+        self.assertEqual(self.stores["5m"].q("SELECT live FROM symbols")[0]["live"], "EMA5_10,EMA10_20,VWAP")
         self.assertEqual(self.engines["5m"].set_live(a, ["EMA5_10"], self.NOW), ["EMA5_10"])
 
     def test_http_live_routes(self):
@@ -2480,9 +2482,9 @@ class LiveSelectionTests(unittest.TestCase):
             code, err = call(f"/api/1h/symbols/{h}/live", {"sleeves": ["EMA5_10"]})
             self.assertEqual(code, 400)
             self.assertIn("only in the 5-min book", err["error"])
-            code, err = call(f"/api/5m/symbols/{f}/live", {"sleeves": ["VWAP"]})
+            code, err = call(f"/api/5m/symbols/{f}/live", {"sleeves": ["MACD"]})
             self.assertEqual(code, 400)
-            self.assertIn("only the 5/10 EMA tranche", err["error"])
+            self.assertIn("unknown tranche", err["error"])
             self.assertEqual(call(f"/api/5m/symbols/{f}/live", {"sleeves": ["EMA5_10"]})[0], 200)
             self.assertEqual(self.stores["5m"].q("SELECT live FROM symbols")[0]["live"], "EMA5_10")
             self.assertEqual(call(f"/api/1h/symbols/{h}/live", {"sleeves": []})[0], 200)  # off is fine
@@ -2555,6 +2557,54 @@ class LiveRuleEngineTests(unittest.TestCase):
     # ---- entries
     BARS = [(10.0, 10.3), (9.9, 10.1), (9.8, 10.0), (9.7, 9.9), (9.75, 9.9), (9.6, 9.8), (9.5, 9.7)]
 
+    # ---- the live 10/20 (Dean, 2026-11-27): crosses both ways, a fixed stop set at entry
+    def step1020(self, eng, bars, i, c):
+        from engine import Fill
+        b = bars[i]
+        t = next(iter(self.store.q("SELECT * FROM tranches WHERE status='open' AND sleeve='EMA10_20'")), None)
+        eng._live_1020(self.sym(), t, Fill(b.close, b.end, b.session, "at the bar close"), bars,
+                       bars, i, self.UNIT, self.store.settings(), c, "ctx")
+
+    def test_live_1020_short_then_long_with_the_days_high_and_low_as_stops(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine(mode="long_short")
+        eng.set_live(1, ["EMA10_20"], datetime.combine(self.D, time(9), tzinfo=ET))
+        self.step1020(eng, bars, 2, -1)                       # down-cross on the 9:40-9:45 bar
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA10_20'")[0]
+        self.assertEqual((t["side"], t["trigger"], t["stop_price"]), ("short", "cross", 10.3))
+        self.assertIn("stop = day's high at entry 10.3", self.store.q(
+            "SELECT message FROM events WHERE kind='entry' AND sleeve='EMA10_20'")[0]["message"])
+        self.step1020(eng, bars, 4, 1)                        # up-cross: cover and go long
+        rows = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA10_20' ORDER BY id")
+        self.assertEqual([(r["side"], r["status"]) for r in rows], [("short", "closed"), ("long", "open")])
+        low = min(b.low for b in bars[:5])
+        self.assertEqual((rows[1]["trigger"], rows[1]["stop_price"]), ("cross", low))
+
+    def test_live_1020_takes_no_long_where_long_is_off(self):
+        bars = self.five(self.BARS)
+        eng = self.live_engine()                              # short only
+        eng.set_live(1, ["EMA10_20"], datetime.combine(self.D, time(9), tzinfo=ET))
+        self.step1020(eng, bars, 2, -1)
+        self.step1020(eng, bars, 4, 1)
+        rows = self.store.q("SELECT side, status FROM tranches WHERE sleeve='EMA10_20'")
+        self.assertEqual([(r["side"], r["status"]) for r in rows], [("short", "closed")])
+
+    def test_live_1020_long_stops_on_a_5_min_close_below_the_days_low(self):
+        from engine import Fill
+        bars = self.five([(10.0, 10.1), (10.2, 10.3), (10.4, 10.5), (10.1, 10.4), (9.7, 10.1)])
+        eng = self.live_engine(mode="long_short")
+        eng.set_live(1, ["EMA10_20"], datetime.combine(self.D, time(9), tzinfo=ET))
+        self.step1020(eng, bars, 2, 1)                        # long at 10.4, stop = day's low
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA10_20'")[0]
+        stop = min(b.low for b in bars[:3])
+        self.assertEqual((t["side"], t["stop_price"]), ("long", stop))
+        self.assertFalse(eng._live_stop(dict(t), bars, bars[3], self.store.settings()))  # 10.1: above
+        self.assertTrue(eng._live_stop(dict(t), bars, bars[4], self.store.settings()))   # 9.7: below
+        t = self.store.q("SELECT * FROM tranches WHERE sleeve='EMA10_20'")[0]
+        self.assertEqual(t["status"], "closed")
+        self.assertAlmostEqual(t["exit_price"], 9.7 * (1 - 5 / 1e4))  # a sell, slippage adverse
+        self.assertIn(f"5-min close 9.7 below the fixed stop {stop:.4g}", t["exit_reason"])
+
     def test_state_entry_on_the_0945_bar_with_the_opening_range_high_stop(self):
         bars = self.five(self.BARS)
         eng = self.live_engine()
@@ -2604,7 +2654,8 @@ class LiveRuleEngineTests(unittest.TestCase):
         rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
         self.assertEqual([r["trigger"] for r in rows], ["cross", "cross"])
 
-    def test_two_entries_a_day_at_most(self):
+    def test_no_daily_cap_on_entries(self):
+        """Dean, 2026-11-27: the 2-entries-a-day cap is gone; every fresh cross enters."""
         bars = self.five(self.BARS)
         eng = self.live_engine()
         # below from the open (no cross), up at 9:50, down at 9:55, up 10:00, down 10:05
@@ -2618,10 +2669,10 @@ class LiveRuleEngineTests(unittest.TestCase):
                      "exit_reason='stop: test', gross_pnl=-1 WHERE status='open'",
                      (bars[5].end.isoformat(),))
         self.step(eng, bars, 5, e5, e10)                             # 10:00 up: nothing open
-        self.step(eng, bars, 6, e5, e10)                             # third: refused
+        self.step(eng, bars, 6, e5, e10)                             # third: entered too
         rows = self.store.q("SELECT trigger FROM tranches ORDER BY id")
-        self.assertEqual([r["trigger"] for r in rows], ["state_0945", "cross"])
-        self.assertTrue(self.store.q("SELECT 1 FROM events WHERE message LIKE '%already 2 entries today%'"))
+        self.assertEqual([r["trigger"] for r in rows], ["state_0945", "cross", "cross"])
+        self.assertFalse(self.store.q("SELECT 1 FROM events WHERE message LIKE '%entries today%'"))
 
     def test_up_cross_covers_and_never_opens_a_live_long(self):
         bars = self.five(self.BARS)
@@ -3357,10 +3408,10 @@ class MultiBookLiveTests(unittest.TestCase):
         self.assertEqual(self.ib.pos, {})
 
     def test_the_adapter_never_allows_more_than_the_cap_times_the_listed_books(self):
-        b = ibkr.IBKRBroker(ib_cfg(IBKR_BOOKS="5m,15m"), ib=FakeIB(pos={"AAA": -2}), api=FakeApi)
-        with self.assertRaisesRegex(BrokerError, "cap is 2"):
-            b.submit("AAA", 1, "sell", "c1", cap=5)  # asks for 5; two books allow 2
-        b.submit("AAA", 1, "buy", "c2", cap=5)        # reducing is always fine
+        b = ibkr.IBKRBroker(ib_cfg(IBKR_BOOKS="5m,15m"), ib=FakeIB(pos={"AAA": -6}), api=FakeApi)
+        with self.assertRaisesRegex(BrokerError, "cap is 6"):
+            b.submit("AAA", 1, "sell", "c1", cap=9)  # asks for 9; two books x 3 tranches allow 6
+        b.submit("AAA", 1, "buy", "c2", cap=9)        # reducing is always fine
 
     # ---- the 5-minute stop watch
     def test_an_hourly_live_stop_is_taken_at_the_5_minute_close_not_the_hour(self):
